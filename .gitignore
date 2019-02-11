@@ -61,7 +61,7 @@ typings/
 .env
 
 openpgp.store/
-dist
+.vscode
 private.key
 doc
 __tests__/__fixtures__/index.json
