@@ -3,7 +3,6 @@ import { FileSystem } from '../models/FileSystem.js'
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
 
-import { checkout } from './checkout'
 import { config } from './config'
 import { currentBranch } from './currentBranch'
 import { fetch } from './fetch'
@@ -65,15 +64,9 @@ export async function pull ({
     await merge({
       gitdir,
       fs,
-      ours: ref,
-      theirs: fetchHead,
-      fastForwardOnly
-    })
-    await checkout({
-      dir,
-      gitdir,
-      fs,
-      ref,
+      ourRef: ref,
+      theirRef: fetchHead,
+      fastForwardOnly,
       emitter,
       emitterPrefix
     })

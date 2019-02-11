@@ -23,6 +23,7 @@ Array [
   "expandOid",
   "expandRef",
   "fetch",
+  "findIndexChanges",
   "findMergeBase",
   "findRoot",
   "getRemoteInfo",
