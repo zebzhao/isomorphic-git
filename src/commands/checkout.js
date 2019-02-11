@@ -78,6 +78,7 @@ export async function checkout ({
 
     if (!noCheckout) {
       let count = 0
+      let gitdirBasename = gitdir.slice(dir.length + 1)
       // Acquire a lock on the index
       await GitIndexManager.acquire(
         { fs, filepath: `${gitdir}/index` },
@@ -100,13 +101,15 @@ export async function checkout ({
                 if (head.fullpath === '.') return
                 // Late filter against file names
                 if (patternGlobrex && !patternGlobrex.regex.test(head.fullpath)) return
-                let stage = index.entriesMap.get(GitIndex.key(workdir.fullpath, 0))
+                let workdirPath = workdir.fullpath
+                if (workdirPath === gitdirBasename) return
+                let stage = index.entriesMap.get(GitIndex.key(workdirPath, 0))
                 if (!head.exists) {
                   // if file is not staged, ignore it
                   if (workdir.exists && stage) {
-                    await fs.rm(join(dir, workdir.fullpath))
+                    await fs.rm(join(dir, workdirPath))
                     // remove from index
-                    index.delete(workdir.fullpath)
+                    index.delete(workdirPath)
                     if (emitter) {
                       emitter.emit(`${emitterPrefix}progress`, {
                         phase: 'Updating workdir',
