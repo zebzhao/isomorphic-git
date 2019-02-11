@@ -27,36 +27,38 @@ export async function findMergeBase ({
     // through ancestors, eventually we'll discover a commit where each one of these N walkers
     // has passed through. So we just need to keep tallies until we find one where we've walked
     // through N times.
-    // TODO: I think it would be much safer if we actually tracked the identities of the walkers
-    // rather than the sum.
-    const counts = {}
-    let passes = oids.length
-    let heads = oids
+    // Due to a single commit coming from multiple parents, it's possible for a single parent to
+    // be double counted if identity of initial walkers are not tracked.
+    const tracker = {}
+    let passes = (1 << oids.length) - 1
+    let heads = oids.map((oid, i) => ({ oid, i }))
     while (heads.length) {
-      // Count how many times we've passed each commit
-      let result = []
-      for (let oid of heads) {
-        if (counts[oid]) {
-          counts[oid] += 1
+      // Track number of passes through each commit by an initial walker
+      let result = {}
+      for (let { oid, i } of heads) {
+        if (tracker[oid]) {
+          tracker[oid] |= 1 << i
         } else {
-          counts[oid] = 1
+          tracker[oid] = 1 << i
         }
-        if (counts[oid] === passes) {
-          result.push(oid)
+        if (tracker[oid] === passes) {
+          result[oid] = 1
         }
       }
+      // It's possible to have 2 common ancestors, see https://git-scm.com/docs/git-merge-base
+      result = Object.keys(result)
       if (result.length > 0) {
         return result
       }
       // We haven't found a common ancestor yet
       let newheads = []
-      for (let oid of heads) {
+      for (let { oid, i } of heads) {
         try {
           let { object } = await readObject({ fs, gitdir, oid })
           let commit = GitCommit.from(object)
           let { parent } = commit.parseHeaders()
           for (let oid of parent) {
-            newheads.push(oid)
+            newheads.push({ oid, i })
           }
         } catch (err) {
           // do nothing

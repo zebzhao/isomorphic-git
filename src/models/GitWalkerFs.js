@@ -8,6 +8,7 @@ import { GitWalkerSymbol } from '../utils/symbols.js'
 
 import { FileSystem } from './FileSystem.js'
 import { GitObject } from './GitObject.js'
+import { GitIndex } from './GitIndex'
 
 class GitWalkerFs {
   constructor ({ fs: _fs, dir, gitdir }) {
@@ -75,7 +76,7 @@ class GitWalkerFs {
     await GitIndexManager.acquire(
       { fs, filepath: `${gitdir}/index` },
       async function (index) {
-        let stage = index.entriesMap.get(entry.fullpath)
+        let stage = index.entriesMap.get(GitIndex.key(entry.fullpath, 0))
         if (!stage || compareStats(entry, stage)) {
           log(`INDEX CACHE MISS: calculating SHA for ${entry.fullpath}`)
           if (!entry.content) await entry.populateContent()
