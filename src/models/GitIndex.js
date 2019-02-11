@@ -1,9 +1,9 @@
-import { BufferCursor } from '../utils/BufferCursor.js'
-import { comparePath } from '../utils/comparePath.js'
-import { normalizeStats } from '../utils/normalizeStats.js'
-import { shasum } from '../utils/shasum.js'
+import { BufferCursor } from '../utils/BufferCursor'
+import { compareStrings } from '../utils/compareStrings'
+import { normalizeStats } from '../utils/normalizeStats'
+import { shasum } from '../utils/shasum'
 
-import { E, GitError } from './GitError.js'
+import { E, GitError } from './GitError'
 
 // Extract 1-bit assume-valid, 1-bit extended flag, 2-bit merge state flag, 12-bit path length flag
 function parseCacheEntryFlags (bits) {
@@ -44,7 +44,7 @@ function parseBuffer (buffer) {
   let magic = reader.toString('utf8', 4)
   if (magic !== 'DIRC') {
     throw new GitError(E.InternalFail, {
-      message: `Inavlid dircache magic file number: ${magic}`
+      message: `Invalid dircache magic file number: ${magic}`
     })
   }
   let version = reader.readUInt32BE()
@@ -79,6 +79,8 @@ function parseBuffer (buffer) {
     }
     // TODO: handle pathnames larger than 12 bits
     entry.path = reader.toString('utf8', pathlength)
+    // TODO: is this a good way to store stage entries?
+    entry.key = GitIndex.key(entry.path, entry.flags.stage)
     // The next bit is awkward. We expect 1 to 8 null characters
     // such that the total size of the entry is a multiple of 8 bits.
     // (Hence subtract 12 bytes for the header.)
@@ -88,9 +90,7 @@ function parseBuffer (buffer) {
       let tmp = reader.readUInt8()
       if (tmp !== 0) {
         throw new GitError(E.InternalFail, {
-          message: `Expected 1-8 null characters but got '${tmp}' after ${
-            entry.path
-          }`
+          message: `Expected 1-8 null characters but got '${tmp}' after ${entry.path}`
         })
       } else if (reader.eof()) {
         throw new GitError(E.InternalFail, {
@@ -99,10 +99,15 @@ function parseBuffer (buffer) {
       }
     }
     // end of awkward part
-    _entries.set(entry.path, entry)
+    _entries.set(entry.key, entry)
     i++
   }
   return _entries
+}
+
+function compareKey (a, b) {
+  // https://stackoverflow.com/a/40355107/2168416
+  return compareStrings(a.path, b.path)
 }
 
 export class GitIndex {
@@ -125,19 +130,29 @@ export class GitIndex {
   static from (buffer) {
     return new GitIndex(buffer)
   }
+  static key (path, stage) {
+    // No delimiter is needed as long as stage is always 1 char
+    return path + stage
+  }
   get entries () {
-    return [...this._entries.values()].sort(comparePath)
+    return [...this._entries.values()].sort(compareKey)
   }
   get entriesMap () {
     return this._entries
+  }
+  get conflictedPaths () {
+    return [...this._entries.keys()]
+      .filter(k => k.charAt(k.length - 1) === '2')
+      .map(k => k.slice(0, -1))
   }
   * [Symbol.iterator] () {
     for (let entry of this.entries) {
       yield entry
     }
   }
-  insert ({ filepath, stats, oid }) {
+  insert ({ filepath, stats, oid, stage = 0 }) {
     stats = normalizeStats(stats)
+    let key = GitIndex.key(filepath, stage)
     let bfilepath = Buffer.from(filepath)
     let entry = {
       ctimeSeconds: stats.ctimeSeconds,
@@ -154,25 +169,27 @@ export class GitIndex {
       gid: stats.gid,
       size: stats.size,
       path: filepath,
+      key: key,
       oid: oid,
       flags: {
         assumeValid: false,
         extended: false,
-        stage: 0,
+        stage: stage,
         nameLength: bfilepath.length < 0xfff ? bfilepath.length : 0xfff
       }
     }
-    this._entries.set(entry.path, entry)
+    this._entries.set(key, entry)
     this._dirty = true
   }
+  writeConflict ({ filepath, stats, ourOid, theirOid, baseOid }) {
+    if (baseOid) this.insert({ filepath, stats, oid: baseOid, stage: 1 })
+    this.insert({ filepath, stats, oid: ourOid, stage: 2 })
+    this.insert({ filepath, stats, oid: theirOid, stage: 3 })
+  }
   delete ({ filepath }) {
-    if (this._entries.has(filepath)) {
-      this._entries.delete(filepath)
-    } else {
-      for (let key of this._entries.keys()) {
-        if (key.startsWith(filepath + '/')) {
-          this._entries.delete(key)
-        }
+    for (let [key, entry] of this._entries.entries()) {
+      if (entry.path === filepath || entry.path.startsWith(filepath + '/')) {
+        this._entries.delete(key)
       }
     }
     this._dirty = true
