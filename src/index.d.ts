@@ -396,6 +396,18 @@ export function fetch(args: GitDir & {
   headers?: { [key: string]: string };
 }): Promise<FetchResponse>;
 
+export function findIndexChanges(args: GitDir & {
+  core?: string;
+  fs?: any;
+  ref: string;
+}): Promise<string>;
+
+export function findMergeBase(args: GitDir & {
+  core?: string;
+  fs?: any;
+  oids: string[];
+}): Promise<string>;
+
 export function findRoot(args: {
   core?: string;
   fs?: any;
@@ -485,8 +497,10 @@ export function log(args: GitDir & {
 export function merge(args: GitDir & {
   core?: string;
   fs?: any;
-  ours?: string;
-  theirs: string;
+  emitter?: EventEmitter;
+  emitterPrefix?: string;
+  ourRef?: string;
+  theirRef: string;
   fastForwardOnly?: boolean;
   dryRun?: boolean;
   message?: string;

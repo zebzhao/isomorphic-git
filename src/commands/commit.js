@@ -117,6 +117,30 @@ export async function commit ({
             parent = []
           }
         }
+
+        let mergeHash
+        try {
+          mergeHash = await GitRefManager.resolve({ fs, gitdir, ref: 'MERGE_HEAD' })
+        } catch (err) {
+          // No merge hash
+        }
+
+        if (mergeHash) {
+          const conflictedPaths = index.conflictedPaths
+          if (conflictedPaths.length > 0) {
+            throw new GitError(E.CommitUnmergedConflictsFail, { paths: conflictedPaths })
+          }
+          if (parents.length) {
+            parents.push(mergeHash)
+          } else {
+            throw new GitError(E.NoHeadCommitError, { noun: 'merge commit', ref: mergeHash })
+          }
+        }
+
+        const inodes = flatFileListToDirectoryStructure(index.entries)
+        const inode = inodes.get('.')
+        const treeRef = await constructTree({ fs, gitdir, inode })
+
         let comm = GitCommit.from({
           tree,
           parent,
@@ -142,6 +166,10 @@ export async function commit ({
             ref,
             value: oid
           })
+        }
+        if (mergeHash) {
+          await GitRefManager.deleteRef({ fs, gitdir, ref: 'MERGE_HEAD' })
+          await fs.rm(join(gitdir, 'MERGE_MSG'))
         }
       }
     )

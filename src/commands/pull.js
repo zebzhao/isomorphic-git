@@ -4,7 +4,6 @@ import { FileSystem } from '../models/FileSystem.js'
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
 
-import { checkout } from './checkout'
 import { config } from './config'
 import { currentBranch } from './currentBranch'
 import { fetch } from './fetch'

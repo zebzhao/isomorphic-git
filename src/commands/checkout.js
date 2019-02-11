@@ -4,6 +4,7 @@ import globrex from 'globrex'
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
 import { FileSystem } from '../models/FileSystem.js'
+import { GitIndex } from '../models/GitIndex'
 import { E, GitError } from '../models/GitError.js'
 import { join } from '../utils/join.js'
 import { patternRoot } from '../utils/patternRoot.js'
@@ -13,7 +14,7 @@ import { worthWalking } from '../utils/worthWalking.js'
 import { TREE } from './TREE.js'
 import { WORKDIR } from './WORKDIR'
 import { config } from './config'
-import { walkBeta1 } from './walkBeta1.js'
+import { walkBeta1 } from './walkBeta1'
 
 /**
  * Checkout a branch
@@ -116,23 +117,9 @@ export async function checkout ({
       await GitIndexManager.acquire(
         { fs, filepath: `${gitdir}/index` },
         async function (index) {
-          // TODO: Big optimization possible here.
           // Instead of deleting and rewriting everything, only delete files
           // that are not present in the new branch, and only write files that
           // are not in the index or are in the index but have the wrong SHA.
-          for (const entry of index) {
-            try {
-              await fs.rm(join(dir, entry.path))
-              if (emitter) {
-                emitter.emit(`${emitterPrefix}progress`, {
-                  phase: 'Updating workdir',
-                  loaded: ++count,
-                  lengthComputable: false
-                })
-              }
-            } catch (err) {}
-          }
-          index.clear()
           try {
             await walkBeta1({
               trees: [TREE({ fs, gitdir, ref }), WORKDIR({ fs, dir, gitdir })],
@@ -142,7 +129,6 @@ export async function checkout ({
               },
               map: async function ([head, workdir]) {
                 if (head.fullpath === '.') return
-                if (!head.exists) return
                 // Late filter against file names
                 if (patternGlobrex) {
                   let match = false
@@ -154,6 +140,23 @@ export async function checkout ({
                     }
                   }
                   if (!match) return
+                }
+                let stage = index.entriesMap.get(GitIndex.key(workdir.fullpath, 0))
+                if (!head.exists) {
+                  // if file is not staged, ignore it
+                  if (workdir.exists && stage) {
+                    await fs.rm(join(dir, workdir.fullpath))
+                    // remove from index
+                    index.delete(workdir.fullpath)
+                    if (emitter) {
+                      emitter.emit(`${emitterPrefix}progress`, {
+                        phase: 'Updating workdir',
+                        loaded: ++count,
+                        lengthComputable: false
+                      })
+                    }
+                  }
+                  return
                 }
                 await head.populateStat()
                 const filepath = `${dir}/${head.fullpath}`
@@ -173,34 +176,41 @@ export async function checkout ({
                     break
                   }
                   case 'blob': {
-                    await head.populateContent()
                     await head.populateHash()
-                    if (head.mode === '100644') {
-                      // regular file
-                      await fs.write(filepath, head.content)
-                    } else if (head.mode === '100755') {
-                      // executable file
-                      await fs.write(filepath, head.content, { mode: 0o777 })
-                    } else if (head.mode === '120000') {
-                      // symlink
-                      await fs.writelink(filepath, head.content)
-                    } else {
-                      throw new GitError(E.InternalFail, {
-                        message: `Invalid mode "${head.mode}" detected in blob ${head.oid}`
+                    let { fullpath, oid, mode } = head
+                    if (!stage || stage.oid !== oid || !workdir.exists) {
+                      await head.populateContent()
+                      switch (mode) {
+                        case '100644':
+                          // regular file
+                          await fs.write(filepath, head.content)
+                          break
+                        case '100755':
+                          // executable file
+                          await fs.write(filepath, head.content, { mode: 0o777 })
+                          break
+                        case '120000':
+                          // symlink
+                          await fs.writelink(filepath, head.content)
+                          break
+                        default:
+                          throw new GitError(E.InternalFail, {
+                            message: `Invalid mode "${mode}" detected in blob ${oid}`
+                          })
+                      }
+                      let stats = await fs.lstat(filepath)
+                      // We can't trust the executable bit returned by lstat on Windows,
+                      // so we need to preserve this value from the TREE.
+                      // TODO: Figure out how git handles this internally.
+                      if (mode === '100755') {
+                        stats.mode = 0o755
+                      }
+                      index.insert({
+                        filepath: fullpath,
+                        stats,
+                        oid
                       })
                     }
-                    const stats = await fs.lstat(filepath)
-                    // We can't trust the executable bit returned by lstat on Windows,
-                    // so we need to preserve this value from the TREE.
-                    // TODO: Figure out how git handles this internally.
-                    if (head.mode === '100755') {
-                      stats.mode = 0o755
-                    }
-                    index.insert({
-                      filepath: head.fullpath,
-                      stats,
-                      oid: head.oid
-                    })
                     if (emitter) {
                       emitter.emit(`${emitterPrefix}progress`, {
                         phase: 'Updating workdir',

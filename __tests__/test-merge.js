@@ -14,8 +14,8 @@ describe('merge', () => {
     })
     const m = await merge({
       gitdir,
-      ours: 'master',
-      theirs: 'master',
+      ourRef: 'master',
+      theirRef: 'master',
       fastForwardOnly: true
     })
     expect(m.oid).toEqual(desiredOid)
@@ -38,8 +38,8 @@ describe('merge', () => {
     })
     const m = await merge({
       gitdir,
-      ours: 'master',
-      theirs: 'medium',
+      ourRef: 'master',
+      theirRef: 'medium',
       fastForwardOnly: true
     })
     expect(m.oid).toEqual(desiredOid)
@@ -62,8 +62,8 @@ describe('merge', () => {
     })
     const m = await merge({
       gitdir,
-      ours: 'master',
-      theirs: 'oldest',
+      ourRef: 'master',
+      theirRef: 'oldest',
       fastForwardOnly: true
     })
     expect(m.oid).toEqual(desiredOid)
@@ -86,8 +86,8 @@ describe('merge', () => {
     })
     const m = await merge({
       gitdir,
-      ours: 'master',
-      theirs: 'newest',
+      ourRef: 'master',
+      theirRef: 'newest',
       fastForwardOnly: true
     })
     expect(m.oid).toEqual(desiredOid)
