@@ -1,17 +1,40 @@
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { compareStats } from '../utils/compareStats.js'
-import { join } from '../utils/join'
+import { compareStrings } from '../utils/compareStrings.js'
 import { log } from '../utils/log.js'
 import { normalizeStats } from '../utils/normalizeStats.js'
 import { shasum } from '../utils/shasum.js'
+import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js'
 
 import { FileSystem } from './FileSystem.js'
 import { GitObject } from './GitObject.js'
-import { GitIndex } from './GitIndex'
 
 export class GitWalkerFs {
   constructor ({ fs: _fs, dir, gitdir }) {
     const fs = new FileSystem(_fs)
+    let walker = this
+    this.treePromise = (async () => {
+      let result = (await fs.readdirDeep(dir)).map(path => {
+        // +1 index for trailing slash
+        return { path: path.slice(dir.length + 1) }
+      })
+      return flatFileListToDirectoryStructure(result)
+    })()
+    this.indexPromise = (async () => {
+      let result
+      await GitIndexManager.acquire(
+        { fs, filepath: `${gitdir}/index` },
+        async function (index) {
+          result = index.entries
+            .filter(entry => entry.flags.stage === 0)
+            .reduce((index, entry) => {
+              index[entry.path] = entry
+              return index
+            }, {})
+        }
+      )
+      return result
+    })()
     this.fs = fs
     this.dir = dir
     this.gitdir = gitdir
@@ -40,15 +63,23 @@ export class GitWalkerFs {
 
   async readdir (entry) {
     if (!entry.exists) return []
-    const filepath = entry.fullpath
-    const { fs, dir } = this
-    const names = await fs.readdir(join(dir, filepath))
-    if (names === null) return null
-    return names.map(name => ({
-      fullpath: join(filepath, name),
-      basename: name,
-      exists: true
-    }))
+    let filepath = entry.fullpath
+    let tree = await this.treePromise
+    let inode = tree.get(filepath)
+    if (!inode) return null
+    if (inode.type === 'blob') return null
+    if (inode.type !== 'tree') {
+      throw new Error(`ENOTDIR: not a directory, scandir '${filepath}'`)
+    }
+    return inode.children
+      .map(inode => ({
+        fullpath: inode.fullpath,
+        basename: inode.basename,
+        exists: true
+        // TODO: Figure out why flatFileListToDirectoryStructure is not returning children
+        // sorted correctly for "__tests__/__fixtures__/test-push.git"
+      }))
+      .sort((a, b) => compareStrings(a.fullpath, b.fullpath))
   }
 
   async populateStat (entry) {
@@ -79,30 +110,17 @@ export class GitWalkerFs {
 
   async populateHash (entry) {
     if (!entry.exists) return
-    const { fs, gitdir } = this
+    let index = await this.indexPromise
+    let stage = index[entry.fullpath]
     let oid
-    // See if we can use the SHA1 hash in the index.
-    await GitIndexManager.acquire(
-      { fs, filepath: `${gitdir}/index` },
-      async function (index) {
-        let stage = index.entriesMap.get(GitIndex.key(entry.fullpath, 0))
-        if (!stage || compareStats(entry, stage)) {
-          log(`INDEX CACHE MISS: calculating SHA for ${entry.fullpath}`)
-          if (!entry.content) await entry.populateContent()
-          oid = shasum(GitObject.wrap({ type: 'blob', object: entry.content }))
-          if (stage && oid === stage.oid) {
-            index.insert({
-              filepath: entry.fullpath,
-              stats: entry,
-              oid: oid
-            })
-          }
-        } else {
-          // Use the index SHA1 rather than compute it
-          oid = stage.oid
-        }
-      }
-    )
+    if (!stage || compareStats(entry, stage)) {
+      log(`INDEX CACHE MISS: calculating SHA for ${entry.fullpath}`)
+      if (!entry.content) await entry.populateContent()
+      oid = shasum(GitObject.wrap({ type: 'blob', object: entry.content }))
+    } else {
+      // Use the index SHA1 rather than compute it
+      oid = stage.oid
+    }
     Object.assign(entry, { oid })
   }
 }
