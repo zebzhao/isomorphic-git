@@ -3238,12 +3238,90 @@ function justWhatMatters (e) {
 // outside of it.
 const GitWalkerSymbol = Symbol('GitWalkerSymbol');
 
+/*::
+type Node = {
+  type: string,
+  fullpath: string,
+  basename: string,
+  metadata: Object, // mode, oid
+  parent?: Node,
+  children: Array<Node>
+}
+*/
+
+function flatFileListToDirectoryStructure (files) {
+  const inodes = new Map();
+  const mkdir = function (name) {
+    if (!inodes.has(name)) {
+      let dir = {
+        type: 'tree',
+        fullpath: name,
+        basename: basename(name),
+        metadata: {},
+        children: []
+      };
+      inodes.set(name, dir);
+      // This recursively generates any missing parent folders.
+      // We do it after we've added the inode to the set so that
+      // we don't recurse infinitely trying to create the root '.' dirname.
+      dir.parent = mkdir(dirname(name));
+      if (dir.parent && dir.parent !== dir) dir.parent.children.push(dir);
+    }
+    return inodes.get(name)
+  };
+
+  const mkfile = function (name, metadata) {
+    if (!inodes.has(name)) {
+      let file = {
+        type: 'blob',
+        fullpath: name,
+        basename: basename(name),
+        metadata: metadata,
+        // This recursively generates any missing parent folders.
+        parent: mkdir(dirname(name)),
+        children: []
+      };
+      if (file.parent) file.parent.children.push(file);
+      inodes.set(name, file);
+    }
+    return inodes.get(name)
+  };
+
+  mkdir('.');
+  for (let file of files) {
+    mkfile(file.path, file);
+  }
+  return inodes
+}
+
 class GitWalkerFs {
   constructor ({ fs, dir, gitdir }) {
+    let walker = this;
+    this.treePromise = (async () => {
+      let result = (await fs.readdirDeep(dir)).map(path => {
+        // +1 index for trailing slash
+        return { path: path.slice(dir.length + 1) }
+      });
+      return flatFileListToDirectoryStructure(result)
+    })();
+    this.indexPromise = (async () => {
+      let result;
+      await GitIndexManager.acquire(
+        { fs, filepath: `${gitdir}/index` },
+        async function (index) {
+          result = index.entries
+            .filter(entry => entry.flags.stage === 0)
+            .reduce((index, entry) => {
+              index[entry.path] = entry;
+              return index
+            }, {});
+        }
+      );
+      return result
+    })();
     this.fs = fs;
     this.dir = dir;
     this.gitdir = gitdir;
-    let walker = this;
     this.ConstructEntry = class FSEntry {
       constructor (entry) {
         Object.assign(this, entry);
@@ -3265,14 +3343,22 @@ class GitWalkerFs {
   async readdir (entry) {
     if (!entry.exists) return []
     let filepath = entry.fullpath;
-    let { fs, dir } = this;
-    let names = await fs.readdir(join(dir, filepath));
-    if (names === null) return null
-    return names.map(name => ({
-      fullpath: join(filepath, name),
-      basename: name,
-      exists: true
-    }))
+    let tree = await this.treePromise;
+    let inode = tree.get(filepath);
+    if (!inode) return null
+    if (inode.type === 'blob') return null
+    if (inode.type !== 'tree') {
+      throw new Error(`ENOTDIR: not a directory, scandir '${filepath}'`)
+    }
+    return inode.children
+      .map(inode => ({
+        fullpath: inode.fullpath,
+        basename: inode.basename,
+        exists: true
+        // TODO: Figure out why flatFileListToDirectoryStructure is not returning children
+        // sorted correctly for "__tests__/__fixtures__/test-push.git"
+      }))
+      .sort((a, b) => compareStrings(a.fullpath, b.fullpath))
   }
   async populateStat (entry) {
     if (!entry.exists) return
@@ -3297,30 +3383,17 @@ class GitWalkerFs {
   }
   async populateHash (entry) {
     if (!entry.exists) return
-    let { fs, gitdir } = this;
+    let index = await this.indexPromise;
+    let stage = index[entry.fullpath];
     let oid;
-    // See if we can use the SHA1 hash in the index.
-    await GitIndexManager.acquire(
-      { fs, filepath: `${gitdir}/index` },
-      async function (index) {
-        let stage = index.entriesMap.get(GitIndex.key(entry.fullpath, 0));
-        if (!stage || compareStats(entry, stage)) {
-          log(`INDEX CACHE MISS: calculating SHA for ${entry.fullpath}`);
-          if (!entry.content) await entry.populateContent();
-          oid = shasum(GitObject.wrap({ type: 'blob', object: entry.content }));
-          if (stage && oid === stage.oid) {
-            index.insert({
-              filepath: entry.fullpath,
-              stats: entry,
-              oid: oid
-            });
-          }
-        } else {
-          // Use the index SHA1 rather than compute it
-          oid = stage.oid;
-        }
-      }
-    );
+    if (!stage || compareStats(entry, stage)) {
+      log(`INDEX CACHE MISS: calculating SHA for ${entry.fullpath}`);
+      if (!entry.content) await entry.populateContent();
+      oid = shasum(GitObject.wrap({ type: 'blob', object: entry.content }));
+    } else {
+      // Use the index SHA1 rather than compute it
+      oid = stage.oid;
+    }
     Object.assign(entry, { oid });
   }
 }
@@ -5420,62 +5493,6 @@ async function clone ({
   }
 }
 
-/*::
-type Node = {
-  type: string,
-  fullpath: string,
-  basename: string,
-  metadata: Object, // mode, oid
-  parent?: Node,
-  children: Array<Node>
-}
-*/
-
-function flatFileListToDirectoryStructure (files) {
-  const inodes = new Map();
-  const mkdir = function (name) {
-    if (!inodes.has(name)) {
-      let dir = {
-        type: 'tree',
-        fullpath: name,
-        basename: basename(name),
-        metadata: {},
-        children: []
-      };
-      inodes.set(name, dir);
-      // This recursively generates any missing parent folders.
-      // We do it after we've added the inode to the set so that
-      // we don't recurse infinitely trying to create the root '.' dirname.
-      dir.parent = mkdir(dirname(name));
-      if (dir.parent && dir.parent !== dir) dir.parent.children.push(dir);
-    }
-    return inodes.get(name)
-  };
-
-  const mkfile = function (name, metadata) {
-    if (!inodes.has(name)) {
-      let file = {
-        type: 'blob',
-        fullpath: name,
-        basename: basename(name),
-        metadata: metadata,
-        // This recursively generates any missing parent folders.
-        parent: mkdir(dirname(name)),
-        children: []
-      };
-      if (file.parent) file.parent.children.push(file);
-      inodes.set(name, file);
-    }
-    return inodes.get(name)
-  };
-
-  mkdir('.');
-  for (let file of files) {
-    mkfile(file.path, file);
-  }
-  return inodes
-}
-
 /**
  * Create a new commit
  *
@@ -5968,62 +5985,6 @@ async function findMergeBase ({
     return []
   } catch (err) {
     err.caller = 'git.findMergeBase';
-    throw err
-  }
-}
-
-/**
- * Find changes between working index and tree.
- *
- */
-async function findIndexChanges ({
-  core = 'default',
-  dir,
-  gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
-  ref = 'HEAD'
-}) {
-  try {
-    const fs = new FileSystem(_fs);
-    // Resolve commit
-    let oid = await GitRefManager.resolve({ fs, gitdir, ref });
-    let changes = [];
-    await GitIndexManager.acquire(
-      { fs, filepath: `${gitdir}/index` },
-      async function (index) {
-        await walkBeta1({
-          fs,
-          dir,
-          gitdir,
-          trees: [
-            TREE({ fs, gitdir, ref: oid }),
-            WORKDIR({ fs, dir, gitdir })
-          ],
-          map: async function ([head, workdir]) {
-            if (head.fullpath === '.') return
-            if (head.exists && !workdir.exists) {
-              changes.push(head.fullpath);
-            } else if (workdir.exists) {
-              let stage = index.entriesMap.get(GitIndex.key(workdir.fullpath, 0));
-              // if file is staged, compare it with head copy
-              if (stage) {
-                if (!head.exists) {
-                  changes.push(stage.fullpath);
-                } else {
-                  await head.populateHash();
-                  if (stage.oid !== head.oid) {
-                    changes.push(stage.fullpath);
-                  }
-                }
-              }
-            }
-          }
-        });
-      }
-    );
-    return changes
-  } catch (err) {
-    err.caller = 'git.findIndexChanges';
     throw err
   }
 }
@@ -8109,7 +8070,6 @@ exports.expandOid = expandOid$1;
 exports.expandRef = expandRef;
 exports.fetch = fetch;
 exports.findMergeBase = findMergeBase;
-exports.findIndexChanges = findIndexChanges;
 exports.findRoot = findRoot;
 exports.getRemoteInfo = getRemoteInfo;
 exports.indexPack = indexPack;
