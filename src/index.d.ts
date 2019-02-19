@@ -375,12 +375,6 @@ export function fetch(args: GitDir & {
   headers?: { [key: string]: string };
 }): Promise<FetchResponse>;
 
-export function findIndexChanges(args: GitDir & {
-  core?: string;
-  fs?: any;
-  ref: string;
-}): Promise<string>;
-
 export function findMergeBase(args: GitDir & {
   core?: string;
   fs?: any;
