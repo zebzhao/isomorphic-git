@@ -103,17 +103,6 @@ export async function push ({
     let oldoid =
       httpRemote.refs.get(fullRemoteRef) ||
       '0000000000000000000000000000000000000000'
-    let finish = [...httpRemote.refs.values()]
-    // hack to speed up common force push scenarios
-    let mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] })
-    for (let oid of mergebase) finish.push(oid)
-    let commits = await listCommitsAndTags({
-      fs,
-      gitdir,
-      start: [oid],
-      finish
-    })
-    let objects = await listObjects({ fs, gitdir, oids: commits })
     if (!force) {
       // Is it a tag that already exists?
       if (
@@ -131,6 +120,17 @@ export async function push ({
         throw new GitError(E.PushRejectedNonFastForward, {})
       }
     }
+    let finish = [...httpRemote.refs.values()]
+    // hack to speed up common force push scenarios
+    let mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] })
+    for (let oid of mergebase) finish.push(oid)
+    let commits = await listCommitsAndTags({
+      fs,
+      gitdir,
+      start: [oid],
+      finish
+    })
+    let objects = await listObjects({ fs, gitdir, oids: commits })
     // We can only safely use capabilities that the server also understands.
     // For instance, AWS CodeCommit aborts a push if you include the `agent`!!!
     const capabilities = filterCapabilities(

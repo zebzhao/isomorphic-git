@@ -52,9 +52,10 @@ describe('merge', () => {
   })
   it('merge oldest into master', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-merge')
+    let { dir, gitdir } = await makeFixture('test-merge')
     // Test
     let desiredOid = await resolveRef({
+      dir,
       gitdir,
       ref: 'master'
     })
@@ -75,13 +76,15 @@ describe('merge', () => {
   })
   it('merge newest into master', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-merge')
+    let { dir, gitdir } = await makeFixture('test-merge')
     // Test
     let desiredOid = await resolveRef({
+      dir,
       gitdir,
       ref: 'newest'
     })
     let m = await merge({
+      dir,
       gitdir,
       ourRef: 'master',
       theirRef: 'newest',

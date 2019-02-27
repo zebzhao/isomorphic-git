@@ -7,7 +7,7 @@ import { join } from '../utils/join'
 import { cores } from '../utils/plugins'
 import { hashObject } from '../utils/hashObject.js'
 
-// import { checkout } from './checkout'
+import { checkout } from './checkout'
 import { currentBranch } from './currentBranch'
 import { findChangedFiles } from './findChangedFiles'
 import { findMergeBase } from './findMergeBase'
@@ -64,14 +64,14 @@ export async function merge ({
     }
     if (baseOid === ourOid) {
       await GitRefManager.writeRef({ fs, gitdir, ref: ourRef, value: theirOid })
-      // await checkout({
-      //   dir,
-      //   gitdir,
-      //   fs,
-      //   ref: ourRef,
-      //   emitter,
-      //   emitterPrefix
-      // })
+      await checkout({
+        dir,
+        gitdir,
+        fs,
+        ref: ourRef,
+        emitter,
+        emitterPrefix
+      })
       return {
         oid: theirOid,
         fastForward: true
@@ -144,6 +144,12 @@ export async function merge ({
                   index.writeConflict({
                     filepath: baseFullpath,
                     stats: baseStats,
+                    ourOid: ours.oid,
+                    theirOid: theirs.oid,
+                    baseOid
+                  })
+                  emitter.emit(`${emitterPrefix}conflict`, {
+                    filepath: baseFullpath,
                     ourOid: ours.oid,
                     theirOid: theirs.oid,
                     baseOid
