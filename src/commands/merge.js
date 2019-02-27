@@ -56,13 +56,14 @@ export async function merge ({
     // find most recent common ancestor of ref a and ref b (if there's more than 1, pick 1)
     let baseOid = (await findMergeBase({ gitdir, fs, oids: [ourOid, theirOid] }))[0]
     // handle fast-forward case
-    if (baseOid === theirOid) {
+    if (!baseOid) {
+      throw new GitError(E.MergeNoCommonAncestryError, { theirRef, ourRef })
+    } else if (baseOid === theirOid) {
       return {
         oid: ourOid,
         alreadyMerged: true
       }
-    }
-    if (baseOid === ourOid) {
+    } else if (baseOid === ourOid) {
       await GitRefManager.writeRef({ fs, gitdir, ref: ourRef, value: theirOid })
       await checkout({
         dir,
