@@ -97,6 +97,8 @@ const messages = {
   MaxSearchDepthExceeded: `Maximum search depth of { depth } exceeded.`,
   PushRejectedNonFastForward: `Push rejected because it was not a simple fast-forward. Use "force: true" to override.`,
   PushRejectedTagExists: `Push rejected because tag already exists. Use "force: true" to override.`,
+  PushRejectedNoCommonAncestry: `Push rejected because no common ancestor was found.`,
+  MergeNoCommonAncestryError: `Merge failed because no common ancestor was found between { theirRef } and { ourRef }.`,
   AddingRemoteWouldOverwrite: `Adding remote { remote } would overwrite the existing remote. Use "force: true" to override.`,
   PluginUndefined: `A command required the "{ plugin }" plugin but it was undefined.`,
   CoreNotFound: `No plugin core with the name "{ core }" is registered.`,
@@ -170,6 +172,8 @@ const E = {
   MaxSearchDepthExceeded: `MaxSearchDepthExceeded`,
   PushRejectedNonFastForward: `PushRejectedNonFastForward`,
   PushRejectedTagExists: `PushRejectedTagExists`,
+  PushRejectedNoCommonAncestry: `PushRejectedNoCommonAncestry`,
+  MergeNoCommonAncestryError: `MergeNoCommonAncestryError`,
   AddingRemoteWouldOverwrite: `AddingRemoteWouldOverwrite`,
   PluginUndefined: `PluginUndefined`,
   CoreNotFound: `CoreNotFound`,
@@ -467,13 +471,22 @@ function basename (path) {
   return path
 }
 
-// For some reason path.posix.join is undefined in webpack
-// Also, this is just much smaller
-function join (...parts) {
-  parts = parts.filter(part => part !== '' && part !== '.');
-  if (parts.length === 0) return '.'
+function normalizePath (path) {
+  return path
+    .replace(/\/\.\//g, '/') // Replace '/./' with '/'
+    .replace(/\/{2,}/g, '/') // Replace consecutive '/'
+    .replace(/^\/\.$/, '/') // if path === '/.' return '/'
+    .replace(/^\.\/$/, '.') // if path === './' return '.'
+    .replace(/^\.\//, '') // Remove leading './'
+    .replace(/\/\.$/, '') // Remove trailing '/.'
+    .replace(/(.+)\/$/, '$1') // Remove trailing '/'
+    .replace(/^$/, '.') // if path === '' return '.'
+}
 
-  return parts.join('/')
+// For some reason path.posix.join is undefined in webpack
+
+function join (...parts) {
+  return normalizePath(parts.map(normalizePath).join('/'))
 }
 
 // I'm putting this in a Manager because I reckon it could benefit
@@ -1133,39 +1146,51 @@ async function add ({
   dir,
   gitdir = join(dir, '.git'),
   fs: _fs = cores.get(core).get('fs'),
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
   filepath
 }) {
   try {
     const fs = new FileSystem(_fs);
-
+    let added = [];
     await GitIndexManager.acquire(
       { fs, filepath: `${gitdir}/index` },
       async function (index) {
-        await addToIndex({ dir, gitdir, fs, filepath, index });
+        await addToIndex({ dir, gitdir, fs, filepath, index, added });
       }
     );
-    // TODO: return all oids for all files added?
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}add`, {
+        filepath,
+        added
+      });
+    }
+    return added
   } catch (err) {
     err.caller = 'git.add';
     throw err
   }
 }
 
-async function addToIndex ({ dir, gitdir, fs, filepath, index }) {
-  // TODO: Should ignore UNLESS it's already in the index.
-  const ignored = await GitIgnoreManager.isIgnored({
-    fs,
-    dir,
-    gitdir,
-    filepath
-  });
-  if (ignored) return
+async function addToIndex ({ dir, gitdir, fs, filepath, index, added }) {
+  const stage = index.entriesMap.get(GitIndex.key(filepath, 0)) ||
+    index.entriesMap.get(GitIndex.key(filepath, 2));
+  if (!stage) {
+    // Should ignore UNLESS it's already in the index.
+    const ignored = await GitIgnoreManager.isIgnored({
+      fs,
+      dir,
+      gitdir,
+      filepath
+    });
+    if (ignored) return
+  }
   let stats = await fs.lstat(join(dir, filepath));
   if (!stats) throw new GitError(E.FileReadError, { filepath })
   if (stats.isDirectory()) {
     const children = await fs.readdir(join(dir, filepath));
     const promises = children.map(child =>
-      addToIndex({ dir, gitdir, fs, filepath: join(filepath, child), index })
+      addToIndex({ dir, gitdir, fs, filepath: join(filepath, child), index, added })
     );
     await Promise.all(promises);
   } else {
@@ -1174,7 +1199,9 @@ async function addToIndex ({ dir, gitdir, fs, filepath, index }) {
       : await fs.read(join(dir, filepath));
     if (object === null) throw new GitError(E.FileReadError, { filepath })
     const oid = await writeObject({ fs, gitdir, type: 'blob', object });
+    if (stage) index.delete({ filepath });
     index.insert({ filepath, stats, oid });
+    added.push({ filepath, oid });
   }
 }
 
@@ -2387,8 +2414,11 @@ let shouldLog = null;
 function log (...args) {
   if (shouldLog === null) {
     shouldLog =
-      process.env.DEBUG === '*' ||
-      process.env.DEBUG === 'isomorphic-git' ||
+      (process &&
+        process.env &&
+        process.env.DEBUG &&
+        (process.env.DEBUG === '*' ||
+          process.env.DEBUG === 'isomorphic-git')) ||
       (typeof window !== 'undefined' &&
         typeof window.localStorage !== 'undefined' &&
         (window.localStorage.debug === '*' ||
@@ -3251,7 +3281,8 @@ function flatFileListToDirectoryStructure (files) {
 }
 
 class GitWalkerFs {
-  constructor ({ fs, dir, gitdir }) {
+  constructor ({ fs: _fs, dir, gitdir }) {
+    const fs = new FileSystem(_fs);
     let walker = this;
     this.treePromise = (async () => {
       let result = (await fs.readdirDeep(dir)).map(path => {
@@ -3691,7 +3722,8 @@ async function resolveTree ({ fs, gitdir, oid }) {
 }
 
 class GitWalkerRepo {
-  constructor ({ fs, gitdir, ref }) {
+  constructor ({ fs: _fs, gitdir, ref }) {
+    const fs = new FileSystem(_fs);
     this.fs = fs;
     this.gitdir = gitdir;
     this.mapPromise = (async () => {
@@ -4125,8 +4157,9 @@ async function checkout ({
         }
       );
     }
-    // Update HEAD TODO: Handle non-branch cases
-    await fs.write(`${gitdir}/HEAD`, `ref: ${fullRef}\n`);
+    // Update HEAD
+    const content = fullRef.startsWith('refs/heads') ? `ref: ${fullRef}` : oid;
+    await fs.write(`${gitdir}/HEAD`, `${content}\n`);
   } catch (err) {
     err.caller = 'git.checkout';
     throw err
@@ -4640,6 +4673,65 @@ class GitShallowManager {
   }
 }
 
+async function hasObjectLoose ({ fs: _fs, gitdir, oid }) {
+  const fs = new FileSystem(_fs);
+  let source = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
+  return fs.exists(`${gitdir}/${source}`)
+}
+
+async function hasObjectPacked ({
+  fs: _fs,
+  gitdir,
+  oid,
+  getExternalRefDelta
+}) {
+  const fs = new FileSystem(_fs);
+  // Check to see if it's in a packfile.
+  // Iterate through all the .idx files
+  let list = await fs.readdir(join(gitdir, '/objects/pack'));
+  list = list.filter(x => x.endsWith('.idx'));
+  for (let filename of list) {
+    const indexFile = `${gitdir}/objects/pack/${filename}`;
+    let p = await readPackIndex({
+      fs,
+      filename: indexFile,
+      getExternalRefDelta
+    });
+    if (p.error) throw new GitError(E.InternalFail, { message: p.error })
+    // If the packfile DOES have the oid we're looking for...
+    if (p.offsets.has(oid)) {
+      return true
+    }
+  }
+  // Failed to find it
+  return false
+}
+
+async function hasObject ({ fs: _fs, gitdir, oid, format = 'content' }) {
+  const fs = new FileSystem(_fs);
+  // Curry the current read method so that the packfile un-deltification
+  // process can acquire external ref-deltas.
+  const getExternalRefDelta = oid => readObject({ fs, gitdir, oid });
+
+  // Look for it in the loose object directory.
+  let result = await hasObjectLoose({ fs, gitdir, oid });
+  // Check to see if it's in a packfile.
+  if (!result) {
+    result = await hasObjectPacked({ fs, gitdir, oid, getExternalRefDelta });
+  }
+  // Finally
+  return result
+}
+
+// TODO: make a function that just returns obCount. then emptyPackfile = () => sizePack(pack) === 0
+function emptyPackfile (pack) {
+  const pheader = '5041434b';
+  const version = '00000002';
+  const obCount = '00000000';
+  const header = pheader + version + obCount;
+  return pack.slice(0, 12).toString('hex') === header
+}
+
 function filterCapabilities (server, client) {
   let serverNames = server.map(cap => cap.split('=', 1)[0]);
   return client.filter(cap => {
@@ -5048,7 +5140,7 @@ async function fetch ({
     // a) NOT concatenate the entire packfile into memory (line 78),
     // b) compute the SHA of the stream except for the last 20 bytes, using the same library used in push.js, and
     // c) compare the computed SHA with the last 20 bytes of the stream before saving to disk, and throwing a "packfile got corrupted during download" error if the SHA doesn't match.
-    if (packfileSha !== '') {
+    if (packfileSha !== '' && !emptyPackfile(packfile)) {
       res.packfile = `objects/pack/pack-${packfileSha}.pack`;
       const fullpath = join(gitdir, res.packfile);
       await fs.write(fullpath, packfile);
@@ -5172,19 +5264,28 @@ async function fetchPackfile ({
     ]
   );
   if (relative) capabilities.push('deepen-relative');
-  // Start requesting oids from the remote by their SHAs
+  // Start figuring out which oids from the remote we want to request
   let wants = singleBranch ? [oid] : remoteRefs.values();
-  let haves = [];
-  for (let ref of refs) {
+  // Come up with a reasonable list of oids to tell the remote we already have
+  // (preferably oids that are close ancestors of the branch heads we're fetching)
+  let haveRefs = singleBranch
+    ? refs
+    : await GitRefManager.listRefs({
+      fs,
+      gitdir,
+      filepath: `refs`
+    });
+  let haves = new Set();
+  for (let ref of haveRefs) {
     try {
       ref = await GitRefManager.expand({ fs, gitdir, ref });
-      // TODO: Actually, should we test whether we have the object using readObject?
-      if (!ref.startsWith('refs/tags/')) {
-        let have = await GitRefManager.resolve({ fs, gitdir, ref });
-        haves.push(have);
+      const oid = await GitRefManager.resolve({ fs, gitdir, ref });
+      if (await hasObject({ fs, gitdir, oid })) {
+        haves.add(oid);
       }
     } catch (err) {}
   }
+  haves = haves.values();
   let oids = await GitShallowManager.read({ fs, gitdir });
   let shallows = remoteHTTP.capabilities.has('shallow') ? [...oids] : [];
   let packstream = writeUploadPackRequest({
@@ -6619,22 +6720,23 @@ async function merge ({
     // find most recent common ancestor of ref a and ref b (if there's more than 1, pick 1)
     let baseOid = (await findMergeBase({ gitdir, fs, oids: [ourOid, theirOid] }))[0];
     // handle fast-forward case
-    if (baseOid === theirOid) {
+    if (!baseOid) {
+      throw new GitError(E.MergeNoCommonAncestryError, { theirRef, ourRef })
+    } else if (baseOid === theirOid) {
       return {
         oid: ourOid,
         alreadyMerged: true
       }
-    }
-    if (baseOid === ourOid) {
+    } else if (baseOid === ourOid) {
       await GitRefManager.writeRef({ fs, gitdir, ref: ourRef, value: theirOid });
-      // await checkout({
-      //   dir,
-      //   gitdir,
-      //   fs,
-      //   ref: ourRef,
-      //   emitter,
-      //   emitterPrefix
-      // })
+      await checkout({
+        dir,
+        gitdir,
+        fs,
+        ref: ourRef,
+        emitter,
+        emitterPrefix
+      });
       return {
         oid: theirOid,
         fastForward: true
@@ -6707,6 +6809,12 @@ async function merge ({
                   index.writeConflict({
                     filepath: baseFullpath,
                     stats: baseStats,
+                    ourOid: ours.oid,
+                    theirOid: theirs.oid,
+                    baseOid
+                  });
+                  emitter.emit(`${emitterPrefix}conflict`, {
+                    filepath: baseFullpath,
                     ourOid: ours.oid,
                     theirOid: theirs.oid,
                     baseOid
@@ -6806,6 +6914,7 @@ async function pull ({
     });
     // Merge the remote tracking branch into the local one.
     await merge({
+      dir,
       gitdir,
       fs,
       ourRef: ref,
@@ -7120,13 +7229,37 @@ async function push ({
         }
       }
     }
+    let emptyOid = '0000000000000000000000000000000000000000';
     let oldoid =
-      httpRemote.refs.get(fullRemoteRef) ||
-      '0000000000000000000000000000000000000000';
+      httpRemote.refs.get(fullRemoteRef) || emptyOid;
     let finish = [...httpRemote.refs.values()];
     // hack to speed up common force push scenarios
     let mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] });
     for (let oid of mergebase) finish.push(oid);
+    // TODO: handle shallow depth cutoff gracefully
+    if (
+      mergebase.length === 0 &&
+      oid !== emptyOid &&
+      oldoid !== emptyOid
+    ) {
+      throw new GitError(E.PushRejectedNoCommonAncestry, {})
+    } else if (!force) {
+      // Is it a tag that already exists?
+      if (
+        fullRef.startsWith('refs/tags') &&
+        oldoid !== emptyOid
+      ) {
+        throw new GitError(E.PushRejectedTagExists, {})
+      }
+      // Is it a non-fast-forward commit?
+      if (
+        oid !== emptyOid &&
+        oldoid !== emptyOid &&
+        !(await isDescendent({ fs, gitdir, oid, ancestor: oldoid }))
+      ) {
+        throw new GitError(E.PushRejectedNonFastForward, {})
+      }
+    }
     let commits = await listCommitsAndTags({
       fs,
       gitdir,
@@ -7134,23 +7267,6 @@ async function push ({
       finish
     });
     let objects = await listObjects({ fs, gitdir, oids: commits });
-    if (!force) {
-      // Is it a tag that already exists?
-      if (
-        fullRef.startsWith('refs/tags') &&
-        oldoid !== '0000000000000000000000000000000000000000'
-      ) {
-        throw new GitError(E.PushRejectedTagExists, {})
-      }
-      // Is it a non-fast-forward commit?
-      if (
-        oid !== '0000000000000000000000000000000000000000' &&
-        oldoid !== '0000000000000000000000000000000000000000' &&
-        !(await isDescendent({ fs, gitdir, oid, ancestor: oldoid }))
-      ) {
-        throw new GitError(E.PushRejectedNonFastForward, {})
-      }
-    }
     // We can only safely use capabilities that the server also understands.
     // For instance, AWS CodeCommit aborts a push if you include the `agent`!!!
     const capabilities = filterCapabilities(
@@ -7427,24 +7543,22 @@ async function status ({
       tree: headTree,
       path: filepath
     });
-    let indexEntry = null;
+    let indexEntry;
+    let conflictEntry;
     // Acquire a lock on the index
     await GitIndexManager.acquire(
       { fs, filepath: `${gitdir}/index` },
       async function (index) {
-        for (let entry of index) {
-          if (entry.path === filepath) {
-            indexEntry = entry;
-            break
-          }
-        }
+        indexEntry = index.entriesMap.get(GitIndex.key(filepath, 0));
+        conflictEntry = index.entriesMap.get(GitIndex.key(filepath, 2));
       }
     );
     let stats = await fs.lstat(join(dir, filepath));
 
     let H = treeOid !== null; // head
-    let I = indexEntry !== null; // index
+    let I = !!indexEntry; // index
     let W = stats !== null; // working dir
+    let C = !!conflictEntry; // in conflict
 
     const getWorkdirOid = async () => {
       if (I && !compareStats(indexEntry, stats)) {
@@ -7475,27 +7589,28 @@ async function status ({
       }
     };
 
-    if (!H && !W && !I) return 'absent' // ---
-    if (!H && !W && I) return '*absent' // -A-
-    if (!H && W && !I) return '*added' // --A
+    let prefix = C ? '!' : '';
+    if (!H && !W && !I) return prefix + 'absent' // ---
+    if (!H && !W && I) return prefix + '*absent' // -A-
+    if (!H && W && !I) return prefix + '*added' // --A
     if (!H && W && I) {
       let workdirOid = await getWorkdirOid();
-      return workdirOid === indexEntry.oid ? 'added' : '*added' // -AA : -AB
+      return prefix + (workdirOid === indexEntry.oid ? 'added' : '*added') // -AA : -AB
     }
-    if (H && !W && !I) return 'deleted' // A--
+    if (H && !W && !I) return prefix + 'deleted' // A--
     if (H && !W && I) {
-      return treeOid === indexEntry.oid ? '*deleted' : '*deleted' // AA- : AB-
+      return prefix + (treeOid === indexEntry.oid ? '*deleted' : '*deleted') // AA- : AB-
     }
     if (H && W && !I) {
       let workdirOid = await getWorkdirOid();
-      return workdirOid === treeOid ? '*undeleted' : '*undeletemodified' // A-A : A-B
+      return prefix + (workdirOid === treeOid ? '*undeleted' : '*undeletemodified') // A-A : A-B
     }
     if (H && W && I) {
       let workdirOid = await getWorkdirOid();
       if (workdirOid === treeOid) {
-        return workdirOid === indexEntry.oid ? 'unmodified' : '*unmodified' // AAA : ABA
+        return prefix + (workdirOid === indexEntry.oid ? 'unmodified' : '*unmodified') // AAA : ABA
       } else {
-        return workdirOid === indexEntry.oid ? 'modified' : '*modified' // ABB : AAB
+        return prefix + (workdirOid === indexEntry.oid ? 'modified' : '*modified') // ABB : AAB
       }
     }
     /*
@@ -7574,13 +7689,19 @@ async function getTree ({ fs, gitdir, oid }) {
 }
 
 class GitWalkerIndex {
-  constructor ({ fs, gitdir }) {
+  constructor ({ fs: _fs, gitdir }) {
+    const fs = new FileSystem(_fs);
     this.treePromise = (async () => {
       let result;
       await GitIndexManager.acquire(
         { fs, filepath: `${gitdir}/index` },
         async function (index) {
           result = flatFileListToDirectoryStructure(index.entries);
+          const conflicts = index.conflictedPaths;
+          for (let path of conflicts) {
+            let inode = result.get(path);
+            if (inode) inode.conflict = true;
+          }
         }
       );
       return result
@@ -7687,11 +7808,14 @@ async function statusMatrix ({
   dir,
   gitdir = join(dir, '.git'),
   fs: _fs = cores.get(core).get('fs'),
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
   ref = 'HEAD',
   pattern = null
 }) {
   try {
     const fs = new FileSystem(_fs);
+    let count = 0;
     let patternGlobrex =
       pattern && globrex(pattern, { globstar: true, extended: true });
     let patternBase = pattern && patternRoot(pattern);
@@ -7727,12 +7851,12 @@ async function statusMatrix ({
         // Late filter against file names
         if (patternGlobrex && !patternGlobrex.regex.test(head.fullpath)) return
         // For now, just bail on directories
-        await head.populateStat();
-        if (head.type === 'tree') return
-        await workdir.populateStat();
-        if (workdir.type === 'tree') return
         await stage.populateStat();
         if (stage.type === 'tree') return
+        await workdir.populateStat();
+        if (workdir.type === 'tree') return
+        await head.populateStat();
+        if (head.type === 'tree') return
         // Figure out the oids, using the staged oid for the working dir oid if the stats match.
         await head.populateHash();
         await stage.populateHash();
@@ -7743,11 +7867,18 @@ async function statusMatrix ({
         } else if (workdir.exists) {
           await workdir.populateHash();
         }
+        if (emitter) {
+          emitter.emit(`${emitterPrefix}progress`, {
+            phase: 'Calculating status',
+            loaded: ++count,
+            lengthComputable: false
+          });
+        }
         let entry = [undefined, head.oid, workdir.oid, stage.oid];
         let result = entry.map(value => entry.indexOf(value));
         result.shift(); // remove leading undefined entry
         let fullpath = head.fullpath || workdir.fullpath || stage.fullpath;
-        return [fullpath, ...result]
+        return [fullpath, ...result, !!stage.conflict]
       }
     });
     return results

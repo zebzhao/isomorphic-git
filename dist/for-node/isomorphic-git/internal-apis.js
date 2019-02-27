@@ -81,6 +81,8 @@ const messages = {
   MaxSearchDepthExceeded: `Maximum search depth of { depth } exceeded.`,
   PushRejectedNonFastForward: `Push rejected because it was not a simple fast-forward. Use "force: true" to override.`,
   PushRejectedTagExists: `Push rejected because tag already exists. Use "force: true" to override.`,
+  PushRejectedNoCommonAncestry: `Push rejected because no common ancestor was found.`,
+  MergeNoCommonAncestryError: `Merge failed because no common ancestor was found between { theirRef } and { ourRef }.`,
   AddingRemoteWouldOverwrite: `Adding remote { remote } would overwrite the existing remote. Use "force: true" to override.`,
   PluginUndefined: `A command required the "{ plugin }" plugin but it was undefined.`,
   CoreNotFound: `No plugin core with the name "{ core }" is registered.`,
@@ -154,6 +156,8 @@ const E = {
   MaxSearchDepthExceeded: `MaxSearchDepthExceeded`,
   PushRejectedNonFastForward: `PushRejectedNonFastForward`,
   PushRejectedTagExists: `PushRejectedTagExists`,
+  PushRejectedNoCommonAncestry: `PushRejectedNoCommonAncestry`,
+  MergeNoCommonAncestryError: `MergeNoCommonAncestryError`,
   AddingRemoteWouldOverwrite: `AddingRemoteWouldOverwrite`,
   PluginUndefined: `PluginUndefined`,
   CoreNotFound: `CoreNotFound`,
@@ -550,13 +554,22 @@ function compareRefNames (a, b) {
   return tmp
 }
 
-// For some reason path.posix.join is undefined in webpack
-// Also, this is just much smaller
-function join (...parts) {
-  parts = parts.filter(part => part !== '' && part !== '.');
-  if (parts.length === 0) return '.'
+function normalizePath (path) {
+  return path
+    .replace(/\/\.\//g, '/') // Replace '/./' with '/'
+    .replace(/\/{2,}/g, '/') // Replace consecutive '/'
+    .replace(/^\/\.$/, '/') // if path === '/.' return '/'
+    .replace(/^\.\/$/, '.') // if path === './' return '.'
+    .replace(/^\.\//, '') // Remove leading './'
+    .replace(/\/\.$/, '') // Remove trailing '/.'
+    .replace(/(.+)\/$/, '$1') // Remove trailing '/'
+    .replace(/^$/, '.') // if path === '' return '.'
+}
 
-  return parts.join('/')
+// For some reason path.posix.join is undefined in webpack
+
+function join (...parts) {
+  return normalizePath(parts.map(normalizePath).join('/'))
 }
 
 // This is straight from parse_unit_factor in config.c of canonical git
@@ -1874,8 +1887,11 @@ let shouldLog = null;
 function log (...args) {
   if (shouldLog === null) {
     shouldLog =
-      process.env.DEBUG === '*' ||
-      process.env.DEBUG === 'isomorphic-git' ||
+      (process &&
+        process.env &&
+        process.env.DEBUG &&
+        (process.env.DEBUG === '*' ||
+          process.env.DEBUG === 'isomorphic-git')) ||
       (typeof window !== 'undefined' &&
         typeof window.localStorage !== 'undefined' &&
         (window.localStorage.debug === '*' ||
@@ -4491,6 +4507,7 @@ exports.collect = collect;
 exports.comparePath = comparePath;
 exports.http = http;
 exports.flatFileListToDirectoryStructure = flatFileListToDirectoryStructure;
+exports.join = join;
 exports.log = log;
 exports.oauth2 = oauth2;
 exports.padHex = padHex;
