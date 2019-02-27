@@ -22,11 +22,14 @@ export async function statusMatrix ({
   dir,
   gitdir = join(dir, '.git'),
   fs: _fs = cores.get(core).get('fs'),
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
   ref = 'HEAD',
   pattern = null
 }) {
   try {
     const fs = new FileSystem(_fs)
+    let count = 0
     let patternGlobrex =
       pattern && globrex(pattern, { globstar: true, extended: true })
     let patternBase = pattern && patternRoot(pattern)
@@ -62,12 +65,12 @@ export async function statusMatrix ({
         // Late filter against file names
         if (patternGlobrex && !patternGlobrex.regex.test(head.fullpath)) return
         // For now, just bail on directories
-        await head.populateStat()
-        if (head.type === 'tree' || head.type === 'special') return
-        await workdir.populateStat()
-        if (workdir.type === 'tree' || workdir.type === 'special') return
         await stage.populateStat()
         if (stage.type === 'tree' || stage.type === 'special') return
+        await workdir.populateStat()
+        if (workdir.type === 'tree' || workdir.type === 'special') return
+        await head.populateStat()
+        if (head.type === 'tree' || head.type === 'special') return
         // Figure out the oids, using the staged oid for the working dir oid if the stats match.
         await head.populateHash()
         await stage.populateHash()
@@ -78,11 +81,18 @@ export async function statusMatrix ({
         } else if (workdir.exists) {
           await workdir.populateHash()
         }
+        if (emitter) {
+          emitter.emit(`${emitterPrefix}progress`, {
+            phase: 'Calculating status',
+            loaded: ++count,
+            lengthComputable: false
+          })
+        }
         let entry = [undefined, head.oid, workdir.oid, stage.oid]
         let result = entry.map(value => entry.indexOf(value))
         result.shift() // remove leading undefined entry
         let fullpath = head.fullpath || workdir.fullpath || stage.fullpath
-        return [fullpath, ...result]
+        return [fullpath, ...result, !!stage.conflict]
       }
     })
     return results
