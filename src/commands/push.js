@@ -155,30 +155,37 @@ export async function push ({
         }
       }
     }
-    const oldoid =
-      httpRemote.refs.get(fullRemoteRef) ||
-      '0000000000000000000000000000000000000000'
-    if (!force) {
+    let emptyOid = '0000000000000000000000000000000000000000'
+    let oldoid =
+      httpRemote.refs.get(fullRemoteRef) || emptyOid
+    let finish = [...httpRemote.refs.values()]
+    // hack to speed up common force push scenarios
+    let mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] })
+    for (let oid of mergebase) finish.push(oid)
+    // TODO: handle shallow depth cutoff gracefully
+    if (
+      mergebase.length === 0 &&
+      oid !== emptyOid &&
+      oldoid !== emptyOid
+    ) {
+      throw new GitError(E.PushRejectedNoCommonAncestry, {})
+    } else if (!force) {
       // Is it a tag that already exists?
       if (
         fullRef.startsWith('refs/tags') &&
-        oldoid !== '0000000000000000000000000000000000000000'
+        oldoid !== emptyOid
       ) {
         throw new GitError(E.PushRejectedTagExists, {})
       }
       // Is it a non-fast-forward commit?
       if (
-        oid !== '0000000000000000000000000000000000000000' &&
-        oldoid !== '0000000000000000000000000000000000000000' &&
+        oid !== emptyOid &&
+        oldoid !== emptyOid &&
         !(await isDescendent({ fs, gitdir, oid, ancestor: oldoid }))
       ) {
         throw new GitError(E.PushRejectedNonFastForward, {})
       }
     }
-    let finish = [...httpRemote.refs.values()]
-    // hack to speed up common force push scenarios
-    let mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] })
-    for (let oid of mergebase) finish.push(oid)
     let commits = await listCommitsAndTags({
       fs,
       gitdir,
