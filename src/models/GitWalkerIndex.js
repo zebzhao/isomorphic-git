@@ -14,6 +14,11 @@ export class GitWalkerIndex {
         { fs, filepath: `${gitdir}/index` },
         async function (index) {
           result = flatFileListToDirectoryStructure(index.entries)
+          const conflicts = index.conflictedPaths
+          for (let path of conflicts) {
+            let inode = result.get(path)
+            if (inode) inode.conflict = true
+          }
         }
       )
       return result

@@ -190,6 +190,12 @@ export async function merge ({
                     theirOid: theirs.oid,
                     baseOid
                   })
+                  emitter.emit(`${emitterPrefix}conflict`, {
+                    filepath: baseFullpath,
+                    ourOid: ours.oid,
+                    theirOid: theirs.oid,
+                    baseOid
+                  })
                 } else {
                   let oid = await hashObject({
                     gitdir,

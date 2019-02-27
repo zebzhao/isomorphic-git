@@ -102,6 +102,7 @@ export async function pull ({
     })
     // Merge the remote tracking branch into the local one.
     await merge({
+      dir,
       gitdir,
       fs,
       ours: ref,
