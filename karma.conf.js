@@ -86,7 +86,7 @@ module.exports = function (config) {
         platformName: 'iOS',
         platformVersion: '11.2',
         browserName: 'Safari',
-        appiumVersion: '1.7.2'
+        appiumVersion: '1.9.1'
       },
       sl_ios_safari12: {
         base: 'SauceLabs',
@@ -102,7 +102,7 @@ module.exports = function (config) {
         platformName: 'Android',
         platformVersion: '7.1',
         browserName: 'Chrome',
-        appiumVersion: '1.7.2'
+        appiumVersion: '1.9.1'
       },
       FirefoxHeadless: {
         base: 'Firefox',
@@ -149,11 +149,7 @@ module.exports = function (config) {
       plugins: [
         new webpack.IgnorePlugin(/^(fs|jest-fixtures)$/),
         new webpack.DefinePlugin({
-          'process.env.TEST_PUSH_GITHUB_TOKEN': `'${
-            process.env.TEST_PUSH_GITHUB_TOKEN
-          }'`,
-          'process.env.ENABLE_LIGHTNINGFS': `${!!process.env
-            .ENABLE_LIGHTNINGFS}`
+          'process.env.TEST_PUSH_GITHUB_TOKEN': `'${process.env.TEST_PUSH_GITHUB_TOKEN}'`
         })
       ],
       resolve: {

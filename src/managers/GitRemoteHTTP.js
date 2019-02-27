@@ -19,6 +19,7 @@ export class GitRemoteHTTP {
   static async capabilities () {
     return ['discover', 'connect']
   }
+
   static async discover ({
     core,
     corsProxy,
@@ -31,7 +32,7 @@ export class GitRemoteHTTP {
     const _origUrl = url
     // Auto-append the (necessary) .git if it's missing.
     if (!url.endsWith('.git') && !noGitSuffix) url = url += '.git'
-    let urlAuth = extractAuthFromUrl(url)
+    const urlAuth = extractAuthFromUrl(url)
     if (urlAuth) {
       url = urlAuth.url
       // To try to be backwards compatible with simple-get's behavior, which uses Node's http.request
@@ -54,7 +55,12 @@ export class GitRemoteHTTP {
     if (typeof window === 'undefined' || corsProxy) {
       headers['user-agent'] = headers['user-agent'] || pkg.agent
     }
-    let _auth = calculateBasicAuthUsernamePasswordPair(auth)
+    // If the username came from the URL, we want to allow the password to be missing.
+    // This is because Github allows using the token as the username with an empty password
+    // so that is a style of git clone URL we might encounter and we don't want to throw a "Missing password or token" error.
+    // Also, we don't want to prematurely throw an error before the credentialManager plugin has
+    // had an opportunity to provide the password.
+    const _auth = calculateBasicAuthUsernamePasswordPair(auth, !!urlAuth)
     if (_auth) {
       headers['Authorization'] = calculateBasicAuthHeader(_auth)
     }
@@ -68,7 +74,7 @@ export class GitRemoteHTTP {
       // Acquire credentials and try again
       const credentialManager = cores.get(core).get('credentialManager')
       auth = await credentialManager.fill({ url: _origUrl })
-      let _auth = calculateBasicAuthUsernamePasswordPair(auth)
+      const _auth = calculateBasicAuthUsernamePasswordPair(auth)
       if (_auth) {
         headers['Authorization'] = calculateBasicAuthHeader(_auth)
       }
@@ -93,7 +99,7 @@ export class GitRemoteHTTP {
     }
     // I'm going to be nice and ignore the content-type requirement unless there is a problem.
     try {
-      let remoteHTTP = await parseRefsAdResponse(res.body, {
+      const remoteHTTP = await parseRefsAdResponse(res.body, {
         service
       })
       remoteHTTP.auth = auth
@@ -111,6 +117,7 @@ export class GitRemoteHTTP {
       throw err
     }
   }
+
   static async connect ({
     core,
     emitter,
@@ -125,7 +132,7 @@ export class GitRemoteHTTP {
   }) {
     // Auto-append the (necessary) .git if it's missing.
     if (!url.endsWith('.git') && !noGitSuffix) url = url += '.git'
-    let urlAuth = extractAuthFromUrl(url)
+    const urlAuth = extractAuthFromUrl(url)
     if (urlAuth) {
       url = urlAuth.url
       // To try to be backwards compatible with simple-get's behavior, which uses Node's http.request
@@ -149,11 +156,16 @@ export class GitRemoteHTTP {
     if (typeof window === 'undefined' || corsProxy) {
       headers['user-agent'] = headers['user-agent'] || pkg.agent
     }
-    auth = calculateBasicAuthUsernamePasswordPair(auth)
+    // If the username came from the URL, we want to allow the password to be missing.
+    // This is because Github allows using the token as the username with an empty password
+    // so that is a style of git clone URL we might encounter and we don't want to throw a "Missing password or token" error.
+    // Also, we don't want to prematurely throw an error before the credentialManager plugin has
+    // had an opportunity to provide the password.
+    auth = calculateBasicAuthUsernamePasswordPair(auth, !!urlAuth)
     if (auth) {
       headers['Authorization'] = calculateBasicAuthHeader(auth)
     }
-    let res = await http({
+    const res = await http({
       core,
       emitter,
       emitterPrefix,

@@ -1,3 +1,4 @@
+// @ts-check
 import globrex from 'globrex'
 
 import { GitIndexManager } from '../managers/GitIndexManager.js'
@@ -5,20 +6,46 @@ import { GitRefManager } from '../managers/GitRefManager.js'
 import { FileSystem } from '../models/FileSystem.js'
 import { GitIndex } from '../models/GitIndex'
 import { E, GitError } from '../models/GitError.js'
-import { WORKDIR } from '../models/GitWalkerFs.js'
-import { TREE } from '../models/GitWalkerRepo.js'
 import { join } from '../utils/join.js'
 import { patternRoot } from '../utils/patternRoot.js'
 import { cores } from '../utils/plugins.js'
 import { worthWalking } from '../utils/worthWalking.js'
 
+import { TREE } from './TREE.js'
+import { WORKDIR } from './WORKDIR'
 import { config } from './config'
 import { walkBeta1 } from './walkBeta1'
 
 /**
  * Checkout a branch
  *
- * @link https://isomorphic-git.github.io/docs/checkout.html
+ * If the branch already exists it will check out that branch. Otherwise, it will create a new remote tracking branch set to track the remote branch of that name.
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
+ * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
+ * @param {string} args.ref - Which branch to checkout
+ * @param {string[]} [args.filepaths = ['.']] - Limit the checkout to the given files and directories
+ * @param {string} [args.pattern = null] - Only checkout the files that match a glob pattern. (Pattern is relative to `filepaths` if `filepaths` is provided.)
+ * @param {string} [args.remote = 'origin'] - Which remote repository to use
+ * @param {boolean} [args.noCheckout = false] - If true, will update HEAD but won't update the working directory
+ *
+ * @returns {Promise<void>} Resolves successfully when filesystem operations are complete
+ *
+ * @example
+ * // checkout the master branch
+ * await git.checkout({ dir: '$input((/))', ref: '$input((master))' })
+ * console.log('done')
+ *
+ * @example
+ * // checkout only JSON and Markdown files from master branch
+ * await git.checkout({ dir: '$input((/))', ref: '$input((master))', pattern: '$input((**\/*.{json,md}))' })
+ * console.log('done')
+ *
  */
 export async function checkout ({
   core = 'default',
@@ -29,6 +56,7 @@ export async function checkout ({
   emitterPrefix = '',
   remote = 'origin',
   ref,
+  filepaths = ['.'],
   pattern = null,
   noCheckout = false
 }) {
@@ -40,9 +68,16 @@ export async function checkout ({
         parameter: 'ref'
       })
     }
-    let patternGlobrex =
-      pattern && globrex(pattern, { globstar: true, extended: true })
-    let patternBase = pattern && patternRoot(pattern)
+    let patternPart = ''
+    let patternGlobrex
+    if (pattern) {
+      patternPart = patternRoot(pattern)
+      if (patternPart) {
+        pattern = pattern.replace(patternPart + '/', '')
+      }
+      patternGlobrex = globrex(pattern, { globstar: true, extended: true })
+    }
+    const bases = filepaths.map(filepath => join(filepath, patternPart))
     // Get tree oid
     let oid
     try {
@@ -52,7 +87,7 @@ export async function checkout ({
     } catch (err) {
       // If `ref` doesn't exist, create a new remote tracking branch
       // Figure out the commit to checkout
-      let remoteRef = `${remote}/${ref}`
+      const remoteRef = `${remote}/${ref}`
       oid = await GitRefManager.resolve({
         fs,
         gitdir,
@@ -74,11 +109,11 @@ export async function checkout ({
       // Create a new branch that points at that same commit
       await fs.write(`${gitdir}/refs/heads/${ref}`, oid + '\n')
     }
-    let fullRef = await GitRefManager.expand({ fs, gitdir, ref })
+    const fullRef = await GitRefManager.expand({ fs, gitdir, ref })
 
     if (!noCheckout) {
       let count = 0
-      let gitdirBasename = gitdir.slice(dir.length + 1)
+      const gitdirBasename = dir ? gitdir.replace(dir + '/', '') : gitdir
       // Acquire a lock on the index
       await GitIndexManager.acquire(
         { fs, filepath: `${gitdir}/index` },
@@ -88,22 +123,28 @@ export async function checkout ({
           // are not in the index or are in the index but have the wrong SHA.
           try {
             await walkBeta1({
-              fs,
-              dir,
-              gitdir,
               trees: [TREE({ fs, gitdir, ref }), WORKDIR({ fs, dir, gitdir })],
               filter: async function ([head, workdir]) {
-                // match against 'pattern' parameter
-                if (pattern == null) return true
-                return worthWalking(head.fullpath, patternBase)
+                // match against base paths
+                return bases.some(base => worthWalking(head.fullpath, base))
               },
               map: async function ([head, workdir]) {
                 if (head.fullpath === '.') return
-                // Late filter against file names
-                if (patternGlobrex && !patternGlobrex.regex.test(head.fullpath)) return
-                let workdirPath = workdir.fullpath
+                const workdirPath = workdir.fullpath
                 if (workdirPath === gitdirBasename) return
-                let stage = index.entriesMap.get(GitIndex.key(workdirPath, 0))
+                // Late filter against file names
+                if (patternGlobrex) {
+                  let match = false
+                  for (const base of bases) {
+                    const partToMatch = head.fullpath.replace(base + '/', '')
+                    if (patternGlobrex.regex.test(partToMatch)) {
+                      match = true
+                      break
+                    }
+                  }
+                  if (!match) return
+                }
+                const stage = index.entriesMap.get(GitIndex.key(workdirPath, 0))
                 if (!head.exists) {
                   // if file is not staged, ignore it
                   if (workdir.exists && stage) {
@@ -139,7 +180,7 @@ export async function checkout ({
                   }
                   case 'blob': {
                     await head.populateHash()
-                    let { fullpath, oid, mode } = head
+                    const { fullpath, oid, mode } = head
                     if (!stage || stage.oid !== oid || !workdir.exists) {
                       await head.populateContent()
                       switch (mode) {
@@ -160,7 +201,7 @@ export async function checkout ({
                             message: `Invalid mode "${mode}" detected in blob ${oid}`
                           })
                       }
-                      let stats = await fs.lstat(filepath)
+                      const stats = await fs.lstat(filepath)
                       // We can't trust the executable bit returned by lstat on Windows,
                       // so we need to preserve this value from the TREE.
                       // TODO: Figure out how git handles this internally.

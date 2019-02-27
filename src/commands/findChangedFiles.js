@@ -1,8 +1,8 @@
 import { FileSystem } from '../models/FileSystem.js'
-import { TREE } from '../models/GitWalkerRepo.js'
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
 
+import { TREE } from './TREE.js'
 import { walkBeta1 } from './walkBeta1.js'
 
 /**
@@ -35,6 +35,15 @@ export async function findChangedFiles ({
       ],
       map: async function ([ours, theirs, base]) {
         if (ours.fullpath === '.') return
+
+        await base.populateStat()
+        if (base.type !== 'blob') return
+
+        await theirs.populateStat()
+        if (theirs.type !== 'blob') return
+
+        await ours.populateStat()
+        if (ours.type !== 'blob') return
 
         if (emitter) {
           emitter.emit(`${emitterPrefix}progress`, {

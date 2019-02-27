@@ -16,7 +16,7 @@ function parseCacheEntryFlags (bits) {
 }
 
 function renderCacheEntryFlags (entry) {
-  let flags = entry.flags
+  const flags = entry.flags
   // 1-bit extended flag (must be zero in version 2)
   flags.extended = false
   // 12-bit name length if the length is less than 0xFFF; otherwise 0xFFF
@@ -32,31 +32,31 @@ function renderCacheEntryFlags (entry) {
 
 function parseBuffer (buffer) {
   // Verify shasum
-  let shaComputed = shasum(buffer.slice(0, -20))
-  let shaClaimed = buffer.slice(-20).toString('hex')
+  const shaComputed = shasum(buffer.slice(0, -20))
+  const shaClaimed = buffer.slice(-20).toString('hex')
   if (shaClaimed !== shaComputed) {
     throw new GitError(E.InternalFail, {
       message: `Invalid checksum in GitIndex buffer: expected ${shaClaimed} but saw ${shaComputed}`
     })
   }
-  let reader = new BufferCursor(buffer)
-  let _entries = new Map()
-  let magic = reader.toString('utf8', 4)
+  const reader = new BufferCursor(buffer)
+  const _entries = new Map()
+  const magic = reader.toString('utf8', 4)
   if (magic !== 'DIRC') {
     throw new GitError(E.InternalFail, {
       message: `Invalid dircache magic file number: ${magic}`
     })
   }
-  let version = reader.readUInt32BE()
+  const version = reader.readUInt32BE()
   if (version !== 2) {
     throw new GitError(E.InternalFail, {
       message: `Unsupported dircache version: ${version}`
     })
   }
-  let numEntries = reader.readUInt32BE()
+  const numEntries = reader.readUInt32BE()
   let i = 0
   while (!reader.eof() && i < numEntries) {
-    let entry = {}
+    const entry = {}
     entry.ctimeSeconds = reader.readUInt32BE()
     entry.ctimeNanoseconds = reader.readUInt32BE()
     entry.mtimeSeconds = reader.readUInt32BE()
@@ -68,10 +68,10 @@ function parseBuffer (buffer) {
     entry.gid = reader.readUInt32BE()
     entry.size = reader.readUInt32BE()
     entry.oid = reader.slice(20).toString('hex')
-    let flags = reader.readUInt16BE()
+    const flags = reader.readUInt16BE()
     entry.flags = parseCacheEntryFlags(flags)
     // TODO: handle if (version === 3 && entry.flags.extended)
-    let pathlength = buffer.indexOf(0, reader.tell() + 1) - reader.tell()
+    const pathlength = buffer.indexOf(0, reader.tell() + 1) - reader.tell()
     if (pathlength < 1) {
       throw new GitError(E.InternalFail, {
         message: `Got a path length of: ${pathlength}`
@@ -87,7 +87,7 @@ function parseBuffer (buffer) {
     let padding = 8 - ((reader.tell() - 12) % 8)
     if (padding === 0) padding = 8
     while (padding--) {
-      let tmp = reader.readUInt8()
+      const tmp = reader.readUInt8()
       if (tmp !== 0) {
         throw new GitError(E.InternalFail, {
           message: `Expected 1-8 null characters but got '${tmp}' after ${entry.path}`
@@ -127,34 +127,41 @@ export class GitIndex {
       })
     }
   }
+
   static from (buffer) {
     return new GitIndex(buffer)
   }
+
   static key (path, stage) {
     // No delimiter is needed as long as stage is always 1 char
     return path + stage
   }
+
   get entries () {
     return [...this._entries.values()].sort(compareKey)
   }
+
   get entriesMap () {
     return this._entries
   }
+
   get conflictedPaths () {
     return [...this._entries.keys()]
       .filter(k => k.charAt(k.length - 1) === '2')
       .map(k => k.slice(0, -1))
   }
+
   * [Symbol.iterator] () {
-    for (let entry of this.entries) {
+    for (const entry of this.entries) {
       yield entry
     }
   }
+
   insert ({ filepath, stats, oid, stage = 0 }) {
     stats = normalizeStats(stats)
-    let key = GitIndex.key(filepath, stage)
-    let bfilepath = Buffer.from(filepath)
-    let entry = {
+    const key = GitIndex.key(filepath, stage)
+    const bfilepath = Buffer.from(filepath)
+    const entry = {
       ctimeSeconds: stats.ctimeSeconds,
       ctimeNanoseconds: stats.ctimeNanoseconds,
       mtimeSeconds: stats.mtimeSeconds,
@@ -181,41 +188,46 @@ export class GitIndex {
     this._entries.set(key, entry)
     this._dirty = true
   }
+
   writeConflict ({ filepath, stats, ourOid, theirOid, baseOid }) {
     if (baseOid) this.insert({ filepath, stats, oid: baseOid, stage: 1 })
     this.insert({ filepath, stats, oid: ourOid, stage: 2 })
     this.insert({ filepath, stats, oid: theirOid, stage: 3 })
   }
+
   delete ({ filepath }) {
-    for (let [key, entry] of this._entries.entries()) {
+    for (const [key, entry] of this._entries.entries()) {
       if (entry.path === filepath || entry.path.startsWith(filepath + '/')) {
         this._entries.delete(key)
       }
     }
     this._dirty = true
   }
+
   clear () {
     this._entries.clear()
     this._dirty = true
   }
+
   render () {
     return this.entries
       .map(entry => `${entry.mode.toString(8)} ${entry.oid}    ${entry.path}`)
       .join('\n')
   }
+
   toObject () {
-    let header = Buffer.alloc(12)
-    let writer = new BufferCursor(header)
+    const header = Buffer.alloc(12)
+    const writer = new BufferCursor(header)
     writer.write('DIRC', 4, 'utf8')
     writer.writeUInt32BE(2)
     writer.writeUInt32BE(this.entries.length)
-    let body = Buffer.concat(
+    const body = Buffer.concat(
       this.entries.map(entry => {
         const bpath = Buffer.from(entry.path)
         // the fixed length + the filename + at least one null char => align by 8
-        let length = Math.ceil((62 + bpath.length + 1) / 8) * 8
-        let written = Buffer.alloc(length)
-        let writer = new BufferCursor(written)
+        const length = Math.ceil((62 + bpath.length + 1) / 8) * 8
+        const written = Buffer.alloc(length)
+        const writer = new BufferCursor(written)
         const stat = normalizeStats(entry)
         writer.writeUInt32BE(stat.ctimeSeconds)
         writer.writeUInt32BE(stat.ctimeNanoseconds)
@@ -233,8 +245,8 @@ export class GitIndex {
         return written
       })
     )
-    let main = Buffer.concat([header, body])
-    let sum = shasum(main)
+    const main = Buffer.concat([header, body])
+    const sum = shasum(main)
     return Buffer.concat([main, Buffer.from(sum, 'hex')])
   }
 }

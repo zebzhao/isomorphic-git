@@ -3,8 +3,8 @@ module.exports = function (api) {
 
   const presets = [
     ['@babel/preset-env', {
-      'useBuiltIns': 'usage',
-      'targets': 'chrome 51, ios_saf 11.4'
+      useBuiltIns: 'usage',
+      targets: 'chrome 51, ios_saf 11.4'
     }]
   ]
   const plugins = []

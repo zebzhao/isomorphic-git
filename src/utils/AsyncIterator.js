@@ -38,7 +38,12 @@ export function fromValue (value) {
 // Convert a Node stream to an Async Iterator
 export function fromNodeStream (stream) {
   // Use native async iteration if it's available.
-  if (stream[Symbol.asyncIterator]) return stream
+  if (
+    Object.getOwnPropertyDescriptor(stream, Symbol.asyncIterator) &&
+    Object.getOwnPropertyDescriptor(stream, Symbol.asyncIterator).enumerable
+  ) {
+    return stream
+  }
   // Author's Note
   // I tried many MANY ways to do this.
   // I tried two npm modules (stream-to-async-iterator and streams-to-async-iterator) with no luck.
@@ -47,7 +52,7 @@ export function fromNodeStream (stream) {
   // So if you are horrified that this solution just builds up a queue with no backpressure,
   // and turns Promises inside out, too bad. This is the first code that worked reliably.
   let ended = false
-  let queue = []
+  const queue = []
   let defer = {}
   stream.on('data', chunk => {
     queue.push(chunk)

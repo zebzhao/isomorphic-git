@@ -29,6 +29,7 @@ module.exports = {
     lint: {
       default: series.nps('lint.js', 'lint.typescript'),
       js: `standard ${srcPaths}`,
+      fix: `standard --fix ${srcPaths}`,
       typescript: 'tsc src/index.d.ts --lib es6',
       typescriptTests: 'tsc -p tsconfig.json'
     },
@@ -40,32 +41,33 @@ module.exports = {
     },
     contributors: {
       add: 'all-contributors add',
-      generate:
-        'all-contributors generate && node ./__tests__/__helpers__/fix-all-contributors.js',
+      generate: 'all-contributors generate',
       check: 'all-contributors check'
     },
     build: {
       default: series.nps(
         'build.rollup',
         'build.webpack',
+        'build.errors',
         'build.indexjson',
         'build.treeshake',
         'build.size'
       ),
+      errors: 'node ./__tests__/__helpers__/generate-errors.js',
       webpack: 'webpack',
       rollup: 'rollup -c',
       indexjson: `node __tests__/__helpers__/make_http_index.js`,
       treeshake: 'agadoo',
+      docs: 'node ./__tests__/__helpers__/generate-docs.js',
       size: process.env.CI
         ? optional(
           `cross-env TRAVIS=true ` +
               `GITHUB_TOKEN=${process.env.BUNDLESIZE_GITHUB_TOKEN} ` +
               `TRAVIS_REPO_SLUG=${process.env.TRAVIS_REPO_SLUG ||
                 process.env.BUILD_REPOSITORY_NAME} ` +
-              // TODO: Figure out what the Azure equivalent of TRAVIS_PULL_REQUEST_SHA is.
-              `TRAVIS_PULL_REQUEST_SHA=${
-                process.env.TRAVIS_PULL_REQUEST_SHA
-              } ` +
+              (process.env.TRAVIS_PULL_REQUEST_SHA
+                ? `TRAVIS_PULL_REQUEST_SHA=${process.env.TRAVIS_PULL_REQUEST_SHA} `
+                : '') +
               `bundlesize`
         )
         : optional(`cross-env-shell GITHUB_TOKEN='' bundlesize`)
@@ -90,16 +92,18 @@ module.exports = {
       // and no one should be required to install Python and a C++ compiler to contribute to this code.
       default: process.env.CI
         ? series.nps(
-          'lint',
+          'lint.js',
           'build',
+          'lint.typescript',
           'test.setup',
           'test.one',
           'test.karma',
           'test.teardown'
         )
         : series.nps(
-          'lint',
+          'lint.js',
           'build',
+          'lint.typescript',
           'test.setup',
           'test.one',
           'test.karma',

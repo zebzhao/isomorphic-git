@@ -40,7 +40,11 @@ export interface CommitDescription {
   gpgsig?: string; // PGP signature (if present)
 }
 
-export interface CommitDescriptionWithPayload extends CommitDescription {
+export interface CommitDescriptionWithOid extends CommitDescription {
+  oid: string; // SHA1 object id of this commit
+}
+
+export interface CommitDescriptionWithPayload extends CommitDescriptionWithOid {
   payload: string;
 }
 
@@ -69,6 +73,11 @@ export interface TreeEntry {
   type?: string;
 }
 
+export interface PackObjectsResponse {
+  filename: string;
+  packfile?: Buffer;
+}
+
 export interface PushResponse {
   ok?: string[];
   errors?: string[];
@@ -78,7 +87,9 @@ export interface PushResponse {
 export interface FetchResponse {
   defaultBranch: string;
   fetchHead: string | null;
+  fetchHeadDescription: string | null;
   headers?: object;
+  pruned?: string[];
 }
 
 export interface RemoteDescription {
@@ -91,9 +102,11 @@ export interface RemoteDescription {
 }
 
 export interface MergeReport {
-  oid: string;
+  oid?: string;
   alreadyMerged?: boolean;
   fastForward?: boolean;
+  mergeCommit?: boolean;
+  tree?: string;
 }
 
 export interface RemoteDefinition {
@@ -132,6 +145,10 @@ export interface GitCredentialManagerPlugin {
 
 export interface GitEmitterPlugin {
   emit: any;
+}
+
+export interface GitFsPromisesPlugin {
+  promises: GitFsPlugin;
 }
 
 export interface GitFsPlugin {
@@ -174,7 +191,7 @@ export type GitHttpPlugin = (
 
 export type GitPluginName = "credentialManager" | "emitter" | "fs" | "pgp" | "http"
 
-export type AnyGitPlugin = GitFsPlugin | GitCredentialManagerPlugin | GitEmitterPlugin | GitPgpPlugin | GitHttpPlugin
+export type AnyGitPlugin = GitFsPlugin | GitFsPromisesPlugin | GitCredentialManagerPlugin | GitEmitterPlugin | GitPgpPlugin | GitHttpPlugin
 
 export type GitPluginCore = Map<GitPluginName, AnyGitPlugin>
 
@@ -189,9 +206,7 @@ export const cores: {
   create: (arg: string) => GitPluginCore;
 }
 
-export const E: {
-  [key: string]: string;
-};
+export { E } from './errors';
 
 export function WORKDIR(args: {
   fs: any;
@@ -210,11 +225,9 @@ export function STAGE(args: {
   gitdir: string;
 }): Walker;
 
-export function add(args: {
+export function add(args: WorkDir & GitDir & {
   core?: string;
   fs?: any;
-  dir: string;
-  gitdir?: string;
   filepath: string;
 }): Promise<void>;
 
@@ -258,6 +271,7 @@ export function checkout(args: WorkDir & GitDir & {
   emitterPrefix?: string;
   remote?: string;
   ref?: string;
+  filepaths?: string[];
   pattern?: string;
 }): Promise<void>;
 
@@ -288,7 +302,7 @@ export function commit(args: GitDir & {
   core?: string;
   fs?: any;
   message: string;
-  author: {
+  author?: {
     name?: string;
     email?: string;
     date?: Date;
@@ -303,6 +317,11 @@ export function commit(args: GitDir & {
     timezoneOffset?: number;
   };
   signingKey?: string;
+  noUpdateBranch?: boolean;
+  dryRun?: boolean;
+  ref?: string;
+  parent?: string[];
+  tree?: string;
 }): Promise<string>;
 
 export function config(args: GitDir & {
@@ -374,6 +393,8 @@ export function fetch(args: GitDir & {
   relative?: boolean;
   tags?: boolean;
   singleBranch?: boolean;
+  prune?: boolean;
+  pruneTags?: boolean;
   headers?: { [key: string]: string };
 }): Promise<FetchResponse>;
 
@@ -451,7 +472,7 @@ export function log(args: GitDir & {
   ref?: string;
   depth?: number;
   since?: Date;
-}): Promise<Array<CommitDescription>>;
+}): Promise<Array<CommitDescriptionWithOid>>;
 export function log(args: GitDir & {
   core?: string;
   fs?: any;
@@ -459,7 +480,7 @@ export function log(args: GitDir & {
   depth?: number;
   since?: Date;
   signing: false;
-}): Promise<Array<CommitDescription>>;
+}): Promise<Array<CommitDescriptionWithOid>>;
 export function log(args: GitDir & {
   core?: string;
   fs?: any;
@@ -477,12 +498,38 @@ export function merge(args: GitDir & {
   ourRef?: string;
   theirRef: string;
   fastForwardOnly?: boolean;
+  dryRun?: boolean;
+  noUpdateBranch?: boolean;
+  message?: string;
+  author?: {
+    name?: string;
+    email?: string;
+    date?: Date;
+    timestamp?: number;
+    timezoneOffset?: number;
+  };
+  committer?: {
+    name?: string;
+    email?: string;
+    date?: Date;
+    timestamp?: number;
+    timezoneOffset?: number;
+  };
+  signingKey?: string;
 }): Promise<MergeReport>;
+
+export function packObjects(args: GitDir & {
+  core?: string;
+  fs?: any;
+  oids: string[];
+  write?: boolean;
+}): Promise<PackObjectsResponse>;
 
 export function pull(args: WorkDir & GitDir & {
   core?: string;
   fs?: any;
   ref?: string;
+  corsProxy?: string;
   singleBranch?: boolean;
   fastForwardOnly?: boolean;
   username?: string;
@@ -492,6 +539,21 @@ export function pull(args: WorkDir & GitDir & {
   headers?: { [key: string]: string };
   emitter?: EventEmitter;
   emitterPrefix?: string;
+  author?: {
+    name?: string;
+    email?: string;
+    date?: Date;
+    timestamp?: number;
+    timezoneOffset?: number;
+  };
+  committer?: {
+    name?: string;
+    email?: string;
+    date?: Date;
+    timestamp?: number;
+    timezoneOffset?: number;
+  };
+  signingKey?: string;
 }): Promise<void>;
 
 export function push(args: GitDir & {
@@ -557,6 +619,7 @@ export function statusMatrix(args: WorkDir & GitDir & {
   core?: string;
   fs?: any;
   ref?: string;
+  filepaths?: string[];
   pattern?: string;
 }): Promise<StatusMatrix>;
 
@@ -595,6 +658,18 @@ export function writeObject(args: GitDir & {
   oid?: string;
   encoding?: string;
 }): Promise<string>;
+
+type HashBlobResult = {
+  oid: string;
+  type: 'blob';
+  object: Buffer;
+  format: 'wrapped';
+}
+
+export function hashBlob(args: {
+  core?: string;
+  object: string | Buffer | CommitDescription | TreeDescription | TagDescription;
+}): Promise<HashBlobResult>;
 
 export function writeRef(args: GitDir & {
   core?: string;

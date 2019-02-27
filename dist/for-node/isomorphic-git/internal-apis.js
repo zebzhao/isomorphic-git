@@ -5,7 +5,6 @@ Object.defineProperty(exports, '__esModule', { value: true });
 function _interopDefault (ex) { return (ex && (typeof ex === 'object') && 'default' in ex) ? ex['default'] : ex; }
 
 var pify = _interopDefault(require('pify'));
-var nick = _interopDefault(require('nick'));
 var pako = _interopDefault(require('pako'));
 var crc32 = _interopDefault(require('crc-32'));
 var applyDelta = _interopDefault(require('git-apply-delta'));
@@ -13,15 +12,17 @@ var marky = require('marky');
 var Hash = _interopDefault(require('sha.js/sha1'));
 var ignore = _interopDefault(require('ignore'));
 var AsyncLock = _interopDefault(require('async-lock'));
+var diff3Merge = _interopDefault(require('diff3'));
 var _path = _interopDefault(require('path'));
 
 // modeled after Therror https://github.com/therror/therror/
+// but with the goal of being much lighter weight.
 
 const messages = {
   FileReadError: `Could not read file "{ filepath }".`,
   MissingRequiredParameterError: `The function "{ function }" requires a "{ parameter }" parameter but none was provided.`,
   InvalidRefNameError: `Failed to { verb } { noun } "{ ref }" because that name would not be a valid git reference. A valid alternative would be "{ suggestion }".`,
-  InvalidParameterCombinationError: `The function "{ function }" doesn't take these parameters simultaneously: { parameters.join(", ") }`,
+  InvalidParameterCombinationError: `The function "{ function }" doesn't take these parameters simultaneously: { parameters }`,
   RefExistsError: `Failed to create { noun } "{ ref }" because { noun } "{ ref }" already exists.`,
   RefNotExistsError: `Failed to { verb } { noun } "{ ref }" because { noun } "{ ref }" does not exists.`,
   BranchDeleteError: `Failed to delete branch "{ ref }" because branch "{ ref }" checked out now.`,
@@ -167,15 +168,30 @@ const E = {
   ShortOidNotFound: `ShortOidNotFound`
 };
 
+function renderTemplate (template, values) {
+  let result = template;
+  for (const key of Object.keys(values)) {
+    let subs;
+    if (Array.isArray(values[key])) {
+      subs = values[key].join(', ');
+    } else {
+      subs = String(values[key]);
+    }
+    result = result.replace(new RegExp(`{ ${key} }`, 'g'), subs);
+  }
+  return result
+}
+
 class GitError extends Error {
   constructor (code, data) {
     super();
     this.name = code;
     this.code = code;
     this.data = data;
-    this.message = nick(messages[code])(data || {});
+    this.message = renderTemplate(messages[code], data || {});
     if (Error.captureStackTrace) Error.captureStackTrace(this, this.constructor);
   }
+
   toJSON () {
     return {
       code: this.code,
@@ -184,6 +200,7 @@ class GitError extends Error {
       message: this.message
     }
   }
+
   toString () {
     return this.stack.toString()
   }
@@ -195,7 +212,7 @@ function compareStrings (a, b) {
 }
 
 function dirname (path) {
-  let last = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  const last = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
   if (last === -1) return '.'
   if (last === 0) return '/'
   return path.slice(0, last)
@@ -206,6 +223,7 @@ async function sleep (ms) {
 }
 
 const delayedReleases = new Map();
+const fsmap = new WeakMap();
 /**
  * This is just a collection of helper functions really. At least that's how it started.
  */
@@ -216,18 +234,47 @@ class FileSystem {
     if (fs === undefined) {
       throw new GitError(E.PluginUndefined, { plugin: 'fs' })
     }
-    if (typeof fs._readFile !== 'undefined') return fs
-    this._readFile = pify(fs.readFile.bind(fs));
-    this._writeFile = pify(fs.writeFile.bind(fs));
-    this._mkdir = pify(fs.mkdir.bind(fs));
-    this._rmdir = pify(fs.rmdir.bind(fs));
-    this._unlink = pify(fs.unlink.bind(fs));
-    this._stat = pify(fs.stat.bind(fs));
-    this._lstat = pify(fs.lstat.bind(fs));
-    this._readdir = pify(fs.readdir.bind(fs));
-    this._readlink = pify(fs.readlink.bind(fs));
-    this._symlink = pify(fs.symlink.bind(fs));
+    // This is sad... but preserving reference equality is now necessary
+    // to deal with cache invalidation in GitIndexManager.
+    if (fsmap.has(fs)) {
+      return fsmap.get(fs)
+    }
+    if (fsmap.has(fs._original_unwrapped_fs)) {
+      return fsmap.get(fs._original_unwrapped_fs)
+    }
+
+    if (typeof fs._original_unwrapped_fs !== 'undefined') return fs
+
+    if (
+      Object.getOwnPropertyDescriptor(fs, 'promises') &&
+      Object.getOwnPropertyDescriptor(fs, 'promises').enumerable
+    ) {
+      this._readFile = fs.promises.readFile.bind(fs.promises);
+      this._writeFile = fs.promises.writeFile.bind(fs.promises);
+      this._mkdir = fs.promises.mkdir.bind(fs.promises);
+      this._rmdir = fs.promises.rmdir.bind(fs.promises);
+      this._unlink = fs.promises.unlink.bind(fs.promises);
+      this._stat = fs.promises.stat.bind(fs.promises);
+      this._lstat = fs.promises.lstat.bind(fs.promises);
+      this._readdir = fs.promises.readdir.bind(fs.promises);
+      this._readlink = fs.promises.readlink.bind(fs.promises);
+      this._symlink = fs.promises.symlink.bind(fs.promises);
+    } else {
+      this._readFile = pify(fs.readFile.bind(fs));
+      this._writeFile = pify(fs.writeFile.bind(fs));
+      this._mkdir = pify(fs.mkdir.bind(fs));
+      this._rmdir = pify(fs.rmdir.bind(fs));
+      this._unlink = pify(fs.unlink.bind(fs));
+      this._stat = pify(fs.stat.bind(fs));
+      this._lstat = pify(fs.lstat.bind(fs));
+      this._readdir = pify(fs.readdir.bind(fs));
+      this._readlink = pify(fs.readlink.bind(fs));
+      this._symlink = pify(fs.symlink.bind(fs));
+    }
+    this._original_unwrapped_fs = fs;
+    fsmap.set(fs, this);
   }
+
   /**
    * Return true if a file exists, false if it doesn't exist.
    * Rethrows errors that aren't related to file existance.
@@ -245,6 +292,7 @@ class FileSystem {
       }
     }
   }
+
   /**
    * Return the contents of a file if it exists, otherwise returns null.
    */
@@ -260,6 +308,7 @@ class FileSystem {
       return null
     }
   }
+
   /**
    * Write a file (creating missing directories if need be) without throwing errors.
    */
@@ -273,6 +322,7 @@ class FileSystem {
       await this._writeFile(filepath, contents, options);
     }
   }
+
   /**
    * Make a directory (or series of nested directories) without throwing an error if it already exists.
    */
@@ -289,7 +339,7 @@ class FileSystem {
       if (_selfCall) throw err
       // If we got a "no such file or directory error" backup and try again.
       if (err.code === 'ENOENT') {
-        let parent = dirname(filepath);
+        const parent = dirname(filepath);
         // Check to see if we've gone too far
         if (parent === '.' || parent === '/' || parent === filepath) throw err
         // Infinite recursion, what could go wrong?
@@ -298,6 +348,7 @@ class FileSystem {
       }
     }
   }
+
   /**
    * Delete a file without throwing an error if it is already deleted.
    */
@@ -308,12 +359,13 @@ class FileSystem {
       if (err.code !== 'ENOENT') throw err
     }
   }
+
   /**
    * Read a directory without throwing an error is the directory doesn't exist
    */
   async readdir (filepath) {
     try {
-      let names = await this._readdir(filepath);
+      const names = await this._readdir(filepath);
       // Ordering is not guaranteed, and system specific (Windows vs Unix)
       // so we must sort them ourselves.
       names.sort(compareStrings);
@@ -323,6 +375,7 @@ class FileSystem {
       return []
     }
   }
+
   /**
    * Return a flast list of all the files nested inside a directory
    *
@@ -341,13 +394,14 @@ class FileSystem {
     );
     return files.reduce((a, f) => a.concat(f), [])
   }
+
   /**
    * Return the Stats of a file/symlink if it exists, otherwise returns null.
    * Rethrows errors that aren't related to file existance.
    */
   async lstat (filename) {
     try {
-      let stats = await this._lstat(filename);
+      const stats = await this._lstat(filename);
       return stats
     } catch (err) {
       if (err.code === 'ENOENT') {
@@ -356,6 +410,7 @@ class FileSystem {
       throw err
     }
   }
+
   /**
    * Reads the contents of a symlink if it exists, otherwise returns null.
    * Rethrows errors that aren't related to file existance.
@@ -372,6 +427,7 @@ class FileSystem {
       throw err
     }
   }
+
   /**
    * Write the contents of buffer to a symlink.
    */
@@ -447,13 +503,16 @@ class GitPackedRefs {
     }
     return this
   }
+
   static from (text) {
     return new GitPackedRefs(text)
   }
+
   delete (ref) {
     this.parsedConfig = this.parsedConfig.filter(entry => entry.ref !== ref);
     this.refs.delete(ref);
   }
+
   toString () {
     return this.parsedConfig.map(({ line }) => line).join('\n') + '\n'
   }
@@ -468,6 +527,7 @@ class GitRefSpec {
       matchPrefix
     });
   }
+
   static from (refspec) {
     const [
       forceMatch,
@@ -492,6 +552,7 @@ class GitRefSpec {
     })
     // TODO: We need to run resolveRef on both paths to expand them to their full name.
   }
+
   translate (remoteBranch) {
     if (this.matchPrefix) {
       if (remoteBranch.startsWith(this.remotePath)) {
@@ -502,12 +563,24 @@ class GitRefSpec {
     }
     return null
   }
+
+  reverseTranslate (localBranch) {
+    if (this.matchPrefix) {
+      if (localBranch.startsWith(this.localPath)) {
+        return this.remotePath + localBranch.replace(this.localPath, '')
+      }
+    } else {
+      if (localBranch === this.localPath) return this.remotePath
+    }
+    return null
+  }
 }
 
 class GitRefSpecSet {
   constructor (rules = []) {
     this.rules = rules;
   }
+
   static from (refspecs) {
     const rules = [];
     for (const refspec of refspecs) {
@@ -515,10 +588,12 @@ class GitRefSpecSet {
     }
     return new GitRefSpecSet(rules)
   }
+
   add (refspec) {
     const rule = GitRefSpec.from(refspec); // might throw
     this.rules.push(rule);
   }
+
   translate (remoteRefs) {
     const result = [];
     for (const rule of this.rules) {
@@ -531,6 +606,7 @@ class GitRefSpecSet {
     }
     return result
   }
+
   translateOne (remoteRef) {
     let result = null;
     for (const rule of this.rules) {
@@ -541,13 +617,19 @@ class GitRefSpecSet {
     }
     return result
   }
+
+  localNamespaces () {
+    return this.rules
+      .filter(rule => rule.matchPrefix)
+      .map(rule => rule.localPath.replace(/\/$/, ''))
+  }
 }
 
 function compareRefNames (a, b) {
   // https://stackoverflow.com/a/40355107/2168416
-  let _a = a.replace(/\^\{\}$/, '');
-  let _b = b.replace(/\^\{\}$/, '');
-  let tmp = -(_a < _b) || +(_a > _b);
+  const _a = a.replace(/\^\{\}$/, '');
+  const _b = b.replace(/\^\{\}$/, '');
+  const tmp = -(_a < _b) || +(_a > _b);
   if (tmp === 0) {
     return a.endsWith('^{}') ? 1 : -1
   }
@@ -719,9 +801,11 @@ class GitConfig {
       return { line, isSection, section, subsection, name, value, path }
     });
   }
+
   static from (text) {
     return new GitConfig(text)
   }
+
   async get (path, getall = false) {
     const allValues = this.parsedConfig
       .filter(config => config.path === path.toLowerCase())
@@ -731,23 +815,28 @@ class GitConfig {
       });
     return getall ? allValues : allValues.pop()
   }
+
   async getall (path) {
     return this.get(path, true)
   }
+
   async getSubsections (section) {
     return this.parsedConfig
       .filter(config => config.section === section && config.isSection)
       .map(config => config.subsection)
   }
+
   async deleteSection (section, subsection) {
     this.parsedConfig = this.parsedConfig.filter(
       config =>
         !(config.section === section && config.subsection === subsection)
     );
   }
+
   async append (path, value) {
     return this.set(path, value, true)
   }
+
   async set (path, value, append = false) {
     const configIndex = findLastIndex(
       this.parsedConfig,
@@ -806,6 +895,7 @@ class GitConfig {
       }
     }
   }
+
   toString () {
     return this.parsedConfig
       .map(({ line, section, subsection, name, value, modified = false }) => {
@@ -829,9 +919,10 @@ class GitConfigManager {
     const fs = new FileSystem(_fs);
     // We can improve efficiency later if needed.
     // TODO: read from full list of git config files
-    let text = await fs.read(`${gitdir}/config`, { encoding: 'utf8' });
+    const text = await fs.read(`${gitdir}/config`, { encoding: 'utf8' });
     return GitConfig.from(text)
   }
+
   static async save ({ fs: _fs, gitdir, config }) {
     const fs = new FileSystem(_fs);
     // We can improve efficiency later if needed.
@@ -855,13 +946,7 @@ const refpaths = ref => [
 ];
 
 // @see https://git-scm.com/docs/gitrepository-layout
-const GIT_FILES = [
-  'config',
-  'description',
-  'index',
-  'shallow',
-  'commondir'
-];
+const GIT_FILES = ['config', 'description', 'index', 'shallow', 'commondir'];
 
 class GitRefManager {
   static async updateRemoteRefs ({
@@ -871,11 +956,13 @@ class GitRefManager {
     refs,
     symrefs,
     tags,
-    refspecs
+    refspecs = undefined,
+    prune = false,
+    pruneTags = false
   }) {
     const fs = new FileSystem(_fs);
     // Validate input
-    for (let value of refs.values()) {
+    for (const value of refs.values()) {
       if (!value.match(/[0-9a-f]{40}/)) {
         throw new GitError(E.NotAnOidFail, { value })
       }
@@ -890,14 +977,26 @@ class GitRefManager {
       refspecs.unshift(`+HEAD:refs/remotes/${remote}/HEAD`);
     }
     const refspec = GitRefSpecSet.from(refspecs);
-    let actualRefsToWrite = new Map();
+    const actualRefsToWrite = new Map();
+    // Delete all current tags if the pruneTags argument is true.
+    if (pruneTags) {
+      const tags = await GitRefManager.listRefs({
+        fs,
+        gitdir,
+        filepath: 'refs/tags'
+      });
+      await GitRefManager.deleteRefs({
+        fs,
+        gitdir,
+        refs: tags.map(tag => `refs/tags/${tag}`)
+      });
+    }
     // Add all tags if the fetch tags argument is true.
     if (tags) {
       for (const serverRef of refs.keys()) {
         if (serverRef.startsWith('refs/tags') && !serverRef.endsWith('^{}')) {
-          const filename = join(gitdir, serverRef);
           // Git's behavior is to only fetch tags that do not conflict with tags already present.
-          if (!(await fs.exists(filename))) {
+          if (!(await GitRefManager.exists({ fs, gitdir, ref: serverRef }))) {
             // If there is a dereferenced an annotated tag value available, prefer that.
             const oid = refs.get(serverRef + '^{}') || refs.get(serverRef);
             actualRefsToWrite.set(serverRef, oid);
@@ -906,17 +1005,36 @@ class GitRefManager {
       }
     }
     // Combine refs and symrefs giving symrefs priority
-    let refTranslations = refspec.translate([...refs.keys()]);
-    for (let [serverRef, translatedRef] of refTranslations) {
-      let value = refs.get(serverRef);
+    const refTranslations = refspec.translate([...refs.keys()]);
+    for (const [serverRef, translatedRef] of refTranslations) {
+      const value = refs.get(serverRef);
       actualRefsToWrite.set(translatedRef, value);
     }
-    let symrefTranslations = refspec.translate([...symrefs.keys()]);
-    for (let [serverRef, translatedRef] of symrefTranslations) {
-      let value = symrefs.get(serverRef);
-      let symtarget = refspec.translateOne(value);
+    const symrefTranslations = refspec.translate([...symrefs.keys()]);
+    for (const [serverRef, translatedRef] of symrefTranslations) {
+      const value = symrefs.get(serverRef);
+      const symtarget = refspec.translateOne(value);
       if (symtarget) {
         actualRefsToWrite.set(translatedRef, `ref: ${symtarget}`);
+      }
+    }
+    // If `prune` argument is true, clear out the existing local refspec roots
+    const pruned = [];
+    if (prune) {
+      for (const filepath of refspec.localNamespaces()) {
+        const refs = (await GitRefManager.listRefs({
+          fs,
+          gitdir,
+          filepath
+        })).map(file => `${filepath}/${file}`);
+        for (const ref of refs) {
+          if (!actualRefsToWrite.has(ref)) {
+            pruned.push(ref);
+          }
+        }
+      }
+      if (pruned.length > 0) {
+        await GitRefManager.deleteRefs({ fs, gitdir, refs: pruned });
       }
     }
     // Update files
@@ -934,10 +1052,12 @@ class GitRefManager {
     // Examples of refs we need to avoid writing in loose format for efficieny's sake
     // are .git/refs/remotes/origin/refs/remotes/remote_mirror_3059
     // and .git/refs/remotes/origin/refs/merge-requests
-    for (let [key, value] of actualRefsToWrite) {
+    for (const [key, value] of actualRefsToWrite) {
       await fs.write(join(gitdir, key), `${value.trim()}\n`, 'utf8');
     }
+    return { pruned }
   }
+
   // TODO: make this less crude?
   static async writeRef ({ fs: _fs, gitdir, ref, value }) {
     const fs = new FileSystem(_fs);
@@ -947,24 +1067,36 @@ class GitRefManager {
     }
     await fs.write(join(gitdir, ref), `${value.trim()}\n`, 'utf8');
   }
+
   static async writeSymbolicRef ({ fs: _fs, gitdir, ref, value }) {
     const fs = new FileSystem(_fs);
     await fs.write(join(gitdir, ref), 'ref: ' + `${value.trim()}\n`, 'utf8');
   }
-  static async deleteRef ({ fs: _fs, gitdir, ref }) {
+
+  static async deleteRef ({ fs, gitdir, ref }) {
+    return GitRefManager.deleteRefs({ fs, gitdir, refs: [ref] })
+  }
+
+  static async deleteRefs ({ fs: _fs, gitdir, refs }) {
     const fs = new FileSystem(_fs);
     // Delete regular ref
-    await fs.rm(join(gitdir, ref));
+    await Promise.all(refs.map(ref => fs.rm(join(gitdir, ref))));
     // Delete any packed ref
     let text = await fs.read(`${gitdir}/packed-refs`, { encoding: 'utf8' });
     const packed = GitPackedRefs.from(text);
-    if (packed.refs.has(ref)) {
-      packed.delete(ref);
+    const beforeSize = packed.refs.size;
+    for (const ref of refs) {
+      if (packed.refs.has(ref)) {
+        packed.delete(ref);
+      }
+    }
+    if (packed.refs.size < beforeSize) {
       text = packed.toString();
       await fs.write(`${gitdir}/packed-refs`, text, { encoding: 'utf8' });
     }
   }
-  static async resolve ({ fs: _fs, gitdir, ref, depth }) {
+
+  static async resolve ({ fs: _fs, gitdir, ref, depth = undefined }) {
     const fs = new FileSystem(_fs);
     if (depth !== undefined) {
       depth--;
@@ -983,12 +1115,11 @@ class GitRefManager {
       return ref
     }
     // We need to alternate between the file system and the packed-refs
-    let packedMap = await GitRefManager.packedRefs({ fs, gitdir });
+    const packedMap = await GitRefManager.packedRefs({ fs, gitdir });
     // Look in all the proper paths, in this order
-    const allpaths = refpaths(ref)
-      .filter((p) => !GIT_FILES.includes(p)); // exclude git system files (#709)
+    const allpaths = refpaths(ref).filter(p => !GIT_FILES.includes(p)); // exclude git system files (#709)
 
-    for (let ref of allpaths) {
+    for (const ref of allpaths) {
       sha =
         (await fs.read(`${gitdir}/${ref}`, { encoding: 'utf8' })) ||
         packedMap.get(ref);
@@ -999,6 +1130,7 @@ class GitRefManager {
     // Do we give up?
     throw new GitError(E.ResolveRefError, { ref })
   }
+
   static async exists ({ fs, gitdir, ref }) {
     try {
       await GitRefManager.expand({ fs, gitdir, ref });
@@ -1007,6 +1139,7 @@ class GitRefManager {
       return false
     }
   }
+
   static async expand ({ fs: _fs, gitdir, ref }) {
     const fs = new FileSystem(_fs);
     // Is it a complete and valid SHA?
@@ -1014,26 +1147,28 @@ class GitRefManager {
       return ref
     }
     // We need to alternate between the file system and the packed-refs
-    let packedMap = await GitRefManager.packedRefs({ fs, gitdir });
+    const packedMap = await GitRefManager.packedRefs({ fs, gitdir });
     // Look in all the proper paths, in this order
     const allpaths = refpaths(ref);
-    for (let ref of allpaths) {
+    for (const ref of allpaths) {
       if (await fs.exists(`${gitdir}/${ref}`)) return ref
       if (packedMap.has(ref)) return ref
     }
     // Do we give up?
     throw new GitError(E.ExpandRefError, { ref })
   }
-  static async expandAgainstMap ({ fs: _fs, gitdir, ref, map }) {
+
+  static async expandAgainstMap ({ ref, map }) {
     // Look in all the proper paths, in this order
     const allpaths = refpaths(ref);
-    for (let ref of allpaths) {
+    for (const ref of allpaths) {
       if (await map.has(ref)) return ref
     }
     // Do we give up?
     throw new GitError(E.ExpandRefError, { ref })
   }
-  static resolveAgainstMap ({ ref, fullref = ref, depth, map }) {
+
+  static resolveAgainstMap ({ ref, fullref = ref, depth = undefined, map }) {
     if (depth !== undefined) {
       depth--;
       if (depth === -1) {
@@ -1051,8 +1186,8 @@ class GitRefManager {
     }
     // Look in all the proper paths, in this order
     const allpaths = refpaths(ref);
-    for (let ref of allpaths) {
-      let sha = map.get(ref);
+    for (const ref of allpaths) {
+      const sha = map.get(ref);
       if (sha) {
         return GitRefManager.resolveAgainstMap({
           ref: sha.trim(),
@@ -1065,16 +1200,18 @@ class GitRefManager {
     // Do we give up?
     throw new GitError(E.ResolveRefError, { ref })
   }
+
   static async packedRefs ({ fs: _fs, gitdir }) {
     const fs = new FileSystem(_fs);
     const text = await fs.read(`${gitdir}/packed-refs`, { encoding: 'utf8' });
     const packed = GitPackedRefs.from(text);
     return packed.refs
   }
+
   // List all the refs that match the `filepath` prefix
   static async listRefs ({ fs: _fs, gitdir, filepath }) {
     const fs = new FileSystem(_fs);
-    let packedMap = GitRefManager.packedRefs({ fs, gitdir });
+    const packedMap = GitRefManager.packedRefs({ fs, gitdir });
     let files = null;
     try {
       files = await fs.readdirDeep(`${gitdir}/${filepath}`);
@@ -1098,6 +1235,7 @@ class GitRefManager {
     files.sort(compareRefNames);
     return files
   }
+
   static async listBranches ({ fs: _fs, gitdir, remote }) {
     const fs = new FileSystem(_fs);
     if (remote) {
@@ -1110,9 +1248,10 @@ class GitRefManager {
       return GitRefManager.listRefs({ fs, gitdir, filepath: `refs/heads` })
     }
   }
+
   static async listTags ({ fs: _fs, gitdir }) {
     const fs = new FileSystem(_fs);
-    let tags = await GitRefManager.listRefs({
+    const tags = await GitRefManager.listRefs({
       fs,
       gitdir,
       filepath: `refs/tags`
@@ -1131,9 +1270,9 @@ function formatAuthor ({ name, email, timestamp, timezoneOffset }) {
 // but can also default to +0 was extraordinary.
 
 function formatTimezoneOffset (minutes) {
-  let sign = simpleSign(negateExceptForZero(minutes));
+  const sign = simpleSign(negateExceptForZero(minutes));
   minutes = Math.abs(minutes);
-  let hours = Math.floor(minutes / 60);
+  const hours = Math.floor(minutes / 60);
   minutes -= hours * 60;
   let strHours = String(hours);
   let strMinutes = String(minutes);
@@ -1161,7 +1300,7 @@ function normalizeNewlines (str) {
 }
 
 function parseAuthor (author) {
-  let [, name, email, timestamp, offset] = author.match(
+  const [, name, email, timestamp, offset] = author.match(
     /^(.*) <(.*)> (.*) (.*)$/
   );
   return {
@@ -1220,7 +1359,7 @@ ${obj.signature ? obj.signature : ''}`
   }
 
   message () {
-    let tag = this.withoutSignature();
+    const tag = this.withoutSignature();
     return tag.slice(tag.indexOf('\n\n') + 2)
   }
 
@@ -1236,9 +1375,9 @@ ${obj.signature ? obj.signature : ''}`
   }
 
   headers () {
-    let headers = this.justHeaders().split('\n');
-    let hs = [];
-    for (let h of headers) {
+    const headers = this.justHeaders().split('\n');
+    const hs = [];
+    for (const h of headers) {
       if (h[0] === ' ') {
         // combine with previous header (without space indent)
         hs[hs.length - 1] += '\n' + h.slice(1);
@@ -1246,10 +1385,10 @@ ${obj.signature ? obj.signature : ''}`
         hs.push(h);
       }
     }
-    let obj = {};
-    for (let h of hs) {
-      let key = h.slice(0, h.indexOf(' '));
-      let value = h.slice(h.indexOf(' ') + 1);
+    const obj = {};
+    for (const h of hs) {
+      const key = h.slice(0, h.indexOf(' '));
+      const value = h.slice(h.indexOf(' ') + 1);
       if (Array.isArray(obj[key])) {
         obj[key].push(value);
       } else {
@@ -1266,13 +1405,13 @@ ${obj.signature ? obj.signature : ''}`
   }
 
   withoutSignature () {
-    let tag = normalizeNewlines(this._tag);
+    const tag = normalizeNewlines(this._tag);
     if (tag.indexOf('\n-----BEGIN PGP SIGNATURE-----') === -1) return tag
     return tag.slice(0, tag.lastIndexOf('\n-----BEGIN PGP SIGNATURE-----'))
   }
 
   signature () {
-    let signature = this._tag.slice(
+    const signature = this._tag.slice(
       this._tag.indexOf('-----BEGIN PGP SIGNATURE-----'),
       this._tag.indexOf('-----END PGP SIGNATURE-----') +
         '-----END PGP SIGNATURE-----'.length
@@ -1289,7 +1428,7 @@ ${obj.signature ? obj.signature : ''}`
     let { signature } = await pgp.sign({ payload, secretKey });
     // renormalize the line endings to the one true line-ending
     signature = normalizeNewlines(signature);
-    let signedTag = payload + signature;
+    const signedTag = payload + signature;
     // return a new tag object
     return GitAnnotatedTag.from(signedTag)
   }
@@ -1334,9 +1473,9 @@ class GitCommit {
   }
 
   static fromPayloadSignature ({ payload, signature }) {
-    let headers = GitCommit.justHeaders(payload);
-    let message = GitCommit.justMessage(payload);
-    let commit = normalizeNewlines(
+    const headers = GitCommit.justHeaders(payload);
+    const message = GitCommit.justMessage(payload);
+    const commit = normalizeNewlines(
       headers + '\ngpgsig' + indent(signature) + '\n' + message
     );
     return new GitCommit(commit)
@@ -1373,9 +1512,9 @@ class GitCommit {
   }
 
   parseHeaders () {
-    let headers = GitCommit.justHeaders(this._commit).split('\n');
-    let hs = [];
-    for (let h of headers) {
+    const headers = GitCommit.justHeaders(this._commit).split('\n');
+    const hs = [];
+    for (const h of headers) {
       if (h[0] === ' ') {
         // combine with previous header (without space indent)
         hs[hs.length - 1] += '\n' + h.slice(1);
@@ -1383,12 +1522,12 @@ class GitCommit {
         hs.push(h);
       }
     }
-    let obj = {
+    const obj = {
       parent: []
     };
-    for (let h of hs) {
-      let key = h.slice(0, h.indexOf(' '));
-      let value = h.slice(h.indexOf(' ') + 1);
+    for (const h of hs) {
+      const key = h.slice(0, h.indexOf(' '));
+      const value = h.slice(h.indexOf(' ') + 1);
       if (Array.isArray(obj[key])) {
         obj[key].push(value);
       } else {
@@ -1417,13 +1556,13 @@ class GitCommit {
           message: `commit 'parent' property should be an array`
         })
       }
-      for (let p of obj.parent) {
+      for (const p of obj.parent) {
         headers += `parent ${p}\n`;
       }
     }
-    let author = obj.author;
+    const author = obj.author;
     headers += `author ${formatAuthor(author)}\n`;
-    let committer = obj.committer || obj.author;
+    const committer = obj.committer || obj.author;
     headers += `committer ${formatAuthor(committer)}\n`;
     if (obj.gpgsig) {
       headers += 'gpgsig' + indent(obj.gpgsig);
@@ -1440,10 +1579,10 @@ class GitCommit {
   }
 
   withoutSignature () {
-    let commit = normalizeNewlines(this._commit);
+    const commit = normalizeNewlines(this._commit);
     if (commit.indexOf('\ngpgsig') === -1) return commit
-    let headers = commit.slice(0, commit.indexOf('\ngpgsig'));
-    let message = commit.slice(
+    const headers = commit.slice(0, commit.indexOf('\ngpgsig'));
+    const message = commit.slice(
       commit.indexOf('-----END PGP SIGNATURE-----\n') +
         '-----END PGP SIGNATURE-----\n'.length
     );
@@ -1451,7 +1590,7 @@ class GitCommit {
   }
 
   isolateSignature () {
-    let signature = this._commit.slice(
+    const signature = this._commit.slice(
       this._commit.indexOf('-----BEGIN PGP SIGNATURE-----'),
       this._commit.indexOf('-----END PGP SIGNATURE-----') +
         '-----END PGP SIGNATURE-----'.length
@@ -1466,7 +1605,7 @@ class GitCommit {
     // renormalize the line endings to the one true line-ending
     signature = normalizeNewlines(signature);
     const headers = GitCommit.justHeaders(commit._commit);
-    let signedCommit =
+    const signedCommit =
       headers + '\n' + 'gpgsig' + indent(signature) + '\n' + message;
     // return a new commit object
     return GitCommit.from(signedCommit)
@@ -1486,12 +1625,13 @@ class GitObject {
       Buffer.from(object)
     ])
   }
+
   static unwrap (buffer) {
-    let s = buffer.indexOf(32); // first space
-    let i = buffer.indexOf(0); // first null value
-    let type = buffer.slice(0, s).toString('utf8'); // get type of object
-    let length = buffer.slice(s + 1, i).toString('utf8'); // get type of object
-    let actualLength = buffer.length - (i + 1);
+    const s = buffer.indexOf(32); // first space
+    const i = buffer.indexOf(0); // first null value
+    const type = buffer.slice(0, s).toString('utf8'); // get type of object
+    const length = buffer.slice(s + 1, i).toString('utf8'); // get type of object
+    const actualLength = buffer.length - (i + 1);
     // verify length
     if (parseInt(length) !== actualLength) {
       throw new GitError(E.InternalFail, {
@@ -1507,8 +1647,8 @@ class GitObject {
 
 async function readObjectLoose ({ fs: _fs, gitdir, oid }) {
   const fs = new FileSystem(_fs);
-  let source = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
-  let file = await fs.read(`${gitdir}/${source}`);
+  const source = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
+  const file = await fs.read(`${gitdir}/${source}`);
   if (!file) {
     return null
   }
@@ -1522,55 +1662,67 @@ class BufferCursor {
     this.buffer = buffer;
     this._start = 0;
   }
+
   eof () {
     return this._start >= this.buffer.length
   }
+
   tell () {
     return this._start
   }
+
   seek (n) {
     this._start = n;
   }
+
   slice (n) {
     const r = this.buffer.slice(this._start, this._start + n);
     this._start += n;
     return r
   }
+
   toString (enc, length) {
     const r = this.buffer.toString(enc, this._start, this._start + length);
     this._start += length;
     return r
   }
+
   write (value, length, enc) {
     const r = this.buffer.write(value, this._start, length, enc);
     this._start += length;
     return r
   }
+
   readUInt8 () {
     const r = this.buffer.readUInt8(this._start);
     this._start += 1;
     return r
   }
+
   writeUInt8 (value) {
     const r = this.buffer.writeUInt8(value, this._start);
     this._start += 1;
     return r
   }
+
   readUInt16BE () {
     const r = this.buffer.readUInt16BE(this._start);
     this._start += 2;
     return r
   }
+
   writeUInt16BE (value) {
     const r = this.buffer.writeUInt16BE(value, this._start);
     this._start += 2;
     return r
   }
+
   readUInt32BE () {
     const r = this.buffer.readUInt32BE(this._start);
     this._start += 4;
     return r
   }
+
   writeUInt32BE (value) {
     const r = this.buffer.writeUInt32BE(value, this._start);
     this._start += 4;
@@ -1600,7 +1752,12 @@ function fromValue (value) {
 // Convert a Node stream to an Async Iterator
 function fromNodeStream (stream) {
   // Use native async iteration if it's available.
-  if (stream[Symbol.asyncIterator]) return stream
+  if (
+    Object.getOwnPropertyDescriptor(stream, Symbol.asyncIterator) &&
+    Object.getOwnPropertyDescriptor(stream, Symbol.asyncIterator).enumerable
+  ) {
+    return stream
+  }
   // Author's Note
   // I tried many MANY ways to do this.
   // I tried two npm modules (stream-to-async-iterator and streams-to-async-iterator) with no luck.
@@ -1609,7 +1766,7 @@ function fromNodeStream (stream) {
   // So if you are horrified that this solution just builds up a queue with no backpressure,
   // and turns Promises inside out, too bad. This is the first code that worked reliably.
   let ended = false;
-  let queue = [];
+  const queue = [];
   let defer = {};
   stream.on('data', chunk => {
     queue.push(chunk);
@@ -1677,12 +1834,15 @@ class StreamReader {
     this._ended = false;
     this._discardedBytes = 0;
   }
+
   eof () {
     return this._ended && this.cursor === this.buffer.length
   }
+
   tell () {
     return this._discardedBytes + this.cursor
   }
+
   async byte () {
     if (this.eof()) return
     if (!this.started) await this._init();
@@ -1693,6 +1853,7 @@ class StreamReader {
     this._moveCursor(1);
     return this.buffer[this.undoCursor]
   }
+
   async chunk () {
     if (this.eof()) return
     if (!this.started) await this._init();
@@ -1703,6 +1864,7 @@ class StreamReader {
     this._moveCursor(this.buffer.length);
     return this.buffer.slice(this.undoCursor, this.cursor)
   }
+
   async read (n) {
     if (this.eof()) return
     if (!this.started) await this._init();
@@ -1713,6 +1875,7 @@ class StreamReader {
     this._moveCursor(n);
     return this.buffer.slice(this.undoCursor, this.cursor)
   }
+
   async skip (n) {
     if (this.eof()) return
     if (!this.started) await this._init();
@@ -1722,9 +1885,11 @@ class StreamReader {
     }
     this._moveCursor(n);
   }
+
   async undo () {
     this.cursor = this.undoCursor;
   }
+
   async _next () {
     this.started = true;
     let { done, value } = await this.stream.next();
@@ -1736,6 +1901,7 @@ class StreamReader {
     }
     return value
   }
+
   _trim () {
     // Throw away parts of the buffer we don't need anymore
     // assert(this.cursor <= this.buffer.length)
@@ -1744,6 +1910,7 @@ class StreamReader {
     this._discardedBytes += this.undoCursor;
     this.undoCursor = 0;
   }
+
   _moveCursor (n) {
     this.undoCursor = this.cursor;
     this.cursor += n;
@@ -1751,24 +1918,27 @@ class StreamReader {
       this.cursor = this.buffer.length;
     }
   }
+
   async _accumulate (n) {
     if (this._ended) return
     // Expand the buffer until we have N bytes of data
     // or we've reached the end of the stream
-    let buffers = [this.buffer];
+    const buffers = [this.buffer];
     while (this.cursor + n > lengthBuffers(buffers)) {
-      let nextbuffer = await this._next();
+      const nextbuffer = await this._next();
       if (this._ended) break
       buffers.push(nextbuffer);
     }
     this.buffer = Buffer.concat(buffers);
   }
+
   async _loadnext () {
     this._discardedBytes += this.buffer.length;
     this.undoCursor = 0;
     this.cursor = 0;
     this.buffer = await this._next();
   }
+
   async _init () {
     this.buffer = await this._next();
   }
@@ -1783,8 +1953,8 @@ function lengthBuffers (buffers) {
 // My version of git-list-pack - roughly 15x faster than the original
 
 async function listpack (stream, onData) {
-  let reader = new StreamReader(stream);
-  let hash = new Hash();
+  const reader = new StreamReader(stream);
+  const hash = new Hash();
   let PACK = await reader.read(4);
   hash.update(PACK);
   PACK = PACK.toString('utf8');
@@ -1810,11 +1980,11 @@ async function listpack (stream, onData) {
   if (numObjects < 1) return
 
   while (!reader.eof() && numObjects--) {
-    let offset = reader.tell();
-    let { type, length, ofs, reference } = await parseHeader(reader, hash);
-    let inflator = new pako.Inflate();
+    const offset = reader.tell();
+    const { type, length, ofs, reference } = await parseHeader(reader, hash);
+    const inflator = new pako.Inflate();
     while (!inflator.result) {
-      let chunk = await reader.chunk();
+      const chunk = await reader.chunk();
       if (reader.ended) break
       inflator.push(chunk, false);
       if (inflator.err) {
@@ -1831,9 +2001,9 @@ async function listpack (stream, onData) {
 
         // Backtrack parser to where deflated data ends
         await reader.undo();
-        let buf = await reader.read(chunk.length - inflator.strm.avail_in);
+        const buf = await reader.read(chunk.length - inflator.strm.avail_in);
         hash.update(buf);
-        let end = reader.tell();
+        const end = reader.tell();
         onData({
           data: inflator.result,
           type,
@@ -1854,7 +2024,7 @@ async function parseHeader (reader, hash) {
   // Object type is encoded in bits 654
   let byte = await reader.byte();
   hash.update(Buffer.from([byte]));
-  let type = (byte >> 4) & 0b111;
+  const type = (byte >> 4) & 0b111;
   // The length encoding get complicated.
   // Last four bits of length is encoded in bits 3210
   let length = byte & 0b1111;
@@ -1875,7 +2045,7 @@ async function parseHeader (reader, hash) {
   if (type === 6) {
     let shift = 0;
     ofs = 0;
-    let bytes = [];
+    const bytes = [];
     do {
       byte = await reader.byte();
       hash.update(Buffer.from([byte]));
@@ -1886,7 +2056,7 @@ async function parseHeader (reader, hash) {
     reference = Buffer.from(bytes);
   }
   if (type === 7) {
-    let buf = await reader.read(20);
+    const buf = await reader.read(20);
     hash.update(buf);
     reference = buf;
   }
@@ -1921,7 +2091,7 @@ function shasum (buffer) {
 }
 
 function decodeVarInt (reader) {
-  let bytes = [];
+  const bytes = [];
   let byte = 0;
   let multibyte = 0;
   do {
@@ -1958,15 +2128,16 @@ class GitPackIndex {
     Object.assign(this, stuff);
     this.offsetCache = {};
   }
+
   static async fromIdx ({ idx, getExternalRefDelta }) {
     marky.mark('fromIdx');
-    let reader = new BufferCursor(idx);
-    let magic = reader.slice(4).toString('hex');
+    const reader = new BufferCursor(idx);
+    const magic = reader.slice(4).toString('hex');
     // Check for IDX v2 magic number
     if (magic !== 'ff744f63') {
       return // undefined
     }
-    let version = reader.readUInt32BE();
+    const version = reader.readUInt32BE();
     if (version !== 2) {
       throw new GitError(E.InternalFail, {
         message: `Unable to read version ${version} packfile IDX. (Only version 2 supported)`
@@ -1980,11 +2151,11 @@ class GitPackIndex {
     // Skip over fanout table
     reader.seek(reader.tell() + 4 * 255);
     // Get hashes
-    let size = reader.readUInt32BE();
+    const size = reader.readUInt32BE();
     marky.mark('hashes');
-    let hashes = [];
+    const hashes = [];
     for (let i = 0; i < size; i++) {
-      let hash = reader.slice(20).toString('hex');
+      const hash = reader.slice(20).toString('hex');
       hashes[i] = hash;
     }
     log(`hashes ${marky.stop('hashes').duration}`);
@@ -1992,12 +2163,12 @@ class GitPackIndex {
     // Skip over CRCs
     marky.mark('offsets');
     // Get offsets
-    let offsets = new Map();
+    const offsets = new Map();
     for (let i = 0; i < size; i++) {
       offsets.set(hashes[i], reader.readUInt32BE());
     }
     log(`offsets ${marky.stop('offsets').duration}`);
-    let packfileSha = reader.slice(20).toString('hex');
+    const packfileSha = reader.slice(20).toString('hex');
     log(`fromIdx ${marky.stop('fromIdx').duration}`);
     return new GitPackIndex({
       hashes,
@@ -2007,6 +2178,7 @@ class GitPackIndex {
       getExternalRefDelta
     })
   }
+
   static async fromPack ({ pack, getExternalRefDelta, emitter, emitterPrefix }) {
     const listpackTypes = {
       1: 'commit',
@@ -2016,19 +2188,19 @@ class GitPackIndex {
       6: 'ofs-delta',
       7: 'ref-delta'
     };
-    let offsetToObject = {};
+    const offsetToObject = {};
 
     // Older packfiles do NOT use the shasum of the pack itself,
     // so it is recommended to just use whatever bytes are in the trailer.
     // Source: https://github.com/git/git/commit/1190a1acf800acdcfd7569f87ac1560e2d077414
-    let packfileSha = pack.slice(-20).toString('hex');
+    const packfileSha = pack.slice(-20).toString('hex');
 
-    let hashes = [];
-    let crcs = {};
-    let offsets = new Map();
+    const hashes = [];
+    const crcs = {};
+    const offsets = new Map();
     let totalObjectCount = null;
     let lastPercent = null;
-    let times = {
+    const times = {
       hash: 0,
       readSlice: 0,
       offsets: 0,
@@ -2054,7 +2226,7 @@ class GitPackIndex {
     marky.mark('percent');
     await listpack([pack], ({ data, type, reference, offset, num }) => {
       if (totalObjectCount === null) totalObjectCount = num;
-      let percent = Math.floor(
+      const percent = Math.floor(
         ((totalObjectCount - num) * 100) / totalObjectCount
       );
       if (percent !== lastPercent) {
@@ -2116,12 +2288,12 @@ class GitPackIndex {
     log('Computing CRCs');
     marky.mark('crcs');
     // We need to know the lengths of the slices to compute the CRCs.
-    let offsetArray = Object.keys(offsetToObject).map(Number);
-    for (let [i, start] of offsetArray.entries()) {
-      let end =
+    const offsetArray = Object.keys(offsetToObject).map(Number);
+    for (const [i, start] of offsetArray.entries()) {
+      const end =
         i + 1 === offsetArray.length ? pack.byteLength - 20 : offsetArray[i + 1];
-      let o = offsetToObject[start];
-      let crc = crc32.buf(pack.slice(start, end)) >>> 0;
+      const o = offsetToObject[start];
+      const crc = crc32.buf(pack.slice(start, end)) >>> 0;
       o.end = end;
       o.crc = crc;
     }
@@ -2145,11 +2317,11 @@ class GitPackIndex {
     let count = 0;
     let callsToReadSlice = 0;
     let callsToGetExternal = 0;
-    let timeByDepth = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    let objectsByDepth = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const timeByDepth = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const objectsByDepth = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     for (let offset in offsetToObject) {
       offset = Number(offset);
-      let percent = Math.floor((count++ * 100) / totalObjectCount);
+      const percent = Math.floor((count++ * 100) / totalObjectCount);
       if (percent !== lastPercent) {
         log(
           `${percent}%\t${Math.floor(
@@ -2170,21 +2342,21 @@ class GitPackIndex {
       }
       lastPercent = percent;
 
-      let o = offsetToObject[offset];
+      const o = offsetToObject[offset];
       if (o.oid) continue
       try {
         p.readDepth = 0;
         p.externalReadDepth = 0;
         marky.mark('readSlice');
-        let { type, object } = await p.readSlice({ start: offset });
-        let time = marky.stop('readSlice').duration;
+        const { type, object } = await p.readSlice({ start: offset });
+        const time = marky.stop('readSlice').duration;
         times.readSlice += time;
         callsToReadSlice += p.readDepth;
         callsToGetExternal += p.externalReadDepth;
         timeByDepth[p.readDepth] += time;
         objectsByDepth[p.readDepth] += 1;
         marky.mark('hash');
-        let oid = shasum(GitObject.wrap({ type, object }));
+        const oid = shasum(GitObject.wrap({ type, object }));
         times.hash += marky.stop('hash').duration;
         o.oid = oid;
         hashes.push(oid);
@@ -2199,7 +2371,7 @@ class GitPackIndex {
     marky.mark('sort');
     hashes.sort();
     times['sort'] = Math.floor(marky.stop('sort').duration);
-    let totalElapsedTime = marky.stop('total').duration;
+    const totalElapsedTime = marky.stop('total').duration;
     times.hash = Math.floor(times.hash);
     times.readSlice = Math.floor(times.readSlice);
     times.misc = Math.floor(
@@ -2218,9 +2390,10 @@ class GitPackIndex {
     );
     return p
   }
+
   toBuffer () {
-    let buffers = [];
-    let write = (str, encoding) => {
+    const buffers = [];
+    const write = (str, encoding) => {
       buffers.push(Buffer.from(str, encoding));
     };
     // Write out IDX v2 magic number
@@ -2228,46 +2401,49 @@ class GitPackIndex {
     // Write out version number 2
     write('00000002', 'hex');
     // Write fanout table
-    let fanoutBuffer = new BufferCursor(Buffer.alloc(256 * 4));
+    const fanoutBuffer = new BufferCursor(Buffer.alloc(256 * 4));
     for (let i = 0; i < 256; i++) {
       let count = 0;
-      for (let hash of this.hashes) {
+      for (const hash of this.hashes) {
         if (parseInt(hash.slice(0, 2), 16) <= i) count++;
       }
       fanoutBuffer.writeUInt32BE(count);
     }
     buffers.push(fanoutBuffer.buffer);
     // Write out hashes
-    for (let hash of this.hashes) {
+    for (const hash of this.hashes) {
       write(hash, 'hex');
     }
     // Write out crcs
-    let crcsBuffer = new BufferCursor(Buffer.alloc(this.hashes.length * 4));
-    for (let hash of this.hashes) {
+    const crcsBuffer = new BufferCursor(Buffer.alloc(this.hashes.length * 4));
+    for (const hash of this.hashes) {
       crcsBuffer.writeUInt32BE(this.crcs[hash]);
     }
     buffers.push(crcsBuffer.buffer);
     // Write out offsets
-    let offsetsBuffer = new BufferCursor(Buffer.alloc(this.hashes.length * 4));
-    for (let hash of this.hashes) {
+    const offsetsBuffer = new BufferCursor(Buffer.alloc(this.hashes.length * 4));
+    for (const hash of this.hashes) {
       offsetsBuffer.writeUInt32BE(this.offsets.get(hash));
     }
     buffers.push(offsetsBuffer.buffer);
     // Write out packfile checksum
     write(this.packfileSha, 'hex');
     // Write out shasum
-    let totalBuffer = Buffer.concat(buffers);
-    let sha = shasum(totalBuffer);
-    let shaBuffer = Buffer.alloc(20);
+    const totalBuffer = Buffer.concat(buffers);
+    const sha = shasum(totalBuffer);
+    const shaBuffer = Buffer.alloc(20);
     shaBuffer.write(sha, 'hex');
     return Buffer.concat([totalBuffer, shaBuffer])
   }
+
   async load ({ pack }) {
     this.pack = pack;
   }
+
   async unload () {
     this.pack = null;
   }
+
   async read ({ oid }) {
     if (!this.offsets.get(oid)) {
       if (this.getExternalRefDelta) {
@@ -2279,9 +2455,10 @@ class GitPackIndex {
         })
       }
     }
-    let start = this.offsets.get(oid);
+    const start = this.offsets.get(oid);
     return this.readSlice({ start })
   }
+
   async readSlice ({ start }) {
     if (this.offsetCache[start]) {
       return Object.assign({}, this.offsetCache[start])
@@ -2301,11 +2478,11 @@ class GitPackIndex {
           'Tried to read from a GitPackIndex with no packfile loaded into memory'
       })
     }
-    let raw = (await this.pack).slice(start);
-    let reader = new BufferCursor(raw);
-    let byte = reader.readUInt8();
+    const raw = (await this.pack).slice(start);
+    const reader = new BufferCursor(raw);
+    const byte = reader.readUInt8();
     // Object type is encoded in bits 654
-    let btype = byte & 0b1110000;
+    const btype = byte & 0b1110000;
     let type = types[btype];
     if (type === undefined) {
       throw new GitError(E.InternalFail, {
@@ -2314,11 +2491,11 @@ class GitPackIndex {
     }
     // The length encoding get complicated.
     // Last four bits of length is encoded in bits 3210
-    let lastFour = byte & 0b1111;
+    const lastFour = byte & 0b1111;
     let length = lastFour;
     // Whether the next byte is part of the variable-length encoded number
     // is encoded in bit 7
-    let multibyte = byte & 0b10000000;
+    const multibyte = byte & 0b10000000;
     if (multibyte) {
       length = otherVarIntDecode(reader, lastFour);
     }
@@ -2326,23 +2503,21 @@ class GitPackIndex {
     let object = null;
     // Handle deltified objects
     if (type === 'ofs_delta') {
-      let offset = decodeVarInt(reader);
-      let baseOffset = start - offset
+      const offset = decodeVarInt(reader);
+      const baseOffset = start - offset
       ;({ object: base, type } = await this.readSlice({ start: baseOffset }));
     }
     if (type === 'ref_delta') {
-      let oid = reader.slice(20).toString('hex')
+      const oid = reader.slice(20).toString('hex')
       ;({ object: base, type } = await this.read({ oid }));
     }
     // Handle undeltified objects
-    let buffer = raw.slice(reader.tell());
+    const buffer = raw.slice(reader.tell());
     object = Buffer.from(pako.inflate(buffer));
     // Assert that the object length is as expected.
     if (object.byteLength !== length) {
       throw new GitError(E.InternalFail, {
-        message: `Packfile told us object would have length ${length} but it had length ${
-          object.byteLength
-        }`
+        message: `Packfile told us object would have length ${length} but it had length ${object.byteLength}`
       })
     }
     if (base) {
@@ -2404,9 +2579,9 @@ async function readObjectPacked ({
   // Iterate through all the .idx files
   let list = await fs.readdir(join(gitdir, 'objects/pack'));
   list = list.filter(x => x.endsWith('.idx'));
-  for (let filename of list) {
+  for (const filename of list) {
     const indexFile = `${gitdir}/objects/pack/${filename}`;
-    let p = await readPackIndex({
+    const p = await readPackIndex({
       fs,
       filename: indexFile,
       getExternalRefDelta
@@ -2419,7 +2594,7 @@ async function readObjectPacked ({
         const packFile = indexFile.replace(/idx$/, 'pack');
         p.pack = fs.read(packFile);
       }
-      let result = await p.read({ oid, getExternalRefDelta });
+      const result = await p.read({ oid, getExternalRefDelta });
       result.format = 'content';
       result.source = `objects/pack/${filename.replace(/idx$/, 'pack')}`;
       return result
@@ -2435,8 +2610,17 @@ async function readObject ({ fs: _fs, gitdir, oid, format = 'content' }) {
   // process can acquire external ref-deltas.
   const getExternalRefDelta = oid => readObject({ fs, gitdir, oid });
 
+  let result;
+  // Empty tree - hard-coded so we can use it as a shorthand.
+  // Note: I think the canonical git implementation must do this too because
+  // `git cat-file -t 4b825dc642cb6eb9a060e54bf8d69288fbee4904` prints "tree" even in empty repos.
+  if (oid === '4b825dc642cb6eb9a060e54bf8d69288fbee4904') {
+    result = { format: 'wrapped', object: Buffer.from(`tree 0\x00`) };
+  }
   // Look for it in the loose object directory.
-  let result = await readObjectLoose({ fs, gitdir, oid });
+  if (!result) {
+    result = await readObjectLoose({ fs, gitdir, oid });
+  }
   // Check to see if it's in a packfile.
   if (!result) {
     result = await readObjectPacked({ fs, gitdir, oid, getExternalRefDelta });
@@ -2445,28 +2629,32 @@ async function readObject ({ fs: _fs, gitdir, oid, format = 'content' }) {
   if (!result) {
     throw new GitError(E.ReadObjectFail, { oid })
   }
+
   if (format === 'deflated') {
     return result
   }
+
   // BEHOLD! THE ONLY TIME I'VE EVER WANTED TO USE A CASE STATEMENT WITH FOLLOWTHROUGH!
   // eslint-ignore
   /* eslint-disable no-fallthrough */
   switch (result.format) {
     case 'deflated':
-      let buffer = Buffer.from(pako.inflate(result.object));
-      result = { format: 'wrapped', object: buffer, source: result.source };
+      result.object = Buffer.from(pako.inflate(result.object));
+      result.format = 'wrapped';
     case 'wrapped':
       if (format === 'wrapped' && result.format === 'wrapped') {
         return result
       }
-      let sha = shasum(result.object);
+      const sha = shasum(result.object);
       if (sha !== oid) {
         throw new GitError(E.InternalFail, {
           message: `SHA check failed! Expected ${oid}, computed ${sha}`
         })
       }
-      let { object, type } = GitObject.unwrap(buffer);
-      result = { type, format: 'content', object, source: result.source };
+      const { object, type } = GitObject.unwrap(result.object);
+      result.type = type;
+      result.object = object;
+      result.format = 'content';
     case 'content':
       if (format === 'content') return result
       break
@@ -2491,6 +2679,14 @@ async function readObject ({ fs: _fs, gitdir, oid, format = 'content' }) {
 class PluginCore extends Map {
   set (key, value) {
     const verifySchema = (key, value) => {
+      // ugh. this sucks
+      if (
+        key === 'fs' &&
+        Object.getOwnPropertyDescriptor(value, 'promises') &&
+        Object.getOwnPropertyDescriptor(value, 'promises').enumerable
+      ) {
+        value = value.promises;
+      }
       const pluginSchemas = {
         credentialManager: ['fill', 'approved', 'rejected'],
         emitter: ['emit'],
@@ -2507,10 +2703,10 @@ class PluginCore extends Map {
         pgp: ['sign', 'verify'],
         http: []
       };
-      if (!pluginSchemas.hasOwnProperty(key)) {
+      if (!Object.prototype.hasOwnProperty.call(pluginSchemas, key)) {
         throw new GitError(E.PluginUnrecognized, { plugin: key })
       }
-      for (let method of pluginSchemas[key]) {
+      for (const method of pluginSchemas[key]) {
         if (value[method] === undefined) {
           throw new GitError(E.PluginSchemaViolation, { plugin: key, method })
         }
@@ -2520,6 +2716,7 @@ class PluginCore extends Map {
     // There can be only one.
     super.set(key, value);
   }
+
   get (key) {
     // Critical plugins throw an error instead of returning undefined.
     const critical = new Set(['credentialManager', 'fs', 'pgp']);
@@ -2564,29 +2761,29 @@ async function listCommitsAndTags ({
   finish
 }) {
   const fs = new FileSystem(_fs);
-  let startingSet = new Set();
-  let finishingSet = new Set();
-  for (let ref of start) {
+  const startingSet = new Set();
+  const finishingSet = new Set();
+  for (const ref of start) {
     startingSet.add(await GitRefManager.resolve({ fs, gitdir, ref }));
   }
-  for (let ref of finish) {
+  for (const ref of finish) {
     // We may not have these refs locally so we must try/catch
     try {
-      let oid = await GitRefManager.resolve({ fs, gitdir, ref });
+      const oid = await GitRefManager.resolve({ fs, gitdir, ref });
       finishingSet.add(oid);
     } catch (err) {}
   }
-  let visited = new Set();
+  const visited = new Set();
   // Because git commits are named by their hash, there is no
   // way to construct a cycle. Therefore we won't worry about
   // setting a default recursion limit.
   async function walk (oid) {
     visited.add(oid);
-    let { type, object } = await readObject({ fs, gitdir, oid });
+    const { type, object } = await readObject({ fs, gitdir, oid });
     // Recursively resolve annotated tags
     if (type === 'tag') {
-      let tag = GitAnnotatedTag.from(object);
-      let commit = tag.headers().object;
+      const tag = GitAnnotatedTag.from(object);
+      const commit = tag.headers().object;
       return walk(commit)
     }
     if (type !== 'commit') {
@@ -2596,8 +2793,8 @@ async function listCommitsAndTags ({
         expected: 'commit'
       })
     }
-    let commit = GitCommit.from(object);
-    let parents = commit.headers().parent;
+    const commit = GitCommit.from(object);
+    const parents = commit.headers().parent;
     for (oid of parents) {
       if (!finishingSet.has(oid) && !visited.has(oid)) {
         await walk(oid);
@@ -2605,7 +2802,7 @@ async function listCommitsAndTags ({
     }
   }
   // Let's go walking!
-  for (let oid of startingSet) {
+  for (const oid of startingSet) {
     await walk(oid);
   }
   return visited
@@ -2640,16 +2837,16 @@ function mode2type (mode) {
 }
 
 function parseBuffer (buffer) {
-  let _entries = [];
+  const _entries = [];
   let cursor = 0;
   while (cursor < buffer.length) {
-    let space = buffer.indexOf(32, cursor);
+    const space = buffer.indexOf(32, cursor);
     if (space === -1) {
       throw new GitError(E.InternalFail, {
         message: `GitTree: Error parsing buffer at byte location ${cursor}: Could not find the next space character.`
       })
     }
-    let nullchar = buffer.indexOf(0, cursor);
+    const nullchar = buffer.indexOf(0, cursor);
     if (nullchar === -1) {
       throw new GitError(E.InternalFail, {
         message: `GitTree: Error parsing buffer at byte location ${cursor}: Could not find the next null character.`
@@ -2657,9 +2854,9 @@ function parseBuffer (buffer) {
     }
     let mode = buffer.slice(cursor, space).toString('utf8');
     if (mode === '40000') mode = '040000'; // makes it line up neater in printed output
-    let type = mode2type(mode);
-    let path = buffer.slice(space + 1, nullchar).toString('utf8');
-    let oid = buffer.slice(nullchar + 1, nullchar + 21).toString('hex');
+    const type = mode2type(mode);
+    const path = buffer.slice(space + 1, nullchar).toString('utf8');
+    const oid = buffer.slice(nullchar + 1, nullchar + 21).toString('hex');
     cursor = nullchar + 21;
     _entries.push({ mode, path, oid, type });
   }
@@ -2710,31 +2907,36 @@ class GitTree {
       })
     }
   }
+
   static from (tree) {
     return new GitTree(tree)
   }
+
   render () {
     return this._entries
       .map(entry => `${entry.mode} ${entry.type} ${entry.oid}    ${entry.path}`)
       .join('\n')
   }
+
   toObject () {
     return Buffer.concat(
       this._entries.map(entry => {
-        let mode = Buffer.from(entry.mode.replace(/^0/, ''));
-        let space = Buffer.from(' ');
-        let path = Buffer.from(entry.path, 'utf8');
-        let nullchar = Buffer.from([0]);
-        let oid = Buffer.from(entry.oid, 'hex');
+        const mode = Buffer.from(entry.mode.replace(/^0/, ''));
+        const space = Buffer.from(' ');
+        const path = Buffer.from(entry.path, 'utf8');
+        const nullchar = Buffer.from([0]);
+        const oid = Buffer.from(entry.oid, 'hex');
         return Buffer.concat([mode, space, path, nullchar, oid])
       })
     )
   }
+
   entries () {
     return this._entries
   }
+
   * [Symbol.iterator] () {
-    for (let entry of this._entries) {
+    for (const entry of this._entries) {
       yield entry;
     }
   }
@@ -2748,24 +2950,24 @@ async function listObjects ({
   oids
 }) {
   const fs = new FileSystem(_fs);
-  let visited = new Set();
+  const visited = new Set();
   // We don't do the purest simplest recursion, because we can
   // avoid reading Blob objects entirely since the Tree objects
   // tell us which oids are Blobs and which are Trees.
   async function walk (oid) {
     visited.add(oid);
-    let { type, object } = await readObject({ fs, gitdir, oid });
+    const { type, object } = await readObject({ fs, gitdir, oid });
     if (type === 'tag') {
-      let tag = GitAnnotatedTag.from(object);
-      let obj = tag.headers().object;
+      const tag = GitAnnotatedTag.from(object);
+      const obj = tag.headers().object;
       await walk(obj);
     } else if (type === 'commit') {
-      let commit = GitCommit.from(object);
-      let tree = commit.headers().tree;
+      const commit = GitCommit.from(object);
+      const tree = commit.headers().tree;
       await walk(tree);
     } else if (type === 'tree') {
-      let tree = GitTree.from(object);
-      for (let entry of tree) {
+      const tree = GitTree.from(object);
+      for (const entry of tree) {
         // only add blobs and trees to the set,
         // skipping over submodules whose type is 'commit'
         if (entry.type === 'blob' || entry.type === 'tree') {
@@ -2779,14 +2981,14 @@ async function listObjects ({
     }
   }
   // Let's go walking!
-  for (let oid of oids) {
+  for (const oid of oids) {
     await walk(oid);
   }
   return visited
 }
 
 function padHex (b, n) {
-  let s = n.toString(16);
+  const s = n.toString(16);
   return '0'.repeat(b - s.length) + s
 }
 
@@ -2799,6 +3001,14 @@ const types = {
   ref_delta: 0b1110000
 };
 
+/**
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string[]} args.oids
+ */
 async function pack ({
   core = 'default',
   dir,
@@ -2807,24 +3017,23 @@ async function pack ({
   oids
 }) {
   const fs = new FileSystem(_fs);
-  let hash = new Hash();
-  let outputStream = [];
+  const hash = new Hash();
+  const outputStream = [];
   function write (chunk, enc) {
-    let buff = Buffer.from(chunk, enc);
+    const buff = Buffer.from(chunk, enc);
     outputStream.push(buff);
     hash.update(buff);
   }
   function writeObject ({ stype, object }) {
-    let lastFour, multibyte, length;
     // Object type is encoded in bits 654
-    let type = types[stype];
+    const type = types[stype];
     // The length encoding gets complicated.
-    length = object.length;
+    let length = object.length;
     // Whether the next byte is part of the variable-length encoded number
     // is encoded in bit 7
-    multibyte = length > 0b1111 ? 0b10000000 : 0b0;
+    let multibyte = length > 0b1111 ? 0b10000000 : 0b0;
     // Last four bits of length is encoded in bits 3210
-    lastFour = length & 0b1111;
+    const lastFour = length & 0b1111;
     // Discard those bits
     length = length >>> 4;
     // The first byte is then (1-bit multibyte?), (3-bit type), (4-bit least sig 4-bits of length)
@@ -2845,12 +3054,12 @@ async function pack ({
   write('00000002', 'hex');
   // Write a 4 byte (32-bit) int
   write(padHex(8, oids.length), 'hex');
-  for (let oid of oids) {
-    let { type, object } = await readObject({ fs, gitdir, oid });
+  for (const oid of oids) {
+    const { type, object } = await readObject({ fs, gitdir, oid });
     writeObject({ write, object, stype: type });
   }
   // Write SHA1 checksum
-  let digest = hash.digest();
+  const digest = hash.digest();
   outputStream.push(digest);
   return outputStream
 }
@@ -2919,8 +3128,8 @@ class GitPktLine {
     if (typeof line === 'string') {
       line = Buffer.from(line);
     }
-    let length = line.length + 4;
-    let hexlength = padHex(4, length);
+    const length = line.length + 4;
+    const hexlength = padHex(4, length);
     return Buffer.concat([Buffer.from(hexlength, 'utf8'), line])
   }
 
@@ -2932,7 +3141,7 @@ class GitPktLine {
         if (length == null) return true
         length = parseInt(length.toString('utf8'), 16);
         if (length === 0) return null
-        let buffer = await reader.read(length - 4);
+        const buffer = await reader.read(length - 4);
         if (buffer == null) return true
         return buffer
       } catch (err) {
@@ -2950,7 +3159,7 @@ const pkg = {
 };
 
 async function writeRefsAdResponse ({ capabilities, refs, symrefs }) {
-  let stream = [];
+  const stream = [];
   // Compose capabilities string
   let syms = '';
   for (const [key, value] of Object.entries(symrefs)) {
@@ -3021,7 +3230,7 @@ async function uploadPack ({
 }
 
 function basename (path) {
-  let last = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  const last = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
   if (last > -1) {
     path = path.slice(last + 1);
   }
@@ -3046,34 +3255,34 @@ class GitIgnoreManager {
     // '.' is not a valid gitignore entry, so '.' is never ignored
     if (filepath === '.') return false
     // Find all the .gitignore files that could affect this file
-    let pairs = [
+    const pairs = [
       {
         gitignore: join(dir, '.gitignore'),
         filepath
       }
     ];
-    let pieces = filepath.split('/');
+    const pieces = filepath.split('/');
     for (let i = 1; i < pieces.length; i++) {
-      let folder = pieces.slice(0, i).join('/');
-      let file = pieces.slice(i).join('/');
+      const folder = pieces.slice(0, i).join('/');
+      const file = pieces.slice(i).join('/');
       pairs.push({
         gitignore: join(dir, folder, '.gitignore'),
         filepath: file
       });
     }
     let ignoredStatus = false;
-    for (let p of pairs) {
+    for (const p of pairs) {
       let file;
       try {
         file = await fs.read(p.gitignore, 'utf8');
       } catch (err) {
         if (err.code === 'NOENT') continue
       }
-      let ign = ignore().add(file);
+      const ign = ignore().add(file);
       // If the parent directory is excluded, we are done.
       // "It is not possible to re-include a file if a parent directory of that file is excluded. Git doesn’t list excluded directories for performance reasons, so any patterns on contained files have no effect, no matter where they are defined."
       // source: https://git-scm.com/docs/gitignore
-      let parentdir = dirname(p.filepath);
+      const parentdir = dirname(p.filepath);
       if (parentdir !== '.' && ign.ignores(parentdir)) return true
       // If the file is currently ignored, test for UNignoring.
       if (ignoredStatus) {
@@ -3189,7 +3398,7 @@ function parseCacheEntryFlags (bits) {
 }
 
 function renderCacheEntryFlags (entry) {
-  let flags = entry.flags;
+  const flags = entry.flags;
   // 1-bit extended flag (must be zero in version 2)
   flags.extended = false;
   // 12-bit name length if the length is less than 0xFFF; otherwise 0xFFF
@@ -3205,31 +3414,31 @@ function renderCacheEntryFlags (entry) {
 
 function parseBuffer$1 (buffer) {
   // Verify shasum
-  let shaComputed = shasum(buffer.slice(0, -20));
-  let shaClaimed = buffer.slice(-20).toString('hex');
+  const shaComputed = shasum(buffer.slice(0, -20));
+  const shaClaimed = buffer.slice(-20).toString('hex');
   if (shaClaimed !== shaComputed) {
     throw new GitError(E.InternalFail, {
       message: `Invalid checksum in GitIndex buffer: expected ${shaClaimed} but saw ${shaComputed}`
     })
   }
-  let reader = new BufferCursor(buffer);
-  let _entries = new Map();
-  let magic = reader.toString('utf8', 4);
+  const reader = new BufferCursor(buffer);
+  const _entries = new Map();
+  const magic = reader.toString('utf8', 4);
   if (magic !== 'DIRC') {
     throw new GitError(E.InternalFail, {
       message: `Invalid dircache magic file number: ${magic}`
     })
   }
-  let version = reader.readUInt32BE();
+  const version = reader.readUInt32BE();
   if (version !== 2) {
     throw new GitError(E.InternalFail, {
       message: `Unsupported dircache version: ${version}`
     })
   }
-  let numEntries = reader.readUInt32BE();
+  const numEntries = reader.readUInt32BE();
   let i = 0;
   while (!reader.eof() && i < numEntries) {
-    let entry = {};
+    const entry = {};
     entry.ctimeSeconds = reader.readUInt32BE();
     entry.ctimeNanoseconds = reader.readUInt32BE();
     entry.mtimeSeconds = reader.readUInt32BE();
@@ -3241,10 +3450,10 @@ function parseBuffer$1 (buffer) {
     entry.gid = reader.readUInt32BE();
     entry.size = reader.readUInt32BE();
     entry.oid = reader.slice(20).toString('hex');
-    let flags = reader.readUInt16BE();
+    const flags = reader.readUInt16BE();
     entry.flags = parseCacheEntryFlags(flags);
     // TODO: handle if (version === 3 && entry.flags.extended)
-    let pathlength = buffer.indexOf(0, reader.tell() + 1) - reader.tell();
+    const pathlength = buffer.indexOf(0, reader.tell() + 1) - reader.tell();
     if (pathlength < 1) {
       throw new GitError(E.InternalFail, {
         message: `Got a path length of: ${pathlength}`
@@ -3260,7 +3469,7 @@ function parseBuffer$1 (buffer) {
     let padding = 8 - ((reader.tell() - 12) % 8);
     if (padding === 0) padding = 8;
     while (padding--) {
-      let tmp = reader.readUInt8();
+      const tmp = reader.readUInt8();
       if (tmp !== 0) {
         throw new GitError(E.InternalFail, {
           message: `Expected 1-8 null characters but got '${tmp}' after ${entry.path}`
@@ -3300,34 +3509,41 @@ class GitIndex {
       })
     }
   }
+
   static from (buffer) {
     return new GitIndex(buffer)
   }
+
   static key (path, stage) {
     // No delimiter is needed as long as stage is always 1 char
     return path + stage
   }
+
   get entries () {
     return [...this._entries.values()].sort(compareKey)
   }
+
   get entriesMap () {
     return this._entries
   }
+
   get conflictedPaths () {
     return [...this._entries.keys()]
       .filter(k => k.charAt(k.length - 1) === '2')
       .map(k => k.slice(0, -1))
   }
+
   * [Symbol.iterator] () {
-    for (let entry of this.entries) {
+    for (const entry of this.entries) {
       yield entry;
     }
   }
+
   insert ({ filepath, stats, oid, stage = 0 }) {
     stats = normalizeStats(stats);
-    let key = GitIndex.key(filepath, stage);
-    let bfilepath = Buffer.from(filepath);
-    let entry = {
+    const key = GitIndex.key(filepath, stage);
+    const bfilepath = Buffer.from(filepath);
+    const entry = {
       ctimeSeconds: stats.ctimeSeconds,
       ctimeNanoseconds: stats.ctimeNanoseconds,
       mtimeSeconds: stats.mtimeSeconds,
@@ -3354,41 +3570,46 @@ class GitIndex {
     this._entries.set(key, entry);
     this._dirty = true;
   }
+
   writeConflict ({ filepath, stats, ourOid, theirOid, baseOid }) {
     if (baseOid) this.insert({ filepath, stats, oid: baseOid, stage: 1 });
     this.insert({ filepath, stats, oid: ourOid, stage: 2 });
     this.insert({ filepath, stats, oid: theirOid, stage: 3 });
   }
+
   delete ({ filepath }) {
-    for (let [key, entry] of this._entries.entries()) {
+    for (const [key, entry] of this._entries.entries()) {
       if (entry.path === filepath || entry.path.startsWith(filepath + '/')) {
         this._entries.delete(key);
       }
     }
     this._dirty = true;
   }
+
   clear () {
     this._entries.clear();
     this._dirty = true;
   }
+
   render () {
     return this.entries
       .map(entry => `${entry.mode.toString(8)} ${entry.oid}    ${entry.path}`)
       .join('\n')
   }
+
   toObject () {
-    let header = Buffer.alloc(12);
-    let writer = new BufferCursor(header);
+    const header = Buffer.alloc(12);
+    const writer = new BufferCursor(header);
     writer.write('DIRC', 4, 'utf8');
     writer.writeUInt32BE(2);
     writer.writeUInt32BE(this.entries.length);
-    let body = Buffer.concat(
+    const body = Buffer.concat(
       this.entries.map(entry => {
         const bpath = Buffer.from(entry.path);
         // the fixed length + the filename + at least one null char => align by 8
-        let length = Math.ceil((62 + bpath.length + 1) / 8) * 8;
-        let written = Buffer.alloc(length);
-        let writer = new BufferCursor(written);
+        const length = Math.ceil((62 + bpath.length + 1) / 8) * 8;
+        const written = Buffer.alloc(length);
+        const writer = new BufferCursor(written);
         const stat = normalizeStats(entry);
         writer.writeUInt32BE(stat.ctimeSeconds);
         writer.writeUInt32BE(stat.ctimeNanoseconds);
@@ -3406,9 +3627,73 @@ class GitIndex {
         return written
       })
     );
-    let main = Buffer.concat([header, body]);
-    let sum = shasum(main);
+    const main = Buffer.concat([header, body]);
+    const sum = shasum(main);
     return Buffer.concat([main, Buffer.from(sum, 'hex')])
+  }
+}
+
+const deepget = (keys, map) => {
+  for (const key of keys) {
+    if (!map.has(key)) map.set(key, new Map());
+    map = map.get(key);
+  }
+  return map
+};
+
+class DeepMap {
+  constructor () {
+    this._root = new Map();
+  }
+
+  set (keys, value) {
+    const lastKey = keys.pop();
+    const lastMap = deepget(keys, this._root);
+    lastMap.set(lastKey, value);
+  }
+
+  get (keys) {
+    const lastKey = keys.pop();
+    const lastMap = deepget(keys, this._root);
+    return lastMap.get(lastKey)
+  }
+
+  has (keys) {
+    const lastKey = keys.pop();
+    const lastMap = deepget(keys, this._root);
+    return lastMap.has(lastKey)
+  }
+}
+
+function compareStats (entry, stats) {
+  // Comparison based on the description in Paragraph 4 of
+  // https://www.kernel.org/pub/software/scm/git/docs/technical/racy-git.txt
+  const e = normalizeStats(entry);
+  const s = normalizeStats(stats);
+  const staleness =
+    e.mode !== s.mode ||
+    e.mtimeSeconds !== s.mtimeSeconds ||
+    e.ctimeSeconds !== s.ctimeSeconds ||
+    e.uid !== s.uid ||
+    e.gid !== s.gid ||
+    e.ino !== s.ino ||
+    e.size !== s.size;
+  // console.log(staleness ? 'stale:' : 'fresh:')
+  if (staleness && log.enabled) {
+    console.table([justWhatMatters(e), justWhatMatters(s)]);
+  }
+  return staleness
+}
+
+function justWhatMatters (e) {
+  return {
+    mode: e.mode,
+    mtimeSeconds: e.mtimeSeconds,
+    ctimeSeconds: e.ctimeSeconds,
+    uid: e.uid,
+    gid: e.gid,
+    ino: e.ino,
+    size: e.size
   }
 }
 
@@ -3417,43 +3702,56 @@ class GitIndex {
 // import Lock from '../utils.js'
 
 // TODO: replace with an LRU cache?
-const map = new Map();
+const map = new DeepMap();
+const stats = new DeepMap();
 // const lm = new LockManager()
 let lock = null;
+
+async function updateCachedIndexFile (fs, filepath) {
+  const stat = await fs.lstat(filepath);
+  const rawIndexFile = await fs.read(filepath);
+  const index = GitIndex.from(rawIndexFile);
+  // cache the GitIndex object so we don't need to re-read it
+  // every time.
+  map.set([fs, filepath], index);
+  // Save the stat data for the index so we know whether
+  // the cached file is stale (modified by an outside process).
+  stats.set([fs, filepath], stat);
+}
+
+// Determine whether our copy of the index file is stale
+async function isIndexStale (fs, filepath) {
+  const savedStats = stats.get([fs, filepath]);
+  if (savedStats === undefined) return true
+  const currStats = await fs.lstat(filepath);
+  if (savedStats === null) return false
+  if (currStats === null) return false
+  return compareStats(savedStats, currStats)
+}
 
 class GitIndexManager {
   static async acquire ({ fs: _fs, filepath }, closure) {
     const fs = new FileSystem(_fs);
     if (lock === null) lock = new AsyncLock({ maxPending: Infinity });
     await lock.acquire(filepath, async function () {
-      let index = map.get(filepath);
-      if (index === undefined) {
-        // Acquire a file lock while we're reading the index
-        // to make sure other processes aren't writing to it
-        // simultaneously, which could result in a corrupted index.
-        // const fileLock = await Lock(filepath)
-        const rawIndexFile = await fs.read(filepath);
-        index = GitIndex.from(rawIndexFile);
-        // cache the GitIndex object so we don't need to re-read it
-        // every time.
-        // TODO: save the stat data for the index so we know whether
-        // the cached file is stale (modified by an outside process).
-        map.set(filepath, index);
-        // await fileLock.cancel()
+      // Acquire a file lock while we're reading the index
+      // to make sure other processes aren't writing to it
+      // simultaneously, which could result in a corrupted index.
+      // const fileLock = await Lock(filepath)
+      if (await isIndexStale(fs, filepath)) {
+        await updateCachedIndexFile(fs, filepath);
       }
+      const index = map.get([fs, filepath]);
       await closure(index);
       if (index._dirty) {
         // Acquire a file lock while we're writing the index file
         // let fileLock = await Lock(filepath)
         const buffer = index.toObject();
         await fs.write(filepath, buffer);
+        // Update cached stat value
+        stats.set([fs, filepath], await fs.lstat(filepath));
         index._dirty = false;
       }
-      // For now, discard our cached object so that external index
-      // manipulation is picked up. TODO: use lstat and compare
-      // file times to determine if our cached object should be
-      // discarded.
-      map.delete(filepath);
     });
   }
 }
@@ -3494,12 +3792,10 @@ function oauth2 (company, token) {
   }
 }
 
-function calculateBasicAuthUsernamePasswordPair ({
-  username,
-  password,
-  token,
-  oauth2format
-} = {}) {
+function calculateBasicAuthUsernamePasswordPair (
+  { username, password, token, oauth2format } = {},
+  allowEmptyPassword = false
+) {
   // This checks for the presense and/or absense of each of the 4 parameters,
   // converts that to a 4-bit binary representation, and then handles
   // every possible combination (2^4 or 16 cases) with a lookup table.
@@ -3510,7 +3806,9 @@ function calculateBasicAuthUsernamePasswordPair ({
   // prettier-ignore
   switch (key) {
     case '0000': return null
-    case '1000': throw new GitError(E.MissingPasswordTokenError)
+    case '1000':
+      if (allowEmptyPassword) return { username, password: '' }
+      else throw new GitError(E.MissingPasswordTokenError)
     case '0100': throw new GitError(E.MissingUsernameError)
     case '1100': return { username, password }
     case '0010': return { username: token, password: '' } // Github's alternative format
@@ -3537,16 +3835,16 @@ function extractAuthFromUrl (url) {
   let userpass = url.match(/^https?:\/\/([^/]+)@/);
   if (userpass == null) return null
   userpass = userpass[1];
-  let [username, password] = userpass.split(':');
+  const [username, password] = userpass.split(':');
   url = url.replace(`${userpass}@`, '');
   return { url, username, password }
 }
 
 // Currently 'for await' upsets my linters.
 async function forAwait (iterable, cb) {
-  let iter = getIterator(iterable);
+  const iter = getIterator(iterable);
   while (true) {
-    let { value, done } = await iter.next();
+    const { value, done } = await iter.next();
     if (value) await cb(value);
     if (done) break
   }
@@ -3555,7 +3853,7 @@ async function forAwait (iterable, cb) {
 
 function asyncIteratorToStream (iter) {
   const { PassThrough } = require('readable-stream');
-  let stream = new PassThrough();
+  const stream = new PassThrough();
   setTimeout(async () => {
     await forAwait(iter, chunk => stream.write(chunk));
     stream.end();
@@ -3564,7 +3862,7 @@ function asyncIteratorToStream (iter) {
 }
 
 async function collect (iterable) {
-  let buffers = [];
+  const buffers = [];
   // This will be easier once `for await ... of` loops are available.
   await forAwait(iterable, value => buffers.push(Buffer.from(value)));
   return Buffer.concat(buffers)
@@ -3596,7 +3894,7 @@ async function http ({
       },
       (err, res) => {
         if (err) return reject(err)
-        let iter = fromNodeStream(res);
+        const iter = fromNodeStream(res);
         resolve({
           url: res.url,
           method: res.method,
@@ -3617,7 +3915,7 @@ async function parseRefsAdResponse (stream, { service }) {
 
   // There is probably a better way to do this, but for now
   // let's just throw the result parser inline here.
-  let read = GitPktLine.streamReader(stream);
+  const read = GitPktLine.streamReader(stream);
   let lineOne = await read();
   // skip past any flushes
   while (lineOne === null) lineOne = await read();
@@ -3635,18 +3933,18 @@ async function parseRefsAdResponse (stream, { service }) {
   // In the edge case of a brand new repo, zero refs (and zero capabilities)
   // are returned.
   if (lineTwo === true) return { capabilities, refs, symrefs }
-  let [firstRef, capabilitiesLine] = lineTwo
+  const [firstRef, capabilitiesLine] = lineTwo
     .toString('utf8')
     .trim()
     .split('\x00');
   capabilitiesLine.split(' ').map(x => capabilities.add(x));
-  let [ref, name] = firstRef.split(' ');
+  const [ref, name] = firstRef.split(' ');
   refs.set(name, ref);
   while (true) {
-    let line = await read();
+    const line = await read();
     if (line === true) break
     if (line !== null) {
-      let [ref, name] = line
+      const [ref, name] = line
         .toString('utf8')
         .trim()
         .split(' ');
@@ -3654,9 +3952,9 @@ async function parseRefsAdResponse (stream, { service }) {
     }
   }
   // Symrefs are thrown into the "capabilities" unfortunately.
-  for (let cap of capabilities) {
+  for (const cap of capabilities) {
     if (cap.startsWith('symref=')) {
-      let m = cap.match(/symref=([^:]+):(.*)/);
+      const m = cap.match(/symref=([^:]+):(.*)/);
       if (m.length === 3) {
         symrefs.set(m[1], m[2]);
       }
@@ -3677,6 +3975,7 @@ class GitRemoteHTTP {
   static async capabilities () {
     return ['discover', 'connect']
   }
+
   static async discover ({
     core,
     corsProxy,
@@ -3689,7 +3988,7 @@ class GitRemoteHTTP {
     const _origUrl = url;
     // Auto-append the (necessary) .git if it's missing.
     if (!url.endsWith('.git') && !noGitSuffix) url = url += '.git';
-    let urlAuth = extractAuthFromUrl(url);
+    const urlAuth = extractAuthFromUrl(url);
     if (urlAuth) {
       url = urlAuth.url;
       // To try to be backwards compatible with simple-get's behavior, which uses Node's http.request
@@ -3702,7 +4001,7 @@ class GitRemoteHTTP {
       url = corsProxify(corsProxy, url);
     }
     // Get the 'http' plugin
-    const http$$1 = cores.get(core).get('http') || http;
+    const http$1 = cores.get(core).get('http') || http;
     // headers['Accept'] = `application/x-${service}-advertisement`
     // Only send a user agent in Node and to CORS proxies by default,
     // because Gogs and others might not whitelist 'user-agent' in allowed headers.
@@ -3712,11 +4011,16 @@ class GitRemoteHTTP {
     if (typeof window === 'undefined' || corsProxy) {
       headers['user-agent'] = headers['user-agent'] || pkg.agent;
     }
-    let _auth = calculateBasicAuthUsernamePasswordPair(auth);
+    // If the username came from the URL, we want to allow the password to be missing.
+    // This is because Github allows using the token as the username with an empty password
+    // so that is a style of git clone URL we might encounter and we don't want to throw a "Missing password or token" error.
+    // Also, we don't want to prematurely throw an error before the credentialManager plugin has
+    // had an opportunity to provide the password.
+    const _auth = calculateBasicAuthUsernamePasswordPair(auth, !!urlAuth);
     if (_auth) {
       headers['Authorization'] = calculateBasicAuthHeader(_auth);
     }
-    let res = await http$$1({
+    let res = await http$1({
       core,
       method: 'GET',
       url: `${url}/info/refs?service=${service}`,
@@ -3726,11 +4030,11 @@ class GitRemoteHTTP {
       // Acquire credentials and try again
       const credentialManager = cores.get(core).get('credentialManager');
       auth = await credentialManager.fill({ url: _origUrl });
-      let _auth = calculateBasicAuthUsernamePasswordPair(auth);
+      const _auth = calculateBasicAuthUsernamePasswordPair(auth);
       if (_auth) {
         headers['Authorization'] = calculateBasicAuthHeader(_auth);
       }
-      res = await http$$1({
+      res = await http$1({
         core,
         method: 'GET',
         url: `${url}/info/refs?service=${service}`,
@@ -3751,7 +4055,7 @@ class GitRemoteHTTP {
     }
     // I'm going to be nice and ignore the content-type requirement unless there is a problem.
     try {
-      let remoteHTTP = await parseRefsAdResponse(res.body, {
+      const remoteHTTP = await parseRefsAdResponse(res.body, {
         service
       });
       remoteHTTP.auth = auth;
@@ -3769,6 +4073,7 @@ class GitRemoteHTTP {
       throw err
     }
   }
+
   static async connect ({
     core,
     emitter,
@@ -3783,7 +4088,7 @@ class GitRemoteHTTP {
   }) {
     // Auto-append the (necessary) .git if it's missing.
     if (!url.endsWith('.git') && !noGitSuffix) url = url += '.git';
-    let urlAuth = extractAuthFromUrl(url);
+    const urlAuth = extractAuthFromUrl(url);
     if (urlAuth) {
       url = urlAuth.url;
       // To try to be backwards compatible with simple-get's behavior, which uses Node's http.request
@@ -3798,7 +4103,7 @@ class GitRemoteHTTP {
     headers['content-type'] = `application/x-${service}-request`;
     headers['accept'] = `application/x-${service}-result`;
     // Get the 'http' plugin
-    const http$$1 = cores.get(core).get('http') || http;
+    const http$1 = cores.get(core).get('http') || http;
     // Only send a user agent in Node and to CORS proxies by default,
     // because Gogs and others might not whitelist 'user-agent' in allowed headers.
     // Solutions using 'process.browser' can't be used as they rely on bundler shims,
@@ -3807,11 +4112,16 @@ class GitRemoteHTTP {
     if (typeof window === 'undefined' || corsProxy) {
       headers['user-agent'] = headers['user-agent'] || pkg.agent;
     }
-    auth = calculateBasicAuthUsernamePasswordPair(auth);
+    // If the username came from the URL, we want to allow the password to be missing.
+    // This is because Github allows using the token as the username with an empty password
+    // so that is a style of git clone URL we might encounter and we don't want to throw a "Missing password or token" error.
+    // Also, we don't want to prematurely throw an error before the credentialManager plugin has
+    // had an opportunity to provide the password.
+    auth = calculateBasicAuthUsernamePasswordPair(auth, !!urlAuth);
     if (auth) {
       headers['Authorization'] = calculateBasicAuthHeader(auth);
     }
-    let res = await http$$1({
+    const res = await http$1({
       core,
       emitter,
       emitterPrefix,
@@ -3831,7 +4141,7 @@ class GitRemoteHTTP {
 }
 
 function parseRemoteUrl ({ url }) {
-  let matches = url.match(/(\w+)(:\/\/|::)(.*)/);
+  const matches = url.match(/(\w+)(:\/\/|::)(.*)/);
   if (matches === null) return
   /*
    * When git encounters a URL of the form <transport>://<address>, where <transport> is
@@ -3867,7 +4177,7 @@ class GitRemoteManager {
     remoteHelpers.set('http', GitRemoteHTTP);
     remoteHelpers.set('https', GitRemoteHTTP);
 
-    let parts = parseRemoteUrl({ url });
+    const parts = parseRemoteUrl({ url });
     if (!parts) {
       throw new GitError(E.RemoteUrlParseError, { url })
     }
@@ -3888,9 +4198,9 @@ class GitShallowManager {
     const fs = new FileSystem(_fs);
     if (lock$1 === null) lock$1 = new AsyncLock();
     const filepath = join(gitdir, 'shallow');
-    let oids = new Set();
+    const oids = new Set();
     await lock$1.acquire(filepath, async function () {
-      let text = await fs.read(filepath, { encoding: 'utf8' });
+      const text = await fs.read(filepath, { encoding: 'utf8' });
       if (text === null) return oids // no file
       if (text.trim() === '') return oids // empty file
       text
@@ -3900,12 +4210,13 @@ class GitShallowManager {
     });
     return oids
   }
+
   static async write ({ fs: _fs, gitdir, oids }) {
     const fs = new FileSystem(_fs);
     if (lock$1 === null) lock$1 = new AsyncLock();
     const filepath = join(gitdir, 'shallow');
     if (oids.size > 0) {
-      let text = [...oids].join('\n') + '\n';
+      const text = [...oids].join('\n') + '\n';
       await lock$1.acquire(filepath, async function () {
         await fs.write(filepath, text, {
           encoding: 'utf8'
@@ -3924,30 +4235,34 @@ class FIFO {
   constructor () {
     this._queue = [];
   }
+
   write (chunk) {
     if (this._ended) {
       throw Error('You cannot write to a FIFO that has already been ended!')
     }
     if (this._waiting) {
-      let resolve = this._waiting;
+      const resolve = this._waiting;
       this._waiting = null;
       resolve({ value: chunk });
     } else {
       this._queue.push(chunk);
     }
   }
+
   end () {
     this._ended = true;
     if (this._waiting) {
-      let resolve = this._waiting;
+      const resolve = this._waiting;
       this._waiting = null;
       resolve({ done: true });
     }
   }
+
   destroy (err) {
     this._ended = true;
     this.error = err;
   }
+
   async next () {
     if (this._queue.length > 0) {
       return { value: this._queue.shift() }
@@ -3990,14 +4305,14 @@ entire packfile without multiplexing.
 
 class GitSideBand {
   static demux (input) {
-    let read = GitPktLine.streamReader(input);
+    const read = GitPktLine.streamReader(input);
     // And now for the ridiculous side-band or side-band-64k protocol
-    let packetlines = new FIFO();
-    let packfile = new FIFO();
-    let progress = new FIFO();
+    const packetlines = new FIFO();
+    const packfile = new FIFO();
+    const progress = new FIFO();
     // TODO: Use a proper through stream?
     const nextBit = async function () {
-      let line = await read();
+      const line = await read();
       // Skip over flush packets
       if (line === null) return nextBit()
       // A made up convention to signal there's no more to read.
@@ -4016,7 +4331,7 @@ class GitSideBand {
           progress.write(line.slice(1));
           break
         case 3: // fatal error message just before stream aborts
-          let error = line.slice(1);
+          const error = line.slice(1);
           progress.write(error);
           packfile.destroy(new Error(error.toString('utf8')));
           return
@@ -4108,11 +4423,12 @@ class SignedGitCommit extends GitCommit {
   static from (commit) {
     return new SignedGitCommit(commit)
   }
+
   async sign (openpgp, privateKeys) {
-    let commit = this.withoutSignature();
-    let headers = GitCommit.justHeaders(this._commit);
-    let message = GitCommit.justMessage(this._commit);
-    let privKeyObj = openpgp.key.readArmored(privateKeys).keys;
+    const commit = this.withoutSignature();
+    const headers = GitCommit.justHeaders(this._commit);
+    const message = GitCommit.justMessage(this._commit);
+    const privKeyObj = openpgp.key.readArmored(privateKeys).keys;
     let { signature } = await openpgp.sign({
       data: openpgp.util.str2Uint8Array(commit),
       privateKeys: privKeyObj,
@@ -4121,14 +4437,14 @@ class SignedGitCommit extends GitCommit {
     });
     // renormalize the line endings to the one true line-ending
     signature = normalizeNewlines(signature);
-    let signedCommit =
+    const signedCommit =
       headers + '\n' + 'gpgsig' + indent(signature) + '\n' + message;
     // return a new commit object
     return GitCommit.from(signedCommit)
   }
 
   async listSigningKeys (openpgp) {
-    let msg = openpgp.message.readSignedContent(
+    const msg = openpgp.message.readSignedContent(
       this.withoutSignature(),
       this.isolateSignature()
     );
@@ -4136,13 +4452,15 @@ class SignedGitCommit extends GitCommit {
   }
 
   async verify (openpgp, publicKeys) {
-    let pubKeyObj = openpgp.key.readArmored(publicKeys).keys;
-    let msg = openpgp.message.readSignedContent(
+    const pubKeyObj = openpgp.key.readArmored(publicKeys).keys;
+    const msg = openpgp.message.readSignedContent(
       this.withoutSignature(),
       this.isolateSignature()
     );
-    let results = msg.verify(pubKeyObj);
-    let validity = results.reduce((a, b) => a.valid && b.valid, { valid: true });
+    const results = msg.verify(pubKeyObj);
+    const validity = results.reduce((a, b) => a.valid && b.valid, {
+      valid: true
+    });
     return validity
   }
 }
@@ -4162,8 +4480,8 @@ async function writeObjectLoose ({
         'GitObjectStoreLoose expects objects to write to be in deflated format'
     })
   }
-  let source = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
-  let filepath = `${gitdir}/${source}`;
+  const source = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
+  const filepath = `${gitdir}/${source}`;
   // Don't overwrite existing git objects - this helps avoid EPERM errors.
   // Although I don't know how we'd fix corrupted objects then. Perhaps delete them
   // on read?
@@ -4176,9 +4494,9 @@ async function writeObject ({
   type,
   object,
   format = 'content',
-  oid
+  oid = undefined,
+  dryRun = false
 }) {
-  const fs = new FileSystem(_fs);
   if (format !== 'deflated') {
     if (format !== 'wrapped') {
       object = GitObject.wrap({ type, object });
@@ -4186,7 +4504,10 @@ async function writeObject ({
     oid = shasum(object);
     object = Buffer.from(pako.deflate(object));
   }
-  await writeObjectLoose({ fs, gitdir, object, format: 'deflated', oid });
+  if (!dryRun) {
+    const fs = new FileSystem(_fs);
+    await writeObjectLoose({ fs, gitdir, object, format: 'deflated', oid });
+  }
   return oid
 }
 
@@ -4198,7 +4519,7 @@ async function writeObject ({
 function auth (username, password) {
   // Allow specifying it as one argument (mostly for CLI inputability)
   if (password === undefined) {
-    let i = username.indexOf(':');
+    const i = username.indexOf(':');
     if (i > -1) {
       password = username.slice(i + 1);
       username = username.slice(0, i);
@@ -4224,7 +4545,7 @@ function flatFileListToDirectoryStructure (files) {
   const inodes = new Map();
   const mkdir = function (name) {
     if (!inodes.has(name)) {
-      let dir = {
+      const dir = {
         type: 'tree',
         fullpath: name,
         basename: basename(name),
@@ -4243,7 +4564,7 @@ function flatFileListToDirectoryStructure (files) {
 
   const mkfile = function (name, metadata) {
     if (!inodes.has(name)) {
-      let file = {
+      const file = {
         type: 'blob',
         fullpath: name,
         basename: basename(name),
@@ -4259,18 +4580,89 @@ function flatFileListToDirectoryStructure (files) {
   };
 
   mkdir('.');
-  for (let file of files) {
+  for (const file of files) {
     mkfile(file.path, file);
   }
   return inodes
 }
 
-// This module is necessary because Webpack doesn't ship with
+/**
+ * Determine whether a file is binary (and therefore not worth trying to merge automatically)
+ *
+ * @param {Uint8Array} buffer
+ *
+ * If it looks incredibly simple / naive to you, compare it with the original:
+ *
+ * // xdiff-interface.c
+ *
+ * #define FIRST_FEW_BYTES 8000
+ * int buffer_is_binary(const char *ptr, unsigned long size)
+ * {
+ *  if (FIRST_FEW_BYTES < size)
+ *   size = FIRST_FEW_BYTES;
+ *  return !!memchr(ptr, 0, size);
+ * }
+ *
+ * Yup, that's how git does it. We could try to be smarter
+ */
+function isBinary (buffer) {
+  // in canonical git, this check happens in builtins/merge-file.c
+  // but I think it's DRYer to do it here.
+  // The value picked is explained here: https://github.com/git/git/blob/ab15ad1a3b4b04a29415aef8c9afa2f64fc194a2/xdiff-interface.h#L12
+  const MAX_XDIFF_SIZE = 1024 * 1024 * 1023;
+  if (buffer.length > MAX_XDIFF_SIZE) return true
+  // check for null characters in the first 8000 bytes
+  return buffer.slice(0, 8000).some(value => value === 0)
+}
 
-const path = _path.posix === undefined ? _path : _path.posix;
+const LINEBREAKS = /^.*(\r?\n|$)/gm;
+
+function mergeFile ({
+  ourContent,
+  baseContent,
+  theirContent,
+  ourName = 'ours',
+  baseName = 'base',
+  theirName = 'theirs',
+  format = 'diff',
+  markerSize = 7
+}) {
+  const ours = ourContent.match(LINEBREAKS);
+  const base = baseContent.match(LINEBREAKS);
+  const theirs = theirContent.match(LINEBREAKS);
+
+  // Here we let the diff3 library do the heavy lifting.
+  const result = diff3Merge(ours, base, theirs);
+
+  // Here we note whether there are conflicts and format the results
+  let mergedText = '';
+  let cleanMerge = true;
+  for (const item of result) {
+    if (item.ok) {
+      mergedText += item.ok.join('');
+    }
+    if (item.conflict) {
+      cleanMerge = false;
+      mergedText += `${'<'.repeat(markerSize)} ${ourName}\n`;
+      mergedText += item.conflict.a.join('');
+      if (format === 'diff3') {
+        mergedText += `${'|'.repeat(markerSize)} ${baseName}\n`;
+        mergedText += item.conflict.o.join('');
+      }
+      mergedText += `${'='.repeat(markerSize)}\n`;
+      mergedText += item.conflict.b.join('');
+      mergedText += `${'>'.repeat(markerSize)} ${theirName}\n`;
+    }
+  }
+  return { cleanMerge, mergedText }
+}
 
 async function resolveTree ({ fs, gitdir, oid }) {
-  let { type, object } = await readObject({ fs, gitdir, oid });
+  // Empty tree - bypass `readObject`
+  if (oid === '4b825dc642cb6eb9a060e54bf8d69288fbee4904') {
+    return { tree: GitTree.from([]), oid }
+  }
+  const { type, object } = await readObject({ fs, gitdir, oid });
   // Resolve annotated tag objects to whatever
   if (type === 'tag') {
     oid = GitAnnotatedTag.from(object).parse().object;
@@ -4287,6 +4679,120 @@ async function resolveTree ({ fs, gitdir, oid }) {
   return { tree: GitTree.from(object), oid }
 }
 
+class GitWalkerRepo {
+  constructor ({ fs: _fs, gitdir, ref }) {
+    const fs = new FileSystem(_fs);
+    this.fs = fs;
+    this.gitdir = gitdir;
+    this.mapPromise = (async () => {
+      const map = new Map();
+      let oid;
+      try {
+        oid = await GitRefManager.resolve({ fs, gitdir, ref });
+      } catch (e) {
+        // Handle fresh branches with no commits
+        if (e.code === E.ResolveRefError) {
+          oid = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+        }
+      }
+      const tree = await resolveTree({ fs, gitdir, oid });
+      tree.type = 'tree';
+      map.set('.', tree);
+      return map
+    })();
+    const walker = this;
+    this.ConstructEntry = class RepoEntry {
+      constructor (entry) {
+        Object.assign(this, entry);
+      }
+
+      async populateStat () {
+        if (!this.exists) return
+        await walker.populateStat(this);
+      }
+
+      async populateContent () {
+        if (!this.exists) return
+        await walker.populateContent(this);
+      }
+
+      async populateHash () {
+        if (!this.exists) return
+        await walker.populateHash(this);
+      }
+    };
+  }
+
+  async readdir (entry) {
+    if (!entry.exists) return []
+    const filepath = entry.fullpath;
+    const { fs, gitdir } = this;
+    const map = await this.mapPromise;
+    const obj = map.get(filepath);
+    if (!obj) throw new Error(`No obj for ${filepath}`)
+    const oid = obj.oid;
+    if (!oid) throw new Error(`No oid for obj ${JSON.stringify(obj)}`)
+    if (obj.type === 'commit') {
+      // TODO: support submodules
+      return null
+    }
+    const { type, object } = await readObject({ fs, gitdir, oid });
+    if (type === 'blob') return null
+    if (type !== 'tree') {
+      throw new Error(`ENOTDIR: not a directory, scandir '${filepath}'`)
+    }
+    const tree = GitTree.from(object);
+    // cache all entries
+    for (const entry of tree) {
+      map.set(join(filepath, entry.path), entry);
+    }
+    return tree.entries().map(entry => ({
+      fullpath: join(filepath, entry.path),
+      basename: entry.path,
+      exists: true
+    }))
+  }
+
+  async populateStat (entry) {
+    // All we can add here is mode and type.
+    const map = await this.mapPromise;
+    const stats = map.get(entry.fullpath);
+    if (!stats) {
+      throw new Error(
+        `ENOENT: no such file or directory, lstat '${entry.fullpath}'`
+      )
+    }
+    const { mode, type } = stats;
+    Object.assign(entry, { mode, type });
+  }
+
+  async populateContent (entry) {
+    const map = await this.mapPromise;
+    const { fs, gitdir } = this;
+    const obj = map.get(entry.fullpath);
+    if (!obj) throw new Error(`No obj for ${entry.fullpath}`)
+    const oid = obj.oid;
+    if (!oid) throw new Error(`No oid for entry ${JSON.stringify(obj)}`)
+    const { type, object } = await readObject({ fs, gitdir, oid });
+    if (type === 'tree') {
+      throw new Error(`EISDIR: illegal operation on a directory, read`)
+    }
+    Object.assign(entry, { content: object });
+  }
+
+  async populateHash (entry) {
+    const map = await this.mapPromise;
+    const obj = map.get(entry.fullpath);
+    if (!obj) {
+      throw new Error(
+        `ENOENT: no such file or directory, open '${entry.fullpath}'`
+      )
+    }
+    const oid = obj.oid;
+    Object.assign(entry, { oid });
+  }
+}
+
 // This is part of an elaborate system to facilitate code-splitting / tree-shaking.
 // commands/walk.js can depend on only this, and the actual Walker classes exported
 // can be opaque - only having a single property (this symbol) that is not enumerable,
@@ -4294,17 +4800,657 @@ async function resolveTree ({ fs, gitdir, oid }) {
 // outside of it.
 const GitWalkerSymbol = Symbol('GitWalkerSymbol');
 
+// @ts-check
+
+/**
+ *
+ * @typedef Walker
+ * @property {Symbol} Symbol('GitWalkerSymbol')
+ */
+
+/**
+ * Get a git commit Walker
+ *
+ * See [walkBeta1](./walkBeta1.md)
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} [args.ref='HEAD'] - [required] The commit to walk
+ *
+ * @returns {Walker} Returns a git commit Walker
+ *
+ */
+function TREE ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  ref = 'HEAD'
+}) {
+  const fs = new FileSystem(_fs);
+  const o = Object.create(null);
+  Object.defineProperty(o, GitWalkerSymbol, {
+    value: function () {
+      return new GitWalkerRepo({ fs, gitdir, ref })
+    }
+  });
+  Object.freeze(o);
+  return o
+}
+
+// https://dev.to/namirsab/comment/2050
+function arrayRange (start, end) {
+  const length = end - start;
+  return Array.from({ length }, (_, i) => start + i)
+}
+
+// TODO: Should I just polyfill Array.flat?
+const flat =
+  typeof Array.prototype.flat === 'undefined'
+    ? entries => entries.reduce((acc, x) => acc.concat(x), [])
+    : entries => entries.flat();
+
+// This is convenient for computing unions/joins of sorted lists.
+class RunningMinimum {
+  constructor () {
+    // Using a getter for 'value' would just bloat the code.
+    // You know better than to set it directly right?
+    this.value = null;
+  }
+
+  consider (value) {
+    if (value === null || value === undefined) return
+    if (this.value === null) {
+      this.value = value;
+    } else if (value < this.value) {
+      this.value = value;
+    }
+  }
+
+  reset () {
+    this.value = null;
+  }
+}
+
+// Take an array of length N of
+//   iterators of length Q_n
+//     of objects with a property 'fullname'
+// and return an iterator of length max(Q_n) for all n
+//   of arrays of length N
+//     of objects who all have the same value for 'fullname'
+function * unionOfIterators (sets) {
+  /* NOTE: We can assume all arrays are sorted.
+   * Indexes are sorted because they are defined that way:
+   *
+   * > Index entries are sorted in ascending order on the name field,
+   * > interpreted as a string of unsigned bytes (i.e. memcmp() order, no
+   * > localization, no special casing of directory separator '/'). Entries
+   * > with the same name are sorted by their stage field.
+   *
+   * Trees should be sorted because they are created directly from indexes.
+   * They definitely should be sorted, or else they wouldn't have a unique SHA1.
+   * So that would be very naughty on the part of the tree-creator.
+   *
+   * Lastly, the working dir entries are sorted because I choose to sort them
+   * in my FileSystem.readdir() implementation.
+   */
+
+  // Init
+  const min = new RunningMinimum();
+  let minimum;
+  const heads = [];
+  const numsets = sets.length;
+  for (let i = 0; i < numsets; i++) {
+    // Abuse the fact that iterators continue to return 'undefined' for value
+    // once they are done
+    heads[i] = sets[i].next().value;
+    if (heads[i] !== undefined) {
+      min.consider(heads[i].fullpath);
+    }
+  }
+  if (min.value === null) return
+  // Iterate
+  while (true) {
+    const result = [];
+    minimum = min.value;
+    min.reset();
+    for (let i = 0; i < numsets; i++) {
+      if (heads[i] !== undefined && heads[i].fullpath === minimum) {
+        result[i] = heads[i];
+        heads[i] = sets[i].next().value;
+      } else {
+        // A little hacky, but eh
+        result[i] = {
+          fullpath: minimum,
+          basename: basename(minimum),
+          exists: false
+        };
+      }
+      if (heads[i] !== undefined) {
+        min.consider(heads[i].fullpath);
+      }
+    }
+    // if (result.reduce((y, a) => y && (a === null), true)) {
+    //   return
+    // }
+    yield result;
+    if (min.value === null) return
+  }
+}
+
+// @ts-check
+
+/**
+ *
+ * @typedef {Object} Walker
+ * @property {Symbol} Symbol('GitWalkerSymbol')
+ */
+
+/**
+ *
+ * @typedef {Object} WalkerEntry The `WalkerEntry` is an interface that abstracts computing many common tree / blob stats.
+ * @property {string} fullpath
+ * @property {string} basename
+ * @property {boolean} exists
+ * @property {Function} populateStat
+ * @property {'tree'|'blob'|'special'|'commit'} [type]
+ * @property {number} [ctimeSeconds]
+ * @property {number} [ctimeNanoseconds]
+ * @property {number} [mtimeSeconds]
+ * @property {number} [mtimeNanoseconds]
+ * @property {number} [dev]
+ * @property {number} [ino]
+ * @property {number|string} [mode] WORKDIR and STAGE return numbers, TREE returns a string... I'll fix this in walkBeta2
+ * @property {number} [uid]
+ * @property {number} [gid]
+ * @property {number} [size]
+ * @property {Function} populateContent
+ * @property {Buffer} [content]
+ * @property {Function} populateHash
+ * @property {string} [oid]
+ */
+
+/**
+ * A powerful recursive tree-walking utility.
+ *
+ * The `walk` API (tentatively named `walkBeta1`) simplifies gathering detailed information about a tree or comparing all the filepaths in two or more trees.
+ * Trees can be file directories, git commits, or git indexes (aka staging areas).
+ * So you can compare two file directories, or 10 commits, or the stage of one repo with the working directory of another repo... etc.
+ * As long as a file or directory is present in at least one of the trees, it will be traversed.
+ * Entries are traversed in alphabetical order.
+ *
+ * The arguments to `walk` are the `trees` you want to traverse, and 4 optional transform functions:
+ *  `filter`, `map`, `reduce`, and `iterate`.
+ *
+ * The trees are represented by three magic functions that can be imported:
+ * ```js
+ * import { TREE, WORKDIR, STAGE } from 'isomorphic-git'
+ * ```
+ *
+ * These functions return objects that implement the `Walker` interface.
+ * The only thing they are good for is passing into `walkBeta1`'s `trees` argument.
+ * Here are the three `Walker`s passed into `walkBeta1` by the `statusMatrix` command for example:
+ *
+ * ```js
+ * let gitdir = '.git'
+ * let dir = '.'
+ * let ref = 'HEAD'
+ *
+ * let trees = [
+ *   TREE({fs, gitdir, ref}),
+ *   WORKDIR({fs, dir, gitdir}),
+ *   STAGE({fs, gitdir})
+ * ]
+ * ```
+ *
+ * See the doc pages for [TREE](./TREE.md), [WORKDIR](./WORKDIR.md), and [STAGE](./STAGE.md).
+ *
+ * `filter`, `map`, `reduce`, and `iterate` allow you control the recursive walk by pruning and transforming `WalkerTree`s into the desired result.
+ *
+ * ## WalkerEntry
+ * The `WalkerEntry` is an interface that abstracts computing many common tree / blob stats.
+ * `filter` and `map` each receive an array of `WalkerEntry[]` as their main argument, one `WalkerEntry` for each `Walker` in the `trees` argument.
+ *
+ * By default, `WalkerEntry`s only have three properties:
+ * ```js
+ * {
+ *   fullpath: string;
+ *   basename: string;
+ *   exists: boolean;
+ * }
+ * ```
+ *
+ * Additional properties can be computed only when needed. This lets you build lean, mean, efficient walking machines.
+ * ```js
+ * await entry.populateStat()
+ * // populates
+ * entry.type // 'tree', 'blob'
+ * // and where applicable, these properties:
+ * entry.ctimeSeconds // number;
+ * entry.ctimeNanoseconds // number;
+ * entry.mtimeSeconds // number;
+ * entry.mtimeNanoseconds // number;
+ * entry.dev // number;
+ * entry.ino // number;
+ * entry.mode // number;
+ * entry.uid // number;
+ * entry.gid // number;
+ * entry.size // number;
+ * ```
+ *
+ * ```js
+ * await entry.populateContent()
+ * // populates
+ * entry.content // Buffer
+ * // except for STAGE which does not currently provide content
+ * ```
+ *
+ * ```js
+ * await entry.populateHash()
+ * // populates
+ * entry.oid // SHA1 string
+ * ```
+ *
+ * ## filter(WalkerEntry[]) => boolean
+ *
+ * Default: `async () => true`.
+ *
+ * This is a good place to put limiting logic such as skipping entries with certain filenames.
+ * If you return false for directories, then none of the children of that directory will be walked.
+ *
+ * Example:
+ * ```js
+ * let path = require('path')
+ * let cwd = 'src/app'
+ * // Only examine files in the directory `cwd`
+ * async function filter ([head, workdir, stage]) {
+ *   // It doesn't matter which tree (head, workdir, or stage) you use here.
+ *   return (
+ *     // return true for the root directory
+ *     head.fullpath === '.' ||
+ *     // return true for 'src' and 'src/app'
+ *     cwd.startsWith(head.fullpath) ||
+ *     // return true for 'src/app/*'
+ *     path.dirname(head.fullpath) === cwd
+ *   )
+ * }
+ * ```
+ *
+ * ## map(WalkerEntry[]) => any
+ *
+ * Default: `async entry => entry`
+ *
+ * This is a good place for query logic, such as examining the contents of a file.
+ * Ultimately, compare all the entries and return any values you are interested in.
+ * If you do not return a value (or return undefined) that entry will be filtered from the results.
+ *
+ * Example 1: Find all the files containing the word 'foo'.
+ * ```js
+ * async function map([head, workdir]) {
+ *   await workdir.populateContent()
+ *   let content = workdir.content.toString('utf8')
+ *   if (content.contains('foo')) {
+ *     return {
+ *       fullpath: workdir.fullpath,
+ *       content
+ *     }
+ *   }
+ * }
+ *
+ * ```
+ *
+ * Example 2: Return the difference between the working directory and the HEAD commit
+ * ```js
+ * const diff = require('diff-lines')
+ * async function map([head, workdir]) {
+ *   await head.populateContent()
+ *   await head.populateHash()
+ *   await workdir.populateContent()
+ *   return {
+ *     filename: head.fullpath,
+ *     oid: head.oid,
+ *     diff: diff(head.content.toString('utf8'), workdir.content.toString('utf8'))
+ *   }
+ * }
+ * ```
+ *
+ * ## reduce(parent, children)
+ *
+ * Default: `async (parent, children) => parent === undefined ? children.flat() : [parent, children].flat()`
+ *
+ * The default implementation of this function returns all directories and children in a giant flat array.
+ * You can define a different accumulation method though.
+ *
+ * Example: Return a hierarchical structure
+ * ```js
+ * async function reduce (parent, children) {
+ *   return Object.assign(parent, { children })
+ * }
+ * ```
+ *
+ * ## iterate(walk, children)
+ *
+ * Default: `(walk, children) => Promise.all([...children].map(walk))`
+ *
+ * The default implementation recurses all children concurrently using Promise.all.
+ * However you could use a custom function to traverse children serially or use a global queue to throttle recursion.
+ *
+ * > Note: For a complete example, look at the implementation of `statusMatrix`.
+ *
+ * @param {object} args
+ * @param {Walker[]} args.trees - The trees you want to traverse
+ * @param {function(WalkerEntry[]): Promise<boolean>} [args.filter] - Filter which `WalkerEntry`s to process
+ * @param {function(WalkerEntry[]): Promise<any>} [args.map] - Transform `WalkerEntry`s into a result form
+ * @param {function(any, any[]): Promise<any>} [args.reduce] - Control how mapped entries are combined with their parent result
+ * @param {function(function(WalkerEntry[]): Promise<any[]>, IterableIterator<WalkerEntry[]>): Promise<any[]>} [args.iterate] - Fine-tune how entries within a tree are iterated over
+ *
+ * @returns {Promise<any>} The finished tree-walking result
+ *
+ * @see WalkerEntry
+ *
+ */
+async function walkBeta1 ({
+  trees,
+  filter = async () => true,
+  // @ts-ignore
+  map = async entry => entry,
+  // The default reducer is a flatmap that filters out undefineds.
+  reduce = async (parent, children) => {
+    const flatten = flat(children);
+    if (parent !== undefined) flatten.unshift(parent);
+    return flatten
+  },
+  // The default iterate function walks all children concurrently
+  iterate = (walk, children) => Promise.all([...children].map(walk))
+}) {
+  try {
+    const walkers = trees.map(proxy => proxy[GitWalkerSymbol]());
+
+    const root = new Array(walkers.length).fill({
+      fullpath: '.',
+      basename: '.',
+      exists: true
+    });
+    const range = arrayRange(0, walkers.length);
+    const unionWalkerFromReaddir = async entry => {
+      const subdirs = await Promise.all(
+        range.map(i => walkers[i].readdir(entry[i]))
+      );
+      range.map(i => {
+        entry[i] = new walkers[i].ConstructEntry(entry[i]);
+      });
+      // Now process child directories
+      const iterators = subdirs
+        .map(array => (array === null ? [] : array))
+        .map(array => array[Symbol.iterator]());
+      return {
+        entry,
+        children: unionOfIterators(iterators)
+      }
+    };
+
+    const walk = async root => {
+      const { children, entry } = await unionWalkerFromReaddir(root);
+      if (await filter(entry)) {
+        const parent = await map(entry);
+        let walkedChildren = await iterate(walk, children);
+        walkedChildren = walkedChildren.filter(x => x !== undefined);
+        return reduce(parent, walkedChildren)
+      }
+    };
+    return walk(root)
+  } catch (err) {
+    err.caller = 'git.walk';
+    throw err
+  }
+}
+
+// @ts-check
+
+/**
+ *
+ * @typedef {import('../commands/readObject').TreeEntry} TreeEntry
+ */
+
+/**
+ * Create a merged tree
+ *
+ * @param {Object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} args.ourOid - The SHA-1 object id of our tree
+ * @param {string} args.baseOid - The SHA-1 object id of the base tree
+ * @param {string} args.theirOid - The SHA-1 object id of their tree
+ * @param {string} [args.ourName='ours'] - The name to use in conflicted files for our hunks
+ * @param {string} [args.baseName='base'] - The name to use in conflicted files (in diff3 format) for the base hunks
+ * @param {string} [args.theirName='theirs'] - The name to use in conflicted files for their hunks
+ * @param {boolean} [args.dryRun=false]
+ *
+ * @returns {Promise<string>} - The SHA-1 object id of the merged tree
+ *
+ */
+async function mergeTree ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  ourOid,
+  baseOid,
+  theirOid,
+  ourName = 'ours',
+  baseName = 'base',
+  theirName = 'theirs',
+  dryRun = false
+}) {
+  const fs = new FileSystem(_fs);
+  const ourTree = TREE({ core, dir, gitdir, fs, ref: ourOid });
+  const baseTree = TREE({ core, dir, gitdir, fs, ref: baseOid });
+  const theirTree = TREE({ core, dir, gitdir, fs, ref: theirOid });
+
+  const results = await walkBeta1({
+    trees: [ourTree, baseTree, theirTree],
+    map: async function ([ours, base, theirs]) {
+      await Promise.all([
+        ours.populateStat(),
+        base.populateStat(),
+        theirs.populateStat(),
+        ours.populateHash(),
+        base.populateHash(),
+        theirs.populateHash()
+      ]);
+      // What we did, what they did
+      const ourChange = modified(ours, base);
+      const theirChange = modified(theirs, base);
+      switch (`${ourChange}-${theirChange}`) {
+        case 'false-false': {
+          return {
+            mode: base.mode,
+            path: base.basename,
+            oid: base.oid,
+            type: base.type
+          }
+        }
+        case 'false-true': {
+          return theirs.exists
+            ? {
+              mode: theirs.mode,
+              path: theirs.basename,
+              oid: theirs.oid,
+              type: theirs.type
+            }
+            : void 0
+        }
+        case 'true-false': {
+          return ours.exists
+            ? {
+              mode: ours.mode,
+              path: ours.basename,
+              oid: ours.oid,
+              type: ours.type
+            }
+            : void 0
+        }
+        case 'true-true': {
+          // Modifications
+          if (
+            ours.type === 'blob' &&
+            base.type === 'blob' &&
+            theirs.type === 'blob'
+          ) {
+            return mergeBlobs({
+              fs,
+              gitdir,
+              ours,
+              base,
+              theirs,
+              ourName,
+              baseName,
+              theirName
+            })
+          }
+          // all other types of conflicts fail
+          throw new GitError(E.MergeNotSupportedFail)
+        }
+      }
+    },
+    /**
+     * @param {TreeEntry} [parent]
+     * @param {Array<TreeEntry>} children
+     */
+    reduce: async (parent, children) => {
+      const entries = children.filter(Boolean); // remove undefineds
+
+      // automatically delete directories if they have been emptied
+      if (parent && parent.type === 'tree' && entries.length === 0) return
+
+      if (entries.length > 0) {
+        const tree = new GitTree(entries);
+        const object = tree.toObject();
+        const oid = await writeObject({
+          fs,
+          gitdir,
+          type: 'tree',
+          object,
+          dryRun
+        });
+        parent.oid = oid;
+      }
+      return parent
+    }
+  });
+  return results.oid
+}
+
+/**
+ *
+ * @param {import('../commands/walkBeta1.js').WalkerEntry} entry
+ * @param {import('../commands/walkBeta1.js').WalkerEntry} base
+ *
+ */
+function modified (entry, base) {
+  if (entry.exists && !base.exists) return true
+  if (!entry.exists && base.exists) return true
+  if (entry.type === 'tree' && base.type === 'tree') return false
+  if (
+    entry.type === base.type &&
+    entry.mode === base.mode &&
+    entry.oid === base.oid
+  ) {
+    return false
+  }
+  return true
+}
+
+/**
+ *
+ * @param {Object} args
+ * @param {FileSystem} args.fs
+ * @param {string} args.gitdir
+ * @param {import('../commands/walkBeta1.js').WalkerEntry} args.ours
+ * @param {import('../commands/walkBeta1.js').WalkerEntry} args.base
+ * @param {import('../commands/walkBeta1.js').WalkerEntry} args.theirs
+ * @param {string} [args.ourName]
+ * @param {string} [args.baseName]
+ * @param {string} [args.theirName]
+ * @param {string} [args.format]
+ * @param {number} [args.markerSize]
+ * @param {boolean} [args.dryRun = false]
+ *
+ */
+async function mergeBlobs ({
+  fs,
+  gitdir,
+  ours,
+  base,
+  theirs,
+  ourName,
+  theirName,
+  baseName,
+  format,
+  markerSize,
+  dryRun
+}) {
+  const type = 'blob';
+  // this might change if we figure out rename detection
+  const path = base.basename;
+  // Compute the new mode.
+  // Since there are ONLY two valid blob modes ('100755' and '100644') it boils down to this
+  const mode = base.mode === ours.mode ? theirs.mode : ours.mode;
+  // The trivial case: nothing to merge except maybe mode
+  if (ours.oid === theirs.oid) return { mode, path, oid: ours.oid, type }
+  // if only one side made oid changes, return that side's oid
+  if (ours.oid === base.oid) return { mode, path, oid: theirs.oid, type }
+  if (theirs.oid === base.oid) return { mode, path, oid: ours.oid, type }
+  // if both sides made changes do a merge
+  await Promise.all([
+    ours.populateContent(),
+    base.populateContent(),
+    theirs.populateContent()
+  ]);
+  const { mergedText, cleanMerge } = mergeFile({
+    ourContent: ours.content.toString('utf8'),
+    baseContent: base.content.toString('utf8'),
+    theirContent: theirs.content.toString('utf8'),
+    ourName,
+    theirName,
+    baseName,
+    format,
+    markerSize
+  });
+  if (!cleanMerge) {
+    // all other types of conflicts fail
+    throw new GitError(E.MergeNotSupportedFail)
+  }
+  const oid = await writeObject({
+    fs,
+    gitdir,
+    type: 'blob',
+    object: Buffer.from(mergedText, 'utf8'),
+    dryRun
+  });
+  return { mode, path, oid, type }
+}
+
+// This module is necessary because Webpack doesn't ship with
+
+const path = _path.posix === undefined ? _path : _path.posix;
+
 async function parseReceivePackResponse (packfile) {
-  let result = {};
+  const result = {};
   let response = '';
-  let read = GitPktLine.streamReader(packfile);
+  const read = GitPktLine.streamReader(packfile);
   let line = await read();
   while (line !== true) {
     if (line !== null) response += line.toString('utf8') + '\n';
     line = await read();
   }
 
-  let lines = response.toString('utf8').split('\n');
+  const lines = response.toString('utf8').split('\n');
   // We're expecting "unpack {unpack-result}"
   line = lines.shift();
   if (!line.startsWith('unpack ')) {
@@ -4315,9 +5461,9 @@ async function parseReceivePackResponse (packfile) {
   } else {
     result.errors = [line.trim()];
   }
-  for (let line of lines) {
-    let status = line.slice(0, 2);
-    let refAndMessage = line.slice(3);
+  for (const line of lines) {
+    const status = line.slice(0, 2);
+    const refAndMessage = line.slice(3);
     if (status === 'ok') {
       result.ok = result.ok || [];
       result.ok.push(refAndMessage);
@@ -4331,29 +5477,29 @@ async function parseReceivePackResponse (packfile) {
 
 async function parseUploadPackResponse (stream) {
   const { packetlines, packfile, progress } = GitSideBand.demux(stream);
-  let shallows = [];
-  let unshallows = [];
-  let acks = [];
+  const shallows = [];
+  const unshallows = [];
+  const acks = [];
   let nak = false;
   let done = false;
   return new Promise((resolve, reject) => {
     // Parse the response
     forAwait(packetlines, data => {
-      let line = data.toString('utf8').trim();
+      const line = data.toString('utf8').trim();
       if (line.startsWith('shallow')) {
-        let oid = line.slice(-41).trim();
+        const oid = line.slice(-41).trim();
         if (oid.length !== 40) {
           reject(new GitError(E.CorruptShallowOidFail, { oid }));
         }
         shallows.push(oid);
       } else if (line.startsWith('unshallow')) {
-        let oid = line.slice(-41).trim();
+        const oid = line.slice(-41).trim();
         if (oid.length !== 40) {
           reject(new GitError(E.CorruptShallowOidFail, { oid }));
         }
         unshallows.push(oid);
       } else if (line.startsWith('ACK')) {
-        let [, oid, status] = line.split(' ');
+        const [, oid, status] = line.split(' ');
         acks.push({ oid, status });
         if (!status) done = true;
       } else if (line.startsWith('NAK')) {
@@ -4368,21 +5514,21 @@ async function parseUploadPackResponse (stream) {
 }
 
 async function parseUploadPackRequest (stream) {
-  let read = GitPktLine.streamReader(stream);
+  const read = GitPktLine.streamReader(stream);
   let done = false;
   let capabilities = null;
-  let wants = [];
-  let haves = [];
-  let shallows = [];
+  const wants = [];
+  const haves = [];
+  const shallows = [];
   let depth;
   let since;
-  let exclude = [];
+  const exclude = [];
   let relative = false;
   while (!done) {
-    let line = await read();
+    const line = await read();
     if (line === true) break
     if (line === null) continue
-    let [key, value, ...rest] = line
+    const [key, value, ...rest] = line
       .toString('utf8')
       .trim()
       .split(' ');
@@ -4431,9 +5577,9 @@ async function writeReceivePackRequest ({
   capabilities = [],
   triplets = []
 }) {
-  let packstream = [];
+  const packstream = [];
   let capsFirstLine = `\x00 ${capabilities.join(' ')}`;
-  for (let trip of triplets) {
+  for (const trip of triplets) {
     packstream.push(
       GitPktLine.encode(
         `${trip.oldoid} ${trip.oid} ${trip.fullRef}${capsFirstLine}\n`
@@ -4454,7 +5600,7 @@ function writeUploadPackRequest ({
   since = null,
   exclude = []
 }) {
-  let packstream = [];
+  const packstream = [];
   wants = [...new Set(wants)]; // remove duplicates
   let firstLineCapabilities = ` ${capabilities.join(' ')}`;
   for (const oid of wants) {
@@ -4483,57 +5629,60 @@ function writeUploadPackRequest ({
   return packstream
 }
 
-exports.listCommitsAndTags = listCommitsAndTags;
-exports.listObjects = listObjects;
-exports.pack = pack;
-exports.uploadPack = uploadPack;
-exports.GitConfigManager = GitConfigManager;
-exports.GitIgnoreManager = GitIgnoreManager;
-exports.GitIndexManager = GitIndexManager;
-exports.GitRefManager = GitRefManager;
-exports.GitRemoteHTTP = GitRemoteHTTP;
-exports.GitRemoteManager = GitRemoteManager;
-exports.GitShallowManager = GitShallowManager;
+exports.E = E;
 exports.FileSystem = FileSystem;
 exports.GitAnnotatedTag = GitAnnotatedTag;
 exports.GitCommit = GitCommit;
 exports.GitConfig = GitConfig;
-exports.E = E;
+exports.GitConfigManager = GitConfigManager;
 exports.GitError = GitError;
+exports.GitIgnoreManager = GitIgnoreManager;
 exports.GitIndex = GitIndex;
+exports.GitIndexManager = GitIndexManager;
 exports.GitObject = GitObject;
 exports.GitPackIndex = GitPackIndex;
 exports.GitPktLine = GitPktLine;
+exports.GitRefManager = GitRefManager;
 exports.GitRefSpec = GitRefSpec;
 exports.GitRefSpecSet = GitRefSpecSet;
+exports.GitRemoteHTTP = GitRemoteHTTP;
+exports.GitRemoteManager = GitRemoteManager;
+exports.GitShallowManager = GitShallowManager;
 exports.GitSideBand = GitSideBand;
 exports.GitTree = GitTree;
+exports.GitWalkerSymbol = GitWalkerSymbol;
 exports.SignedGitCommit = SignedGitCommit;
-exports.readObject = readObject;
-exports.writeObject = writeObject;
 exports.auth = auth;
 exports.calculateBasicAuthHeader = calculateBasicAuthHeader;
 exports.calculateBasicAuthUsernamePasswordPair = calculateBasicAuthUsernamePasswordPair;
 exports.collect = collect;
 exports.comparePath = comparePath;
-exports.http = http;
+exports.cores = cores;
 exports.flatFileListToDirectoryStructure = flatFileListToDirectoryStructure;
+exports.http = http;
+exports.isBinary = isBinary;
 exports.join = join;
+exports.listCommitsAndTags = listCommitsAndTags;
+exports.listObjects = listObjects;
 exports.log = log;
+exports.mergeFile = mergeFile;
+exports.mergeTree = mergeTree;
 exports.oauth2 = oauth2;
+exports.pack = pack;
 exports.padHex = padHex;
+exports.parseReceivePackResponse = parseReceivePackResponse;
+exports.parseRefsAdResponse = parseRefsAdResponse;
+exports.parseUploadPackRequest = parseUploadPackRequest;
+exports.parseUploadPackResponse = parseUploadPackResponse;
 exports.path = path;
 exports.pkg = pkg;
 exports.plugins = plugins;
-exports.cores = cores;
+exports.readObject = readObject;
 exports.resolveTree = resolveTree;
 exports.shasum = shasum;
 exports.sleep = sleep;
-exports.GitWalkerSymbol = GitWalkerSymbol;
-exports.parseReceivePackResponse = parseReceivePackResponse;
-exports.parseRefsAdResponse = parseRefsAdResponse;
-exports.parseUploadPackResponse = parseUploadPackResponse;
-exports.parseUploadPackRequest = parseUploadPackRequest;
+exports.uploadPack = uploadPack;
+exports.writeObject = writeObject;
 exports.writeReceivePackRequest = writeReceivePackRequest;
 exports.writeRefsAdResponse = writeRefsAdResponse;
 exports.writeUploadPackRequest = writeUploadPackRequest;

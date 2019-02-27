@@ -13,6 +13,14 @@ import { E, GitError } from '../models/GitError'
 class PluginCore extends Map {
   set (key, value) {
     const verifySchema = (key, value) => {
+      // ugh. this sucks
+      if (
+        key === 'fs' &&
+        Object.getOwnPropertyDescriptor(value, 'promises') &&
+        Object.getOwnPropertyDescriptor(value, 'promises').enumerable
+      ) {
+        value = value.promises
+      }
       const pluginSchemas = {
         credentialManager: ['fill', 'approved', 'rejected'],
         emitter: ['emit'],
@@ -29,10 +37,10 @@ class PluginCore extends Map {
         pgp: ['sign', 'verify'],
         http: []
       }
-      if (!pluginSchemas.hasOwnProperty(key)) {
+      if (!Object.prototype.hasOwnProperty.call(pluginSchemas, key)) {
         throw new GitError(E.PluginUnrecognized, { plugin: key })
       }
-      for (let method of pluginSchemas[key]) {
+      for (const method of pluginSchemas[key]) {
         if (value[method] === undefined) {
           throw new GitError(E.PluginSchemaViolation, { plugin: key, method })
         }
@@ -42,6 +50,7 @@ class PluginCore extends Map {
     // There can be only one.
     super.set(key, value)
   }
+
   get (key) {
     // Critical plugins throw an error instead of returning undefined.
     const critical = new Set(['credentialManager', 'fs', 'pgp'])

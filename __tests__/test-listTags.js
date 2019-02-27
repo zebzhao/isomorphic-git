@@ -1,5 +1,6 @@
 /* eslint-env node, browser, jasmine */
 const { makeFixture } = require('./__helpers__/FixtureFS.js')
+// @ts-ignore
 const snapshots = require('./__snapshots__/test-listTags.js.snap')
 const registerSnapshots = require('./__helpers__/jasmine-snapshots')
 const { listTags } = require('isomorphic-git')
@@ -10,9 +11,9 @@ describe('listTags', () => {
   })
   it('listTags', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-listTags')
+    const { gitdir } = await makeFixture('test-listTags')
     // Test
-    let refs = await listTags({
+    const refs = await listTags({
       gitdir
     })
     expect(refs).toMatchSnapshot()

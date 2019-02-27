@@ -1,7 +1,9 @@
 const pify = require('pify')
 
-const { plugins } = require('isomorphic-git')
+const { cores, plugins } = require('isomorphic-git')
 const { FileSystem } = require('isomorphic-git/internal-apis')
+
+let i = 0
 
 let browserFS = null
 let browserFSwritable = null
@@ -16,29 +18,35 @@ async function makeBrowserFS (dir) {
       const InMemoryFS = pify(BrowserFS.FileSystem.InMemory.Create)
       const OverlayFS = pify(BrowserFS.FileSystem.OverlayFS.Create)
       const index = require('../../__fixtures__/index.json')
-      let readable = await HTTPRequestFS({
+      const readable = await HTTPRequestFS({
         index,
         baseUrl: 'http://localhost:9876/base/__tests__/__fixtures__/'
       })
-      let writable = await InMemoryFS()
-      let ofs = await OverlayFS({ readable, writable })
+      const writable = await InMemoryFS()
+      const ofs = await OverlayFS({ readable, writable })
       BrowserFS.initialize(ofs)
       browserFS = BrowserFS.BFSRequire('fs')
       browserFSwritable = writable
     }
-    const _fs = browserFS
+    const _fs = Object.assign({}, browserFS)
     browserFSwritable.empty()
-    plugins.set('fs', _fs)
+
+    const core = `core-browserfs-${i++}`
+    cores.create(core).set('fs', _fs)
+    plugins.set('fs', _fs) // deprecated
+
     const fs = new FileSystem(_fs)
+
     dir = `/${dir}`
-    let gitdir = `/${dir}.git`
+    const gitdir = `/${dir}.git`
     await fs.mkdir(dir)
     await fs.mkdir(gitdir)
     return {
       _fs,
       fs,
       dir,
-      gitdir
+      gitdir,
+      core
     }
   }
 }

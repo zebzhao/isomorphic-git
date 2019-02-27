@@ -1,3 +1,4 @@
+// @ts-check
 import { FileSystem } from '../models/FileSystem.js'
 import { GitCommit } from '../models/GitCommit.js'
 import { readObject } from '../storage/readObject.js'
@@ -9,7 +10,6 @@ import { cores } from '../utils/plugins.js'
  *
  * @link https://isomorphic-git.github.io/docs/findMergeBase.html
  */
-// TODO: Should I rename this nearestCommonAncestor?
 export async function findMergeBase ({
   core = 'default',
   dir,
@@ -30,12 +30,12 @@ export async function findMergeBase ({
     // Due to a single commit coming from multiple parents, it's possible for a single parent to
     // be double counted if identity of initial walkers are not tracked.
     const tracker = {}
-    let passes = (1 << oids.length) - 1
+    const passes = (1 << oids.length) - 1
     let heads = oids.map((oid, i) => ({ oid, i }))
     while (heads.length) {
       // Track number of passes through each commit by an initial walker
       let result = {}
-      for (let { oid, i } of heads) {
+      for (const { oid, i } of heads) {
         if (tracker[oid]) {
           tracker[oid] |= 1 << i
         } else {
@@ -51,13 +51,13 @@ export async function findMergeBase ({
         return result
       }
       // We haven't found a common ancestor yet
-      let newheads = []
-      for (let { oid, i } of heads) {
+      const newheads = []
+      for (const { oid, i } of heads) {
         try {
-          let { object } = await readObject({ fs, gitdir, oid })
-          let commit = GitCommit.from(object)
-          let { parent } = commit.parseHeaders()
-          for (let oid of parent) {
+          const { object } = await readObject({ fs, gitdir, oid })
+          const commit = GitCommit.from(object)
+          const { parent } = commit.parseHeaders()
+          for (const oid of parent) {
             newheads.push({ oid, i })
           }
         } catch (err) {

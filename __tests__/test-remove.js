@@ -1,5 +1,6 @@
 /* eslint-env node, browser, jasmine */
 const { makeFixture } = require('./__helpers__/FixtureFS.js')
+// @ts-ignore
 const snapshots = require('./__snapshots__/test-remove.js.snap')
 const registerSnapshots = require('./__helpers__/jasmine-snapshots')
 
@@ -11,23 +12,23 @@ describe('remove', () => {
   })
   it('file', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-remove')
+    const { gitdir } = await makeFixture('test-remove')
     // Test
-    let before = await listFiles({ gitdir })
+    const before = await listFiles({ gitdir })
     expect(before).toMatchSnapshot()
     await remove({ gitdir, filepath: 'LICENSE.md' })
-    let after = await listFiles({ gitdir })
+    const after = await listFiles({ gitdir })
     expect(after).toMatchSnapshot()
     expect(before.length === after.length + 1).toBe(true)
   })
   it('dir', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-remove')
+    const { gitdir } = await makeFixture('test-remove')
     // Test
-    let before = await listFiles({ gitdir })
+    const before = await listFiles({ gitdir })
     expect(before).toMatchSnapshot()
     await remove({ gitdir, filepath: 'src/models' })
-    let after = await listFiles({ gitdir })
+    const after = await listFiles({ gitdir })
     expect(after).toMatchSnapshot()
     expect(before.length === after.length + 5).toBe(true)
   })

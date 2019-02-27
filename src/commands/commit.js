@@ -1,11 +1,10 @@
+// @ts-check
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
 import { FileSystem } from '../models/FileSystem.js'
 import { GitCommit } from '../models/GitCommit.js'
 import { E, GitError } from '../models/GitError.js'
-import { GitTree } from '../models/GitTree.js'
 import { writeObject } from '../storage/writeObject.js'
-import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js'
 import { join } from '../utils/join.js'
 import { normalizeAuthorObject } from '../utils/normalizeAuthorObject.js'
 import { cores } from '../utils/plugins.js'
@@ -13,7 +12,39 @@ import { cores } from '../utils/plugins.js'
 /**
  * Create a new commit
  *
- * @link https://isomorphic-git.github.io/docs/commit.html
+ * @param {Object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} args.message - The commit message to use.
+ * @param {Object} [args.author] - The details about the author.
+ * @param {string} [args.author.name] - Default is `user.name` config.
+ * @param {string} [args.author.email] - Default is `user.email` config.
+ * @param {string} [args.author.date] - Set the author timestamp field. Default is the current date.
+ * @param {string} [args.author.timestamp] - Set the author timestamp field. This is an alternative to using `date` using an integer number of seconds since the Unix epoch instead of a JavaScript date object.
+ * @param {string} [args.author.timezoneOffset] - Set the author timezone offset field. This is the difference, in minutes, from the current timezone to UTC. Default is `(new Date()).getTimezoneOffset()`.
+ * @param {Object} [args.committer = author] - The details about the commit committer, in the same format as the author parameter. If not specified, the author details are used.
+ * @param {string} [args.signingKey] - Sign the tag object using this private PGP key.
+ * @param {boolean} [args.dryRun = false] - If true, simulates making a commit so you can test whether it would succeed. Implies `noUpdateBranch`.
+ * @param {boolean} [args.noUpdateBranch = false] - If true, does not update the branch pointer after creating the commit.
+ * @param {string} [args.ref] - The fully expanded name of the branch to commit to. Default is the current branch pointed to by HEAD. (TODO: fix it so it can expand branch names without throwing if the branch doesn't exist yet.)
+ * @param {string[]} [args.parent] - The SHA-1 object ids of the commits to use as parents. If not specified, the commit pointed to by `ref` is used.
+ * @param {string} [args.tree] - The SHA-1 object id of the tree to use. If not specified, a new tree object is created from the current git index.
+ *
+ * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly created commit.
+ *
+ * @example
+ * let sha = await git.commit({
+ *   dir: '$input((/))',
+ *   author: {
+ *     name: '$input((Mr. Test))',
+ *     email: '$input((mrtest@example.com))'
+ *   },
+ *   message: '$input((Added the a.txt file))'
+ * })
+ * console.log(sha)
+ *
  */
 export async function commit ({
   core = 'default',
@@ -23,10 +54,24 @@ export async function commit ({
   message,
   author,
   committer,
-  signingKey
+  signingKey,
+  dryRun = false,
+  noUpdateBranch = false,
+  ref,
+  parent,
+  tree
 }) {
   try {
     const fs = new FileSystem(_fs)
+
+    if (!ref) {
+      ref = await GitRefManager.resolve({
+        fs,
+        gitdir,
+        ref: 'HEAD',
+        depth: 2
+      })
+    }
 
     if (message === undefined) {
       throw new GitError(E.MissingRequiredParameterError, {
@@ -53,13 +98,19 @@ export async function commit ({
     await GitIndexManager.acquire(
       { fs, filepath: `${gitdir}/index` },
       async function (index) {
-        let parents
-        try {
-          let parent = await GitRefManager.resolve({ fs, gitdir, ref: 'HEAD' })
-          parents = [parent]
-        } catch (err) {
-          // Probably an initial commit
-          parents = []
+        if (!parent) {
+          try {
+            parent = [
+              await GitRefManager.resolve({
+                fs,
+                gitdir,
+                ref
+              })
+            ]
+          } catch (err) {
+            // Probably an initial commit
+            parent = []
+          }
         }
 
         let mergeHash
@@ -74,45 +125,47 @@ export async function commit ({
           if (conflictedPaths.length > 0) {
             throw new GitError(E.CommitUnmergedConflictsFail, { paths: conflictedPaths })
           }
-          if (parents.length) {
-            parents.push(mergeHash)
+          if (parent.length) {
+            parent.push(mergeHash)
           } else {
             throw new GitError(E.NoHeadCommitError, { noun: 'merge commit', ref: mergeHash })
           }
         }
 
-        const inodes = flatFileListToDirectoryStructure(index.entries)
-        const inode = inodes.get('.')
-        const treeRef = await constructTree({ fs, gitdir, inode })
+        if (!tree) {
+          tree = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index })
+        }
 
         let comm = GitCommit.from({
-          tree: treeRef,
-          parent: parents,
+          tree,
+          parent,
           author,
           committer,
           message
         })
         if (signingKey) {
-          let pgp = cores.get(core).get('pgp')
+          const pgp = cores.get(core).get('pgp')
           comm = await GitCommit.sign(comm, pgp, signingKey)
         }
         oid = await writeObject({
           fs,
           gitdir,
           type: 'commit',
-          object: comm.toObject()
+          object: comm.toObject(),
+          dryRun
         })
-        // Update branch pointer
-        const branch = await GitRefManager.resolve({
-          fs,
-          gitdir,
-          ref: 'HEAD',
-          depth: 2
-        })
-        await fs.write(join(gitdir, branch), oid + '\n')
-        if (mergeHash) {
-          await GitRefManager.deleteRef({ fs, gitdir, ref: 'MERGE_HEAD' })
-          await fs.rm(join(gitdir, 'MERGE_MSG'))
+        if (!noUpdateBranch && !dryRun) {
+          // Update branch pointer
+          await GitRefManager.writeRef({
+            fs,
+            gitdir,
+            ref,
+            value: oid
+          })
+          if (mergeHash) {
+            await GitRefManager.deleteRef({ fs, gitdir, ref: 'MERGE_HEAD' })
+            await fs.rm(join(gitdir, 'MERGE_MSG'))
+          }
         }
       }
     )
@@ -121,29 +174,4 @@ export async function commit ({
     err.caller = 'git.commit'
     throw err
   }
-}
-
-async function constructTree ({ fs, gitdir, inode }) {
-  // use depth first traversal
-  let children = inode.children
-  for (let inode of children) {
-    if (inode.type === 'tree') {
-      inode.metadata.mode = '040000'
-      inode.metadata.oid = await constructTree({ fs, gitdir, inode })
-    }
-  }
-  let entries = children.map(inode => ({
-    mode: inode.metadata.mode,
-    path: inode.basename,
-    oid: inode.metadata.oid,
-    type: inode.type
-  }))
-  const tree = GitTree.from(entries)
-  let oid = await writeObject({
-    fs,
-    gitdir,
-    type: 'tree',
-    object: tree.toObject()
-  })
-  return oid
 }

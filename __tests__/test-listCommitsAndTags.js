@@ -1,6 +1,7 @@
 /* eslint-env node, browser, jasmine */
 const { makeFixture } = require('./__helpers__/FixtureFS.js')
 const registerSnapshots = require('./__helpers__/jasmine-snapshots')
+// @ts-ignore
 const snapshots = require('./__snapshots__/test-listCommitsAndTags.js.snap')
 
 const { listCommitsAndTags } = require('isomorphic-git/internal-apis')
@@ -11,9 +12,9 @@ describe('listCommitsAndTags', () => {
   })
   it('listCommitsAndTags', async () => {
     // Setup
-    let { fs, gitdir } = await makeFixture('test-listCommitsAndTags')
+    const { fs, gitdir } = await makeFixture('test-listCommitsAndTags')
     // Test
-    let commits = await listCommitsAndTags({
+    const commits = await listCommitsAndTags({
       fs,
       gitdir,
       start: ['c60bbbe99e96578105c57c4b3f2b6ebdf863edbc'],

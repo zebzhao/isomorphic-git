@@ -14,8 +14,15 @@ jobs:
       versionSpec: '8.x'
     displayName: 'Install Node.js'
 
+  - task: 1ESLighthouseEng.PipelineArtifactCaching.RestoreAndSaveCacheV1.RestoreAndSaveCache@1
+    inputs:
+      keyfile: 'package-lock.json'
+      targetfolder: 'node_modules'
+      vstsFeed: $(ARTIFACT_FEED)
+
   - script: npm ci
     displayName: 'Install dependencies'
+    condition: ne(variables['CacheRestored'], 'true')
 
   - script: npm test
     displayName: 'Run tests'
@@ -26,7 +33,6 @@ jobs:
       SAUCE_ACCESS_KEY: $(SAUCE_ACCESS_KEY)
       SAUCE_USERNAME: $(SAUCE_USERNAME)
       TEST_BROWSERS: 'ChromeHeadlessNoSandbox,FirefoxHeadless,sl_edge,sl_ios_safari,sl_safari,sl_android_chrome'
-      ENABLE_LIGHTNINGFS: 'true'
 
   - task: PublishTestResults@2
     displayName: 'Save test results'

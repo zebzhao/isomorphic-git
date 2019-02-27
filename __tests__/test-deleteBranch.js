@@ -1,6 +1,7 @@
 /* eslint-env node, browser, jasmine */
 const path = require('path')
 const { makeFixture } = require('./__helpers__/FixtureFS.js')
+// @ts-ignore
 const snapshots = require('./__snapshots__/test-deleteBranch.js.snap')
 const registerSnapshots = require('./__helpers__/jasmine-snapshots')
 
@@ -13,16 +14,16 @@ describe('deleteBranch', () => {
 
   it('delete branch', async () => {
     // Setup
-    let { fs, dir, gitdir } = await makeFixture('test-deleteBranch')
+    const { fs, dir, gitdir } = await makeFixture('test-deleteBranch')
     // Test
     await deleteBranch({ dir, gitdir, ref: 'test' })
-    let files = await fs.readdir(path.resolve(gitdir, 'refs', 'heads'))
+    const files = await fs.readdir(path.resolve(gitdir, 'refs', 'heads'))
     expect(files.sort()).toMatchSnapshot()
   })
 
   it('invalid branch name', async () => {
     // Setup
-    let { dir, gitdir } = await makeFixture('test-deleteBranch')
+    const { dir, gitdir } = await makeFixture('test-deleteBranch')
     let error = null
     // Test
     try {
@@ -36,7 +37,7 @@ describe('deleteBranch', () => {
 
   it('branch not exist', async () => {
     // Setup
-    let { dir, gitdir } = await makeFixture('test-deleteBranch')
+    const { dir, gitdir } = await makeFixture('test-deleteBranch')
     let error = null
     // Test
     try {
@@ -50,7 +51,7 @@ describe('deleteBranch', () => {
 
   it('missing ref argument', async () => {
     // Setup
-    let { dir, gitdir } = await makeFixture('test-deleteBranch')
+    const { dir, gitdir } = await makeFixture('test-deleteBranch')
     let error = null
     // Test
     try {
@@ -64,7 +65,7 @@ describe('deleteBranch', () => {
 
   it('checked out branch', async () => {
     // Setup
-    let { dir, gitdir } = await makeFixture('test-deleteBranch')
+    const { dir, gitdir } = await makeFixture('test-deleteBranch')
     let error = null
     // Test
     try {

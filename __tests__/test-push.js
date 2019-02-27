@@ -1,5 +1,6 @@
 /* eslint-env node, browser, jasmine */
 const { makeFixture } = require('./__helpers__/FixtureFS.js')
+// @ts-ignore
 const snapshots = require('./__snapshots__/test-push.js.snap')
 const registerSnapshots = require('./__helpers__/jasmine-snapshots')
 const EventEmitter = require('events')
@@ -12,14 +13,14 @@ describe('push', () => {
   })
   it('push', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-push')
-    let output = []
+    const { gitdir } = await makeFixture('test-push')
+    const output = []
     plugins.set(
       'emitter',
       new EventEmitter().on('push.message', output.push.bind(output))
     )
     // Test
-    let res = await push({
+    const res = await push({
       gitdir,
       emitterPrefix: 'push.',
       remote: 'karma',
@@ -33,9 +34,9 @@ describe('push', () => {
   })
   it('push without ref', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-push')
+    const { gitdir } = await makeFixture('test-push')
     // Test
-    let res = await push({
+    const res = await push({
       gitdir,
       remote: 'karma'
     })
@@ -46,9 +47,9 @@ describe('push', () => {
   })
   it('push with ref !== remoteRef', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-push')
+    const { gitdir } = await makeFixture('test-push')
     // Test
-    let res = await push({
+    const res = await push({
       gitdir,
       remote: 'karma',
       ref: 'master',
@@ -61,9 +62,9 @@ describe('push', () => {
   })
   it('push with lightweight tag', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-push')
+    const { gitdir } = await makeFixture('test-push')
     // Test
-    let res = await push({
+    const res = await push({
       gitdir,
       remote: 'karma',
       ref: 'lightweight-tag'
@@ -75,9 +76,9 @@ describe('push', () => {
   })
   it('push with annotated tag', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-push')
+    const { gitdir } = await makeFixture('test-push')
     // Test
-    let res = await push({
+    const res = await push({
       gitdir,
       remote: 'karma',
       ref: 'annotated-tag'
@@ -90,9 +91,9 @@ describe('push', () => {
 
   it('push with Basic Auth', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-push')
+    const { gitdir } = await makeFixture('test-push')
     // Test
-    let res = await push({
+    const res = await push({
       gitdir,
       username: 'testuser',
       password: 'testpassword',
@@ -106,9 +107,9 @@ describe('push', () => {
   })
   it('push with Basic Auth credentials in the URL', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-push')
+    const { gitdir } = await makeFixture('test-push')
     // Test
-    let res = await push({
+    const res = await push({
       gitdir,
       remote: 'url',
       ref: 'master'
@@ -120,7 +121,7 @@ describe('push', () => {
   })
   it('throws an Error if no credentials supplied', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-push')
+    const { gitdir } = await makeFixture('test-push')
     // Test
     let error = null
     try {
@@ -136,7 +137,7 @@ describe('push', () => {
   })
   it('throws an Error if invalid credentials supplied', async () => {
     // Setup
-    let { gitdir } = await makeFixture('test-push')
+    const { gitdir } = await makeFixture('test-push')
     // Test
     let error = null
     try {
@@ -162,9 +163,9 @@ describe('push', () => {
       .reverse()
       .join('')
     // Setup
-    let { gitdir } = await makeFixture('test-push')
+    const { gitdir } = await makeFixture('test-push')
     // Test
-    let res = await push({
+    const res = await push({
       gitdir,
       corsProxy: process.browser ? 'http://localhost:9999' : undefined,
       token: token,
