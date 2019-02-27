@@ -104,13 +104,14 @@ export async function merge ({
     }
     const baseOid = baseOids[0]
     // handle fast-forward case
-    if (baseOid === theirOid) {
+    if (!baseOid) {
+      throw new GitError(E.MergeNoCommonAncestryError, { theirRef, ourRef })
+    } else if (baseOid === theirOid) {
       return {
         oid: ourOid,
         alreadyMerged: true
       }
-    }
-    if (baseOid === ourOid) {
+    } else if (baseOid === ourOid) {
       if (!dryRun) {
         await GitRefManager.writeRef({ fs, gitdir, ref: ours, value: theirOid })
       }
