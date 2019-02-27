@@ -4,6 +4,7 @@ import { GitRefManager } from '../managers/GitRefManager.js'
 import { FileSystem } from '../models/FileSystem.js'
 import { GitCommit } from '../models/GitCommit.js'
 import { E, GitError } from '../models/GitError.js'
+import { GitIndex } from '../models/GitIndex'
 import { GitTree } from '../models/GitTree.js'
 import { readObject } from '../storage/readObject.js'
 import { compareStats } from '../utils/compareStats.js'
@@ -41,24 +42,22 @@ export async function status ({
       tree: headTree,
       path: filepath
     })
-    let indexEntry = null
+    let indexEntry
+    let conflictEntry
     // Acquire a lock on the index
     await GitIndexManager.acquire(
       { fs, filepath: `${gitdir}/index` },
       async function (index) {
-        for (let entry of index) {
-          if (entry.path === filepath) {
-            indexEntry = entry
-            break
-          }
-        }
+        indexEntry = index.entriesMap.get(GitIndex.key(filepath, 0))
+        conflictEntry = index.entriesMap.get(GitIndex.key(filepath, 2))
       }
     )
     let stats = await fs.lstat(join(dir, filepath))
 
     let H = treeOid !== null // head
-    let I = indexEntry !== null // index
+    let I = !!indexEntry // index
     let W = stats !== null // working dir
+    let C = !!conflictEntry // in conflict
 
     const getWorkdirOid = async () => {
       if (I && !compareStats(indexEntry, stats)) {
@@ -89,27 +88,28 @@ export async function status ({
       }
     }
 
-    if (!H && !W && !I) return 'absent' // ---
-    if (!H && !W && I) return '*absent' // -A-
-    if (!H && W && !I) return '*added' // --A
+    let prefix = C ? '!' : ''
+    if (!H && !W && !I) return prefix + 'absent' // ---
+    if (!H && !W && I) return prefix + '*absent' // -A-
+    if (!H && W && !I) return prefix + '*added' // --A
     if (!H && W && I) {
       let workdirOid = await getWorkdirOid()
-      return workdirOid === indexEntry.oid ? 'added' : '*added' // -AA : -AB
+      return prefix + (workdirOid === indexEntry.oid ? 'added' : '*added') // -AA : -AB
     }
-    if (H && !W && !I) return 'deleted' // A--
+    if (H && !W && !I) return prefix + 'deleted' // A--
     if (H && !W && I) {
-      return treeOid === indexEntry.oid ? '*deleted' : '*deleted' // AA- : AB-
+      return prefix + (treeOid === indexEntry.oid ? '*deleted' : '*deleted') // AA- : AB-
     }
     if (H && W && !I) {
       let workdirOid = await getWorkdirOid()
-      return workdirOid === treeOid ? '*undeleted' : '*undeletemodified' // A-A : A-B
+      return prefix + (workdirOid === treeOid ? '*undeleted' : '*undeletemodified') // A-A : A-B
     }
     if (H && W && I) {
       let workdirOid = await getWorkdirOid()
       if (workdirOid === treeOid) {
-        return workdirOid === indexEntry.oid ? 'unmodified' : '*unmodified' // AAA : ABA
+        return prefix + (workdirOid === indexEntry.oid ? 'unmodified' : '*unmodified') // AAA : ABA
       } else {
-        return workdirOid === indexEntry.oid ? 'modified' : '*modified' // ABB : AAB
+        return prefix + (workdirOid === indexEntry.oid ? 'modified' : '*modified') // ABB : AAB
       }
     }
     /*
