@@ -1,4 +1,4 @@
-import diff3 from 'node-diff3'
+import { merge as d3merge } from 'node-diff3'
 import { GitRefManager } from '../managers/GitRefManager'
 import { GitIndexManager } from '../managers/GitIndexManager'
 import { FileSystem } from '../models/FileSystem'
@@ -137,7 +137,7 @@ export async function merge ({
                 await base.populateContent()
                 await base.populateStat()
 
-                let merged = await diff3.merge(ours.content, base.content, theirs.content)
+                let merged = await d3merge(ours.content, base.content, theirs.content)
                 let { baseFullpath, baseOid, baseStats } = base
                 let mergedText = merged.result.join('\n')
 
