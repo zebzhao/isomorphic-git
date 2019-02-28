@@ -14,8 +14,12 @@ class GitWalkerRepo {
     this.gitdir = gitdir
     this.mapPromise = (async () => {
       let map = new Map()
-      let oid = await GitRefManager.resolve({ fs, gitdir, ref })
-      let tree = await resolveTree({ fs, gitdir, oid })
+      // If ref doesn't exist, then assume empty branch
+      let oid = null
+      try {
+        oid = await GitRefManager.resolve({ fs, gitdir, ref })
+      } catch (e) {}
+      let tree = oid ? (await resolveTree({ fs, gitdir, oid })) : { tree: GitTree.from([]), oid }
       map.set('.', tree)
       return map
     })()
@@ -45,14 +49,16 @@ class GitWalkerRepo {
     let map = await this.mapPromise
     let obj = map.get(filepath)
     if (!obj) throw new Error(`No obj for ${filepath}`)
-    let oid = obj.oid
-    if (!oid) throw new Error(`No oid for obj ${JSON.stringify(obj)}`)
-    let { type, object } = await readObject({ fs, gitdir, oid })
-    if (type === 'blob') return null
-    if (type !== 'tree') {
-      throw new Error(`ENOTDIR: not a directory, scandir '${filepath}'`)
+    let { oid, tree } = obj
+    if (!tree) {
+      if (!oid) throw new Error(`No oid for obj ${JSON.stringify(obj)}`)
+      let { type, object } = await readObject({ fs, gitdir, oid })
+      if (type === 'blob') return null
+      if (type !== 'tree') {
+        throw new Error(`ENOTDIR: not a directory, scandir '${filepath}'`)
+      }
+      tree = GitTree.from(object)
     }
-    let tree = GitTree.from(object)
     // cache all entries
     for (const entry of tree) {
       map.set(join(filepath, entry.path), entry)

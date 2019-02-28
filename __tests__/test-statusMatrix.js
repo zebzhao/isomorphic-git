@@ -46,4 +46,17 @@ describe('statusMatrix', () => {
     matrix = await statusMatrix({ dir, gitdir, pattern: 'e.txt' })
     expect(matrix).toEqual([['e.txt', 0, 0, 3, false]])
   })
+
+  it('non-existant refs', async () => {
+    // Setup
+    let { dir, gitdir } = await makeFixture('test-statusMatrix')
+    // Test
+    let matrix = await statusMatrix({ dir, gitdir, ref: 'non-existant' })
+    expect(matrix).toEqual([
+      ['a.txt', 0, 2, 2, false],
+      ['b.txt', 0, 2, 3, false],
+      ['c.txt', 0, 0, 3, false],
+      ['d.txt', 0, 2, 0, false]
+    ])
+  })
 })
