@@ -179,7 +179,7 @@ export async function merge ({
                 await base.populateContent()
                 await base.populateStat()
 
-                let merged = await diff3.merge(ours.content, base.content, theirs.content)
+                let merged = await d3merge(ours.content, base.content, theirs.content)
                 let { baseFullpath, baseOid, baseStats } = base
                 let mergedText = merged.result.join('\n')
 
