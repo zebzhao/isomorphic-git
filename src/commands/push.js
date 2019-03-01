@@ -161,7 +161,7 @@ export async function push ({
     let finish = [...httpRemote.refs.values()]
     // hack to speed up common force push scenarios
     let mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] })
-    for (let oid of mergebase) finish.push(oid)
+    for (let baseOid of mergebase) finish.push(baseOid)
     // TODO: handle shallow depth cutoff gracefully
     if (
       mergebase.length === 0 &&
@@ -231,6 +231,19 @@ export async function push ({
     const result = await parseReceivePackResponse(packfile)
     if (res.headers) {
       result.headers = res.headers
+    }
+    if (!result.errors || result.errors.length === 0) {
+      // no errors pushing
+      let refs = new Map()
+      refs.set(fullRemoteRef, oid)
+      let symrefs = new Map()
+      await GitRefManager.updateRemoteRefs({
+        fs,
+        gitdir,
+        remote,
+        refs,
+        symrefs
+      })
     }
     return result
   } catch (err) {
