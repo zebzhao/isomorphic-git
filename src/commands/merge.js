@@ -178,6 +178,11 @@ export async function merge ({
           }
         }
       )
+
+      return {
+        oid: ourOid,
+        recursiveMerge: true
+      }
     }
   } catch (err) {
     err.caller = 'git.merge'
