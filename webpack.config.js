@@ -40,11 +40,10 @@ module.exports = [
       rules: [
         {
           test: /\.js$/,
-          exclude: /node_modules/,
+          exclude: /node_modules\/(?!(pify|ignore|globrex|globalyzer)\/)/,
           use: {
             loader: 'babel-loader',
             options: {
-              babelrc: false,
               plugins: [
                 '@babel/plugin-proposal-object-rest-spread',
                 '@babel/plugin-transform-async-to-generator'
