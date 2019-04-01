@@ -68,6 +68,7 @@
   "devDependencies": {
     "@babel/core": "7.2.2",
     "@babel/plugin-transform-async-to-generator": "7.2.0",
+    "@babel/polyfill": "^7.2.5",
     "@babel/preset-env": "7.2.3",
     "@babel/runtime": "7.2.0",
     "@isomorphic-git/cors-proxy": "2.3.0",
@@ -127,6 +128,10 @@
     {
       "path": "./dist/bundle.umd.min.js"
     }
+  ],
+  "browserslist": [
+    "last 2 versions",
+    "> 1%"
   ],
   "collective": {
     "type": "opencollective",

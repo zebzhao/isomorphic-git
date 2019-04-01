@@ -30,6 +30,7 @@ Array [
   "init",
   "isDescendent",
   "listBranches",
+  "listCommitsAndTags",
   "listFiles",
   "listRemotes",
   "listTags",
