@@ -1,5 +1,4 @@
 // @ts-check
-// import diff3 from 'node-diff3'
 import { GitRefManager } from '../managers/GitRefManager.js'
 import { FileSystem } from '../models/FileSystem.js'
 import { E, GitError } from '../models/GitError.js'
@@ -10,6 +9,7 @@ import { cores } from '../utils/plugins.js'
 import { _applyTreePatch } from './_applyTreePatch.js'
 import { _diffTree } from './_diffTree.js'
 import { _mergeTreePatches } from './_mergeTreePatches.js'
+import { _mergeFile } from './_mergeFile'
 import { commit } from './commit'
 import { currentBranch } from './currentBranch.js'
 import { findMergeBase } from './findMergeBase.js'
@@ -179,11 +179,10 @@ export async function merge ({
                 await base.populateContent()
                 await base.populateStat()
 
-                let merged = await d3merge(ours.content, base.content, theirs.content)
                 let { baseFullpath, baseOid, baseStats } = base
-                let mergedText = merged.result.join('\n')
+                let {cleanMerge, mergedText} = _mergeFile({ours: ours.content, base: base.content, theirs: theirs.content})
 
-                if (merged.conflict) {
+                if (!cleanMerge) {
                   index.writeConflict({
                     filepath: baseFullpath,
                     stats: baseStats,
@@ -223,7 +222,7 @@ export async function merge ({
 
       return {
         oid: ourOid,
-        recursiveMerge: true
+        mergeCommit: true
       }
     }
   } catch (err) {
