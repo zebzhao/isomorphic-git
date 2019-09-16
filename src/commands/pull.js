@@ -83,7 +83,7 @@ export async function pull ({
       fs,
       path: `branch.${ref}.remote`
     })
-    const { fetchHead } = await fetch({
+    const { fetchHead, fetchHeadDescription } = await fetch({
       dir,
       gitdir,
       fs,
@@ -101,15 +101,19 @@ export async function pull ({
       headers
     })
     // Merge the remote tracking branch into the local one.
-    return await merge({
+    await merge({
       dir,
       gitdir,
       fs,
       ourRef: ref,
       theirRef: fetchHead,
-      fastForwardOnly,
       emitter,
-      emitterPrefix
+      emitterPrefix,
+      fastForwardOnly,
+      message: `Merge ${fetchHeadDescription}`,
+      author,
+      committer,
+      signingKey
     })
   } catch (err) {
     err.caller = 'git.pull'

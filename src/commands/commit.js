@@ -126,7 +126,7 @@ export async function commit ({
             throw new GitError(E.CommitUnmergedConflictsFail, { paths: conflictedPaths })
           }
           if (parent.length) {
-            parent.push(mergeHash)
+            if (!parent.includes(mergeHash)) parent.push(mergeHash)
           } else {
             throw new GitError(E.NoHeadCommitError, { noun: 'merge commit', ref: mergeHash })
           }

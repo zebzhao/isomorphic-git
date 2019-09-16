@@ -1,4 +1,3 @@
-import { merge as d3merge } from 'node-diff3'
 import { GitRefManager } from '../managers/GitRefManager'
 import { GitIndexManager } from '../managers/GitIndexManager'
 import { FileSystem } from '../models/FileSystem'
@@ -12,7 +11,8 @@ import { commit } from './commit'
 import { currentBranch } from './currentBranch'
 import { findChangedFiles } from './findChangedFiles'
 import { findMergeBase } from './findMergeBase'
-import { abbreviateRef } from '../utils/abbreviateRef';
+import { abbreviateRef } from '../utils/abbreviateRef'
+import { mergeFile } from '../utils/mergeFile'
 
 /**
  *
@@ -47,6 +47,7 @@ import { abbreviateRef } from '../utils/abbreviateRef';
  * @param {boolean} [args.fastForwardOnly = false] - If true, then non-fast-forward merges will throw an Error instead of performing a merge.
  * @param {boolean} [args.dryRun = false] - If true, simulates a merge so you can test whether it would succeed.
  * @param {boolean} [args.noUpdateBranch = false] - If true, does not update the branch pointer after creating the commit.
+ * @param {boolean} [args.noCheckout = false] - If true, does not perform checkout after merge.
  * @param {string} [args.message] - Overrides the default auto-generated merge commit message
  * @param {Object} [args.author] - passed to [commit](commit.md) when creating a merge commit
  * @param {Object} [args.committer] - passed to [commit](commit.md) when creating a merge commit
@@ -72,6 +73,7 @@ export async function merge ({
   fastForwardOnly = false,
   dryRun = false,
   noUpdateBranch = false,
+  noCheckout = false,
   message,
   author,
   committer,
@@ -79,14 +81,16 @@ export async function merge ({
 }) {
   try {
     const fs = new FileSystem(_fs)
+    const currentRef = await currentBranch({ fs, gitdir, fullname: true })
     if (ourRef === undefined) {
-      ourRef = await currentBranch({ fs, gitdir, fullname: true })
+      ourRef = currentRef
+    } else {
+      ourRef = await GitRefManager.expand({
+        fs,
+        gitdir,
+        ref: ourRef
+      })
     }
-    ourRef = await GitRefManager.expand({
-      fs,
-      gitdir,
-      ref: ourRef
-    })
     theirRef = await GitRefManager.expand({
       fs,
       gitdir,
@@ -123,15 +127,16 @@ export async function merge ({
       if (!dryRun && !noUpdateBranch) {
         await GitRefManager.writeRef({ fs, gitdir, ref: ourRef, value: theirOid })
       }
-      await checkout({
-        dir,
-        gitdir,
-        fs,
-        ref: ourRef,
-        emitter,
-        emitterPrefix,
-        dryRun
-      })
+      if (!noCheckout) {
+        await checkout({
+          dir,
+          gitdir,
+          fs,
+          ref: ourRef,
+          emitter,
+          emitterPrefix
+        })
+      }
       return {
         oid: theirOid,
         fastForward: true
@@ -140,6 +145,19 @@ export async function merge ({
       // not a simple fast-forward
       if (fastForwardOnly) {
         throw new GitError(E.FastForwardFail)
+      }
+
+      if (currentRef !== ourRef) {
+        // checkout our branch to begin non-fast-forward merge (needed for tests)
+        await checkout({
+          dir,
+          gitdir,
+          fs,
+          ref: ourRef,
+          emitter,
+          emitterPrefix,
+          dryRun
+        })
       }
 
       await GitRefManager.writeRef({ fs, gitdir, ref: 'MERGE_HEAD', value: theirOid })
@@ -155,33 +173,33 @@ export async function merge ({
         theirOid,
         baseOid
       })
-      
-      let treeOid, hasConflict = false
+      const total = mergeDiff.length
+
+      let treeOid; let hasConflict = false
       await GitIndexManager.acquire(
         { fs, filepath: `${gitdir}/index` },
         async function (index) {
-          const total = mergeDiff.length
           let count = 0
           for (const diff of mergeDiff) {
             const { ours, theirs, base } = diff
             // for simple cases of add, remove, or modify files
             switch (diff.status) {
               case 'added':
-                await processAdded({ours, theirs, fs, index, dir})
+                await processAdded({ ours, theirs, fs, index, dir })
                 break
               case 'deleted':
                 index.delete({ filepath: base.fullpath })
                 await fs.rm(`${dir}/${base.fullpath}`)
                 break
               case 'modified':
-                await processModified({theirs, base, fs, emitter, emitterPrefix, index, dir})
+                await processModified({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir })
                 break
               case 'conflict':
-                const conflict = await processConflict({ours, theirs, base, fs, emitter, emitterPrefix, index, dir, gitdir})
+                const conflict = await processConflict({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir, gitdir })
                 hasConflict = hasConflict || conflict
                 break
             }
-            
+
             if (emitter) {
               emitter.emit(`${emitterPrefix}progress`, {
                 phase: 'Applying changes',
@@ -191,7 +209,7 @@ export async function merge ({
               })
             }
           }
-          treeOid = await GitIndexManager.constructTree({fs, gitdir, dryRun, index})
+          treeOid = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index })
         }
       )
 
@@ -207,7 +225,7 @@ export async function merge ({
           message,
           ref: ourRef,
           tree: treeOid,
-          parent: [ourOid, theirOid],
+          parent: [ourOid], // theirOid should be handled by MERGE_HASH in commit
           author,
           committer,
           signingKey,
@@ -231,10 +249,12 @@ export async function merge ({
   }
 }
 
-async function processAdded({ ours, theirs, fs, index, dir }) {
+async function processAdded ({ ours, theirs, fs, index, dir }) {
   const added = ours.exists ? ours : theirs
-  await added.populateHash()
-  await added.populateContent()
+  await Promise.all([
+    !added.oid && added.populateHash(),
+    !added.content && added.populateContent()
+  ])
   const { fullpath: filepath, contents, oid } = added
   const workingPath = `${dir}/${filepath}`
   await fs.write(workingPath, contents)
@@ -242,35 +262,58 @@ async function processAdded({ ours, theirs, fs, index, dir }) {
   index.insert({ filepath, stats, oid })
 }
 
-async function processModified({ theirs, base, fs, index, dir }) {
-  if (theirs.oid !== base.oid) {
-    await theirs.populateContent()
-    await theirs.populateHash()
-    const { fullpath: filepath, contents, oid } = theirs
-    const workingPath = `${dir}/${filepath}`
-    await fs.write(workingPath, contents)
-    const stats = await fs.lstat(workingPath)
-    console.log('oooid2', oid, theirs)
-    index.insert({ filepath, stats, oid })
-  }
+async function processModified ({ ours, theirs, base, fs, index, dir }) {
+  await Promise.all([
+    !ours.oid && ours.populateHash(),
+    !base.oid && base.populateHash(),
+    !theirs.oid && theirs.populateHash(),
+    !ours.mode && ours.populateStats(),
+    !base.mode && base.populateStats(),
+    !theirs.mode && theirs.populateStats()
+  ])
+  const mode = base.mode === ours.mode ? theirs.mode : ours.mode
+  const { fullpath: filepath, content, oid } = base.oid === ours.oid ? theirs : ours
+  const workingPath = `${dir}/${filepath}`
+  await fs.write(
+    workingPath,
+    content,
+    mode === '100755' ? { mode: 0o777 } : undefined
+  )
+  const stats = await fs.lstat(workingPath)
+  // Lightning FS does not store mode in IDB - problem for testing
+  stats.mode = mode === '100755' ? 0o100755 : 0o100644
+  index.insert({ filepath, stats, oid })
 }
 
-async function processConflict({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir, gitdir }) {
-  await ours.populateContent()
-  await theirs.populateContent()
-  await base.populateContent()
-  await base.populateHash()
-  await ours.populateHash()
-  await theirs.populateHash()
+async function processConflict ({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir, gitdir }) {
+  await Promise.all([
+    !ours.content && ours.populateContent(),
+    !theirs.content && theirs.populateContent(),
+    !base.content && base.populateContent(),
+    !base.oid && base.populateHash(),
+    !ours.oid && ours.populateHash(),
+    !theirs.oid && theirs.populateHash()
+  ])
 
-  const merged = await d3merge(ours.content, base.content, theirs.content)
+  const merged = await mergeFile({
+    ourContent: ours.content.toString('utf8'),
+    baseContent: base.content.toString('utf8'),
+    theirContent: theirs.content.toString('utf8')
+  })
+
+  const mode = base.mode === ours.mode ? theirs.mode : ours.mode
   const { fullpath: filepath, oid: baseOid } = base
-  const mergedText = merged.result.join('\n')
   const workingPath = `${dir}/${filepath}`
-  await fs.write(workingPath, mergedText)
+  await fs.write(
+    workingPath,
+    merged.mergedText,
+    mode === '100755' ? { mode: 0o777 } : undefined
+  )
+
   const stats = await fs.lstat(workingPath)
-  
-  if (merged.conflict) {
+  stats.mode = mode === '100755' ? 0o100755 : 0o100644
+
+  if (!merged.cleanMerge) {
     index.writeConflict({
       filepath,
       stats,
@@ -291,7 +334,7 @@ async function processConflict({ ours, theirs, base, fs, emitter, emitterPrefix,
     const oid = await hashObject({
       gitdir,
       type: 'blob',
-      object: mergedText
+      object: merged.mergedText
     })
     index.insert({ filepath, stats, oid })
     return false

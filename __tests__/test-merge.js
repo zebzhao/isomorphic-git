@@ -92,7 +92,8 @@ describe('merge', () => {
       gitdir,
       ourRef: 'master',
       theirRef: 'newest',
-      fastForwardOnly: true
+      fastForwardOnly: true,
+      noCheckout: true
     })
     expect(m.oid).toEqual(desiredOid)
     expect(m.alreadyMerged).toBeFalsy()
@@ -122,7 +123,8 @@ describe('merge', () => {
       ourRef: 'master',
       theirRef: 'newest',
       fastForwardOnly: true,
-      dryRun: true
+      dryRun: true,
+      noCheckout: true
     })
     expect(m.oid).toEqual(desiredOid)
     expect(m.alreadyMerged).toBeFalsy()
@@ -136,7 +138,7 @@ describe('merge', () => {
 
   it('merge newest into master --noUpdateBranch', async () => {
     // Setup
-    const { dir,gitdir } = await makeFixture('test-merge')
+    const { dir, gitdir } = await makeFixture('test-merge')
     // Test
     const originalOid = await resolveRef({
       gitdir,
@@ -152,7 +154,8 @@ describe('merge', () => {
       ourRef: 'master',
       theirRef: 'newest',
       fastForwardOnly: true,
-      dryRun: true
+      dryRun: true,
+      noCheckout: true
     })
     expect(m.oid).toEqual(desiredOid)
     expect(m.alreadyMerged).toBeFalsy()
@@ -392,7 +395,7 @@ describe('merge', () => {
     } catch (e) {
       error = e
     }
-    expect(error).toBeNull()
+    expect(error).not.toBeNull()
   })
 
   it("merge two branches that modified the same file (no conflict)'", async () => {

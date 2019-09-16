@@ -5,9 +5,9 @@ import { FileSystem } from '../models/FileSystem.js'
 import { GitIndex } from '../models/GitIndex.js'
 import { DeepMap } from '../utils/DeepMap.js'
 import { compareStats } from '../utils/compareStats.js'
-import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js';
-import { GitTree } from '../models/GitTree.js';
-import { writeObject } from '../storage/writeObject.js';
+import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js'
+import { GitTree } from '../models/GitTree.js'
+import { writeObject } from '../storage/writeObject.js'
 
 // import Lock from '../utils.js'
 
@@ -65,14 +65,13 @@ export class GitIndexManager {
     })
   }
 
-  static async constructTree({ fs, gitdir, dryRun, index }) {
+  static async constructTree ({ fs, gitdir, dryRun, index }) {
     const inodes = flatFileListToDirectoryStructure(index.entries)
     const inode = inodes.get('.')
-    console.log('iiii', index.entries, inodes)
-    return await constructTree({ fs, gitdir, inode, dryRun })
+    const tree = await constructTree({ fs, gitdir, inode, dryRun })
+    return tree
   }
 }
-
 
 async function constructTree ({ fs, gitdir, inode, dryRun }) {
   // use depth first traversal

@@ -36,14 +36,15 @@ export async function findChangedFiles ({
       map: async function ([ours, theirs, base]) {
         if (ours.fullpath === '.') return
 
-        await base.populateStat()
-        if (base.type !== 'blob') return
+        await Promise.all([
+          base.exists && base.populateStat(),
+          theirs.exists && theirs.populateStat(),
+          ours.exists && ours.populateStat()
+        ])
 
-        await theirs.populateStat()
-        if (theirs.type !== 'blob') return
-
-        await ours.populateStat()
-        if (ours.type !== 'blob') return
+        if ((base.exists && base.type !== 'blob') ||
+            (ours.exists && ours.type !== 'blob') ||
+            (theirs.exists && theirs.type !== 'blob')) return
 
         if (emitter) {
           emitter.emit(`${emitterPrefix}progress`, {
@@ -70,7 +71,7 @@ export async function findChangedFiles ({
 export async function fileStatus (receiver, giver, base) {
   const receiverPresent = receiver.exists
   const basePresent = base.exists
-  const giverPresent = base.exists
+  const giverPresent = giver.exists
 
   if ((!receiverPresent && !basePresent && giverPresent) ||
     (receiverPresent && !basePresent && !giverPresent)) {
@@ -79,11 +80,16 @@ export async function fileStatus (receiver, giver, base) {
     (!receiverPresent && basePresent && giverPresent)) {
     return 'deleted'
   } else {
-    if (receiverPresent) await receiver.populateHash()
-    if (giverPresent) await giver.populateHash()
-
+    await Promise.all([
+      receiverPresent && receiver.populateHash(),
+      giverPresent && giver.populateHash()
+    ])
     if (receiver.oid === giver.oid) {
-      return 'unmodified'
+      if (receiver.mode === giver.mode) {
+        return 'unmodified'
+      } else {
+        return 'modified'
+      }
     } else {
       if (basePresent) await base.populateHash()
       if (receiverPresent && giverPresent && receiver.oid !== giver.oid) {

@@ -204,15 +204,19 @@ export async function statusMatrix ({
           if (!match) return
         }
         // For now, just bail on directories
-        await stage.populateStat()
-        if (stage.type === 'tree' || stage.type === 'special') return
-        await workdir.populateStat()
-        if (workdir.type === 'tree' || workdir.type === 'special') return
-        await head.populateStat()
-        if (head.type === 'tree' || head.type === 'special') return
+        await Promise.all([
+          stage.populateStat(),
+          workdir.populateStat(),
+          head.populateStat()
+        ])
+        if (stage.type === 'tree' || stage.type === 'special' ||
+            workdir.type === 'tree' || workdir.type === 'special' ||
+            head.type === 'tree' || head.type === 'special') return
         // Figure out the oids, using the staged oid for the working dir oid if the stats match.
-        await head.populateHash()
-        await stage.populateHash()
+        await Promise.all([
+          head.populateHash(),
+          stage.populateHash()
+        ])
         if (!head.exists && workdir.exists && !stage.exists) {
           // We don't actually NEED the sha. Any sha will do
           // TODO: update this logic to handle N trees instead of just 3.
