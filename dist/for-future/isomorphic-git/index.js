@@ -9,7 +9,7 @@ import applyDelta from 'git-apply-delta';
 import { mark, stop } from 'marky';
 import globrex from 'globrex';
 import globalyzer from 'globalyzer';
-import { merge as merge$1 } from 'node-diff3';
+import diff3Merge from 'diff3';
 
 /**
  * Use with push and fetch to set Basic Authentication headers.
@@ -1106,70 +1106,202 @@ function justWhatMatters (e) {
   }
 }
 
-// import LockManager from 'travix-lock-manager'
+/*::
+type Node = {
+  type: string,
+  fullpath: string,
+  basename: string,
+  metadata: Object, // mode, oid
+  parent?: Node,
+  children: Array<Node>
+}
+*/
 
-// import Lock from '../utils.js'
+function flatFileListToDirectoryStructure (files) {
+  const inodes = new Map();
+  const mkdir = function (name) {
+    if (!inodes.has(name)) {
+      const dir = {
+        type: 'tree',
+        fullpath: name,
+        basename: basename(name),
+        metadata: {},
+        children: []
+      };
+      inodes.set(name, dir);
+      // This recursively generates any missing parent folders.
+      // We do it after we've added the inode to the set so that
+      // we don't recurse infinitely trying to create the root '.' dirname.
+      dir.parent = mkdir(dirname(name));
+      if (dir.parent && dir.parent !== dir) dir.parent.children.push(dir);
+    }
+    return inodes.get(name)
+  };
 
-// TODO: replace with an LRU cache?
-const map = new DeepMap();
-const stats = new DeepMap();
-// const lm = new LockManager()
-let lock = null;
+  const mkfile = function (name, metadata) {
+    if (!inodes.has(name)) {
+      const file = {
+        type: 'blob',
+        fullpath: name,
+        basename: basename(name),
+        metadata: metadata,
+        // This recursively generates any missing parent folders.
+        parent: mkdir(dirname(name)),
+        children: []
+      };
+      if (file.parent) file.parent.children.push(file);
+      inodes.set(name, file);
+    }
+    return inodes.get(name)
+  };
 
-async function updateCachedIndexFile (fs, filepath) {
-  const stat = await fs.lstat(filepath);
-  const rawIndexFile = await fs.read(filepath);
-  const index = GitIndex.from(rawIndexFile);
-  // cache the GitIndex object so we don't need to re-read it
-  // every time.
-  map.set([fs, filepath], index);
-  // Save the stat data for the index so we know whether
-  // the cached file is stale (modified by an outside process).
-  stats.set([fs, filepath], stat);
+  mkdir('.');
+  for (const file of files) {
+    mkfile(file.path, file);
+  }
+  return inodes
 }
 
-// Determine whether our copy of the index file is stale
-async function isIndexStale (fs, filepath) {
-  const savedStats = stats.get([fs, filepath]);
-  if (savedStats === undefined) return true
-  const currStats = await fs.lstat(filepath);
-  if (savedStats === null) return false
-  if (currStats === null) return false
-  return compareStats(savedStats, currStats)
+function comparePath (a, b) {
+  // https://stackoverflow.com/a/40355107/2168416
+  return compareStrings(a.path, b.path)
 }
 
-class GitIndexManager {
-  static async acquire ({ fs: _fs, filepath }, closure) {
-    const fs = new FileSystem(_fs);
-    if (lock === null) lock = new AsyncLock({ maxPending: Infinity });
-    await lock.acquire(filepath, async function () {
-      // Acquire a file lock while we're reading the index
-      // to make sure other processes aren't writing to it
-      // simultaneously, which could result in a corrupted index.
-      // const fileLock = await Lock(filepath)
-      if (await isIndexStale(fs, filepath)) {
-        await updateCachedIndexFile(fs, filepath);
-      }
-      const index = map.get([fs, filepath]);
-      await closure(index);
-      if (index._dirty) {
-        // Acquire a file lock while we're writing the index file
-        // let fileLock = await Lock(filepath)
-        const buffer = index.toObject();
-        await fs.write(filepath, buffer);
-        // Update cached stat value
-        stats.set([fs, filepath], await fs.lstat(filepath));
-        index._dirty = false;
-      }
-    });
+/*::
+type TreeEntry = {
+  mode: string,
+  path: string,
+  oid: string,
+  type?: string
+}
+*/
+
+function mode2type (mode) {
+  // prettier-ignore
+  switch (mode) {
+    case '040000': return 'tree'
+    case '100644': return 'blob'
+    case '100755': return 'blob'
+    case '120000': return 'blob'
+    case '160000': return 'commit'
+  }
+  throw new GitError(E.InternalFail, {
+    message: `Unexpected GitTree entry mode: ${mode}`
+  })
+}
+
+function parseBuffer$1 (buffer) {
+  const _entries = [];
+  let cursor = 0;
+  while (cursor < buffer.length) {
+    const space = buffer.indexOf(32, cursor);
+    if (space === -1) {
+      throw new GitError(E.InternalFail, {
+        message: `GitTree: Error parsing buffer at byte location ${cursor}: Could not find the next space character.`
+      })
+    }
+    const nullchar = buffer.indexOf(0, cursor);
+    if (nullchar === -1) {
+      throw new GitError(E.InternalFail, {
+        message: `GitTree: Error parsing buffer at byte location ${cursor}: Could not find the next null character.`
+      })
+    }
+    let mode = buffer.slice(cursor, space).toString('utf8');
+    if (mode === '40000') mode = '040000'; // makes it line up neater in printed output
+    const type = mode2type(mode);
+    const path = buffer.slice(space + 1, nullchar).toString('utf8');
+    const oid = buffer.slice(nullchar + 1, nullchar + 21).toString('hex');
+    cursor = nullchar + 21;
+    _entries.push({ mode, path, oid, type });
+  }
+  return _entries
+}
+
+function limitModeToAllowed (mode) {
+  if (typeof mode === 'number') {
+    mode = mode.toString(8);
+  }
+  // tree
+  if (mode.match(/^0?4.*/)) return '040000' // Directory
+  if (mode.match(/^1006.*/)) return '100644' // Regular non-executable file
+  if (mode.match(/^1007.*/)) return '100755' // Regular executable file
+  if (mode.match(/^120.*/)) return '120000' // Symbolic link
+  if (mode.match(/^160.*/)) return '160000' // Commit (git submodule reference)
+  throw new GitError(E.InternalFail, {
+    message: `Could not understand file mode: ${mode}`
+  })
+}
+
+function nudgeIntoShape (entry) {
+  if (!entry.oid && entry.sha) {
+    entry.oid = entry.sha; // Github
+  }
+  entry.mode = limitModeToAllowed(entry.mode); // index
+  if (!entry.type) {
+    entry.type = 'blob'; // index
+  }
+  return entry
+}
+
+class GitTree {
+  /*::
+  _entries: Array<TreeEntry>
+  */
+  constructor (entries) {
+    if (Buffer.isBuffer(entries)) {
+      this._entries = parseBuffer$1(entries);
+      // There appears to be an edge case (in this repo no less) where
+      // the tree is NOT sorted as expected if some directories end with ".git"
+      this._entries.sort(comparePath);
+    } else if (Array.isArray(entries)) {
+      this._entries = entries.map(nudgeIntoShape);
+    } else {
+      throw new GitError(E.InternalFail, {
+        message: 'invalid type passed to GitTree constructor'
+      })
+    }
+  }
+
+  static from (tree) {
+    return new GitTree(tree)
+  }
+
+  render () {
+    return this._entries
+      .map(entry => `${entry.mode} ${entry.type} ${entry.oid}    ${entry.path}`)
+      .join('\n')
+  }
+
+  toObject () {
+    return Buffer.concat(
+      this._entries.map(entry => {
+        const mode = Buffer.from(entry.mode.replace(/^0/, ''));
+        const space = Buffer.from(' ');
+        const path = Buffer.from(entry.path, 'utf8');
+        const nullchar = Buffer.from([0]);
+        const oid = Buffer.from(entry.oid, 'hex');
+        return Buffer.concat([mode, space, path, nullchar, oid])
+      })
+    )
+  }
+
+  entries () {
+    return this._entries
+  }
+
+  * [Symbol.iterator] () {
+    for (const entry of this._entries) {
+      yield entry;
+    }
   }
 }
 
 class GitObject {
   static wrap ({ type, object }) {
+    const buffer = typeof object === 'string' ? Buffer.from(object, 'utf8') : Buffer.from(object);
     return Buffer.concat([
-      Buffer.from(`${type} ${object.byteLength.toString()}\x00`),
-      Buffer.from(object)
+      Buffer.from(`${type} ${buffer.byteLength.toString()}\x00`),
+      buffer
     ])
   }
 
@@ -1235,6 +1367,98 @@ async function writeObject ({
     const fs = new FileSystem(_fs);
     await writeObjectLoose({ fs, gitdir, object, format: 'deflated', oid });
   }
+  return oid
+}
+
+// import LockManager from 'travix-lock-manager'
+
+// import Lock from '../utils.js'
+
+// TODO: replace with an LRU cache?
+const map = new DeepMap();
+const stats = new DeepMap();
+// const lm = new LockManager()
+let lock = null;
+
+async function updateCachedIndexFile (fs, filepath) {
+  const stat = await fs.lstat(filepath);
+  const rawIndexFile = await fs.read(filepath);
+  const index = GitIndex.from(rawIndexFile);
+  // cache the GitIndex object so we don't need to re-read it
+  // every time.
+  map.set([fs, filepath], index);
+  // Save the stat data for the index so we know whether
+  // the cached file is stale (modified by an outside process).
+  stats.set([fs, filepath], stat);
+}
+
+// Determine whether our copy of the index file is stale
+async function isIndexStale (fs, filepath) {
+  const savedStats = stats.get([fs, filepath]);
+  if (savedStats === undefined) return true
+  const currStats = await fs.lstat(filepath);
+  if (savedStats === null) return false
+  if (currStats === null) return false
+  return compareStats(savedStats, currStats)
+}
+
+class GitIndexManager {
+  static async acquire ({ fs: _fs, filepath }, closure) {
+    const fs = new FileSystem(_fs);
+    if (lock === null) lock = new AsyncLock({ maxPending: Infinity });
+    await lock.acquire(filepath, async function () {
+      // Acquire a file lock while we're reading the index
+      // to make sure other processes aren't writing to it
+      // simultaneously, which could result in a corrupted index.
+      // const fileLock = await Lock(filepath)
+      if (await isIndexStale(fs, filepath)) {
+        await updateCachedIndexFile(fs, filepath);
+      }
+      const index = map.get([fs, filepath]);
+      await closure(index);
+      if (index._dirty) {
+        // Acquire a file lock while we're writing the index file
+        // let fileLock = await Lock(filepath)
+        const buffer = index.toObject();
+        await fs.write(filepath, buffer);
+        // Update cached stat value
+        stats.set([fs, filepath], await fs.lstat(filepath));
+        index._dirty = false;
+      }
+    });
+  }
+
+  static async constructTree ({ fs, gitdir, dryRun, index }) {
+    const inodes = flatFileListToDirectoryStructure(index.entries);
+    const inode = inodes.get('.');
+    const tree = await constructTree({ fs, gitdir, inode, dryRun });
+    return tree
+  }
+}
+
+async function constructTree ({ fs, gitdir, inode, dryRun }) {
+  // use depth first traversal
+  const children = inode.children;
+  for (const inode of children) {
+    if (inode.type === 'tree') {
+      inode.metadata.mode = '040000';
+      inode.metadata.oid = await constructTree({ fs, gitdir, inode, dryRun });
+    }
+  }
+  const entries = children.map(inode => ({
+    mode: inode.metadata.mode,
+    path: inode.basename,
+    oid: inode.metadata.oid,
+    type: inode.type
+  }));
+  const tree = GitTree.from(entries);
+  const oid = await writeObject({
+    fs,
+    gitdir,
+    type: 'tree',
+    object: tree.toObject(),
+    dryRun
+  });
   return oid
 }
 
@@ -1336,7 +1560,7 @@ const cores = {
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.filepath - The path to the file to add to the index
  *
- * @returns {Promise<void>} Resolves successfully once the git index has been updated
+ * @returns {Promise<string[]>} Resolves successfully once the git index has been updated
  *
  * @example
  * await new Promise((resolve, reject) => fs.writeFile(
@@ -3803,140 +4027,6 @@ class GitCommit {
   }
 }
 
-function comparePath (a, b) {
-  // https://stackoverflow.com/a/40355107/2168416
-  return compareStrings(a.path, b.path)
-}
-
-/*::
-type TreeEntry = {
-  mode: string,
-  path: string,
-  oid: string,
-  type?: string
-}
-*/
-
-function mode2type (mode) {
-  // prettier-ignore
-  switch (mode) {
-    case '040000': return 'tree'
-    case '100644': return 'blob'
-    case '100755': return 'blob'
-    case '120000': return 'blob'
-    case '160000': return 'commit'
-  }
-  throw new GitError(E.InternalFail, {
-    message: `Unexpected GitTree entry mode: ${mode}`
-  })
-}
-
-function parseBuffer$1 (buffer) {
-  const _entries = [];
-  let cursor = 0;
-  while (cursor < buffer.length) {
-    const space = buffer.indexOf(32, cursor);
-    if (space === -1) {
-      throw new GitError(E.InternalFail, {
-        message: `GitTree: Error parsing buffer at byte location ${cursor}: Could not find the next space character.`
-      })
-    }
-    const nullchar = buffer.indexOf(0, cursor);
-    if (nullchar === -1) {
-      throw new GitError(E.InternalFail, {
-        message: `GitTree: Error parsing buffer at byte location ${cursor}: Could not find the next null character.`
-      })
-    }
-    let mode = buffer.slice(cursor, space).toString('utf8');
-    if (mode === '40000') mode = '040000'; // makes it line up neater in printed output
-    const type = mode2type(mode);
-    const path = buffer.slice(space + 1, nullchar).toString('utf8');
-    const oid = buffer.slice(nullchar + 1, nullchar + 21).toString('hex');
-    cursor = nullchar + 21;
-    _entries.push({ mode, path, oid, type });
-  }
-  return _entries
-}
-
-function limitModeToAllowed (mode) {
-  if (typeof mode === 'number') {
-    mode = mode.toString(8);
-  }
-  // tree
-  if (mode.match(/^0?4.*/)) return '040000' // Directory
-  if (mode.match(/^1006.*/)) return '100644' // Regular non-executable file
-  if (mode.match(/^1007.*/)) return '100755' // Regular executable file
-  if (mode.match(/^120.*/)) return '120000' // Symbolic link
-  if (mode.match(/^160.*/)) return '160000' // Commit (git submodule reference)
-  throw new GitError(E.InternalFail, {
-    message: `Could not understand file mode: ${mode}`
-  })
-}
-
-function nudgeIntoShape (entry) {
-  if (!entry.oid && entry.sha) {
-    entry.oid = entry.sha; // Github
-  }
-  entry.mode = limitModeToAllowed(entry.mode); // index
-  if (!entry.type) {
-    entry.type = 'blob'; // index
-  }
-  return entry
-}
-
-class GitTree {
-  /*::
-  _entries: Array<TreeEntry>
-  */
-  constructor (entries) {
-    if (Buffer.isBuffer(entries)) {
-      this._entries = parseBuffer$1(entries);
-      // There appears to be an edge case (in this repo no less) where
-      // the tree is NOT sorted as expected if some directories end with ".git"
-      this._entries.sort(comparePath);
-    } else if (Array.isArray(entries)) {
-      this._entries = entries.map(nudgeIntoShape);
-    } else {
-      throw new GitError(E.InternalFail, {
-        message: 'invalid type passed to GitTree constructor'
-      })
-    }
-  }
-
-  static from (tree) {
-    return new GitTree(tree)
-  }
-
-  render () {
-    return this._entries
-      .map(entry => `${entry.mode} ${entry.type} ${entry.oid}    ${entry.path}`)
-      .join('\n')
-  }
-
-  toObject () {
-    return Buffer.concat(
-      this._entries.map(entry => {
-        const mode = Buffer.from(entry.mode.replace(/^0/, ''));
-        const space = Buffer.from(' ');
-        const path = Buffer.from(entry.path, 'utf8');
-        const nullchar = Buffer.from([0]);
-        const oid = Buffer.from(entry.oid, 'hex');
-        return Buffer.concat([mode, space, path, nullchar, oid])
-      })
-    )
-  }
-
-  entries () {
-    return this._entries
-  }
-
-  * [Symbol.iterator] () {
-    for (const entry of this._entries) {
-      yield entry;
-    }
-  }
-}
-
 async function resolveTree ({ fs, gitdir, oid }) {
   // Empty tree - bypass `readObject`
   if (oid === '4b825dc642cb6eb9a060e54bf8d69288fbee4904') {
@@ -4043,7 +4133,7 @@ class GitWalkerRepo {
       )
     }
     const { mode, type } = stats;
-    Object.assign(entry, { mode, type });
+    Object.assign(entry, { mode, type, stats });
   }
 
   async populateContent (entry) {
@@ -4119,62 +4209,6 @@ function TREE ({
   });
   Object.freeze(o);
   return o
-}
-
-/*::
-type Node = {
-  type: string,
-  fullpath: string,
-  basename: string,
-  metadata: Object, // mode, oid
-  parent?: Node,
-  children: Array<Node>
-}
-*/
-
-function flatFileListToDirectoryStructure (files) {
-  const inodes = new Map();
-  const mkdir = function (name) {
-    if (!inodes.has(name)) {
-      const dir = {
-        type: 'tree',
-        fullpath: name,
-        basename: basename(name),
-        metadata: {},
-        children: []
-      };
-      inodes.set(name, dir);
-      // This recursively generates any missing parent folders.
-      // We do it after we've added the inode to the set so that
-      // we don't recurse infinitely trying to create the root '.' dirname.
-      dir.parent = mkdir(dirname(name));
-      if (dir.parent && dir.parent !== dir) dir.parent.children.push(dir);
-    }
-    return inodes.get(name)
-  };
-
-  const mkfile = function (name, metadata) {
-    if (!inodes.has(name)) {
-      const file = {
-        type: 'blob',
-        fullpath: name,
-        basename: basename(name),
-        metadata: metadata,
-        // This recursively generates any missing parent folders.
-        parent: mkdir(dirname(name)),
-        children: []
-      };
-      if (file.parent) file.parent.children.push(file);
-      inodes.set(name, file);
-    }
-    return inodes.get(name)
-  };
-
-  mkdir('.');
-  for (const file of files) {
-    mkfile(file.path, file);
-  }
-  return inodes
 }
 
 class GitWalkerFs {
@@ -4789,7 +4823,7 @@ async function checkout ({
 
     if (!noCheckout) {
       let count = 0;
-      const gitdirBasename = gitdir.slice(dir.length + 1);
+      const gitdirBasename = dir ? gitdir.replace(dir + '/', '') : gitdir;
       // Acquire a lock on the index
       await GitIndexManager.acquire(
         { fs, filepath: `${gitdir}/index` },
@@ -4806,10 +4840,20 @@ async function checkout ({
               },
               map: async function ([head, workdir]) {
                 if (head.fullpath === '.') return
-                // Late filter against file names
-                if (patternGlobrex && !patternGlobrex.regex.test(head.fullpath)) return
                 const workdirPath = workdir.fullpath;
                 if (workdirPath === gitdirBasename) return
+                // Late filter against file names
+                if (patternGlobrex) {
+                  let match = false;
+                  for (const base of bases) {
+                    const partToMatch = head.fullpath.replace(base + '/', '');
+                    if (patternGlobrex.regex.test(partToMatch)) {
+                      match = true;
+                      break
+                    }
+                  }
+                  if (!match) return
+                }
                 const stage = index.entriesMap.get(GitIndex.key(workdirPath, 0));
                 if (!head.exists) {
                   // if file is not staged, ignore it
@@ -6568,13 +6612,19 @@ async function commit ({
     await GitIndexManager.acquire(
       { fs, filepath: `${gitdir}/index` },
       async function (index) {
-        let parents;
-        try {
-          const parent = await GitRefManager.resolve({ fs, gitdir, ref });
-          parents = [parent];
-        } catch (err) {
-          // Probably an initial commit
-          parents = [];
+        if (!parent) {
+          try {
+            parent = [
+              await GitRefManager.resolve({
+                fs,
+                gitdir,
+                ref
+              })
+            ];
+          } catch (err) {
+            // Probably an initial commit
+            parent = [];
+          }
         }
 
         let mergeHash;
@@ -6589,19 +6639,19 @@ async function commit ({
           if (conflictedPaths.length > 0) {
             throw new GitError(E.CommitUnmergedConflictsFail, { paths: conflictedPaths })
           }
-          if (parents.length) {
-            parents.push(mergeHash);
+          if (parent.length) {
+            if (!parent.includes(mergeHash)) parent.push(mergeHash);
           } else {
             throw new GitError(E.NoHeadCommitError, { noun: 'merge commit', ref: mergeHash })
           }
         }
 
-        const inodes = flatFileListToDirectoryStructure(index.entries);
-        const inode = inodes.get('.');
-        const treeRef = await constructTree({ fs, gitdir, inode, dryRun });
+        if (!tree) {
+          tree = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index });
+        }
 
         let comm = GitCommit.from({
-          treeRef,
+          tree,
           parent,
           author,
           committer,
@@ -6638,32 +6688,6 @@ async function commit ({
     err.caller = 'git.commit';
     throw err
   }
-}
-
-async function constructTree ({ fs, gitdir, inode, dryRun }) {
-  // use depth first traversal
-  const children = inode.children;
-  for (const inode of children) {
-    if (inode.type === 'tree') {
-      inode.metadata.mode = '040000';
-      inode.metadata.oid = await constructTree({ fs, gitdir, inode, dryRun });
-    }
-  }
-  const entries = children.map(inode => ({
-    mode: inode.metadata.mode,
-    path: inode.basename,
-    oid: inode.metadata.oid,
-    type: inode.type
-  }));
-  const tree = GitTree.from(entries);
-  const oid = await writeObject({
-    fs,
-    gitdir,
-    type: 'tree',
-    object: tree.toObject(),
-    dryRun
-  });
-  return oid
 }
 
 // @ts-check
@@ -7419,6 +7443,7 @@ async function isDescendent ({
 }) {
   try {
     const fs = new FileSystem(_fs);
+    const shallows = await GitShallowManager.read({ fs, gitdir });
     if (!oid) {
       throw new GitError(E.MissingRequiredParameterError, {
         function: 'isDescendent',
@@ -7457,11 +7482,13 @@ async function isDescendent ({
       for (const parent of commit.parent) {
         if (parent === ancestor) return true
       }
-      // If not, add them to heads
-      for (const parent of commit.parent) {
-        if (!visited.has(parent)) {
-          queue.push(parent);
-          visited.add(parent);
+      // If not, add them to heads (unless we know this is a shallow commit)
+      if (!shallows.has(oid)) {
+        for (const parent of commit.parent) {
+          if (!visited.has(parent)) {
+            queue.push(parent);
+            visited.add(parent);
+          }
         }
       }
       // Eventually, we'll travel entire tree to the roots where all the parents are empty arrays,
@@ -7528,6 +7555,7 @@ async function listCommitsAndTags ({
   finish
 }) {
   const fs = new FileSystem(_fs);
+  const shallows = await GitShallowManager.read({ fs, gitdir });
   const startingSet = new Set();
   const finishingSet = new Set();
   for (const ref of start) {
@@ -7560,11 +7588,13 @@ async function listCommitsAndTags ({
         expected: 'commit'
       })
     }
-    const commit = GitCommit.from(object);
-    const parents = commit.headers().parent;
-    for (oid of parents) {
-      if (!finishingSet.has(oid) && !visited.has(oid)) {
-        await walk(oid);
+    if (!shallows.has(oid)) {
+      const commit = GitCommit.from(object);
+      const parents = commit.headers().parent;
+      for (oid of parents) {
+        if (!finishingSet.has(oid) && !visited.has(oid)) {
+          await walk(oid);
+        }
       }
     }
   }
@@ -8128,6 +8158,16 @@ async function findChangedFiles ({
       map: async function ([ours, theirs, base]) {
         if (ours.fullpath === '.') return
 
+        await Promise.all([
+          base.exists && base.populateStat(),
+          theirs.exists && theirs.populateStat(),
+          ours.exists && ours.populateStat()
+        ]);
+
+        if ((base.exists && base.type !== 'blob') ||
+            (ours.exists && ours.type !== 'blob') ||
+            (theirs.exists && theirs.type !== 'blob')) return
+
         if (emitter) {
           emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Counting changes',
@@ -8153,7 +8193,7 @@ async function findChangedFiles ({
 async function fileStatus (receiver, giver, base) {
   const receiverPresent = receiver.exists;
   const basePresent = base.exists;
-  const giverPresent = base.exists;
+  const giverPresent = giver.exists;
 
   if ((!receiverPresent && !basePresent && giverPresent) ||
     (receiverPresent && !basePresent && !giverPresent)) {
@@ -8162,11 +8202,16 @@ async function fileStatus (receiver, giver, base) {
     (!receiverPresent && basePresent && giverPresent)) {
     return 'deleted'
   } else {
-    if (receiverPresent) await receiver.populateHash();
-    if (giverPresent) await giver.populateHash();
-
+    await Promise.all([
+      receiverPresent && receiver.populateHash(),
+      giverPresent && giver.populateHash()
+    ]);
     if (receiver.oid === giver.oid) {
-      return 'unmodified'
+      if (receiver.mode === giver.mode) {
+        return 'unmodified'
+      } else {
+        return 'modified'
+      }
     } else {
       if (basePresent) await base.populateHash();
       if (receiverPresent && giverPresent && receiver.oid !== giver.oid) {
@@ -8178,6 +8223,48 @@ async function fileStatus (receiver, giver, base) {
       }
     }
   }
+}
+
+const LINEBREAKS = /^.*(\r?\n|$)/gm;
+
+function mergeFile ({
+  ourContent,
+  baseContent,
+  theirContent,
+  ourName = 'ours',
+  baseName = 'base',
+  theirName = 'theirs',
+  format = 'diff',
+  markerSize = 7
+}) {
+  const ours = ourContent.match(LINEBREAKS);
+  const base = baseContent.match(LINEBREAKS);
+  const theirs = theirContent.match(LINEBREAKS);
+
+  // Here we let the diff3 library do the heavy lifting.
+  const result = diff3Merge(ours, base, theirs);
+
+  // Here we note whether there are conflicts and format the results
+  let mergedText = '';
+  let cleanMerge = true;
+  for (const item of result) {
+    if (item.ok) {
+      mergedText += item.ok.join('');
+    }
+    if (item.conflict) {
+      cleanMerge = false;
+      mergedText += `${'<'.repeat(markerSize)} ${ourName}\n`;
+      mergedText += item.conflict.a.join('');
+      if (format === 'diff3') {
+        mergedText += `${'|'.repeat(markerSize)} ${baseName}\n`;
+        mergedText += item.conflict.o.join('');
+      }
+      mergedText += `${'='.repeat(markerSize)}\n`;
+      mergedText += item.conflict.b.join('');
+      mergedText += `${'>'.repeat(markerSize)} ${theirName}\n`;
+    }
+  }
+  return { cleanMerge, mergedText }
 }
 
 /**
@@ -8213,6 +8300,7 @@ async function fileStatus (receiver, giver, base) {
  * @param {boolean} [args.fastForwardOnly = false] - If true, then non-fast-forward merges will throw an Error instead of performing a merge.
  * @param {boolean} [args.dryRun = false] - If true, simulates a merge so you can test whether it would succeed.
  * @param {boolean} [args.noUpdateBranch = false] - If true, does not update the branch pointer after creating the commit.
+ * @param {boolean} [args.noCheckout = false] - If true, does not perform checkout after merge.
  * @param {string} [args.message] - Overrides the default auto-generated merge commit message
  * @param {Object} [args.author] - passed to [commit](commit.md) when creating a merge commit
  * @param {Object} [args.committer] - passed to [commit](commit.md) when creating a merge commit
@@ -8237,18 +8325,25 @@ async function merge ({
   theirRef,
   fastForwardOnly = false,
   dryRun = false,
-  noUpdateBranch = false
+  noUpdateBranch = false,
+  noCheckout = false,
+  message,
+  author,
+  committer,
+  signingKey
 }) {
   try {
     const fs = new FileSystem(_fs);
+    const currentRef = await currentBranch({ fs, gitdir, fullname: true });
     if (ourRef === undefined) {
-      ourRef = await currentBranch({ fs, gitdir, fullname: true });
+      ourRef = currentRef;
+    } else {
+      ourRef = await GitRefManager.expand({
+        fs,
+        gitdir,
+        ref: ourRef
+      });
     }
-    ourRef = await GitRefManager.expand({
-      fs,
-      gitdir,
-      ref: ourRef
-    });
     theirRef = await GitRefManager.expand({
       fs,
       gitdir,
@@ -8282,15 +8377,19 @@ async function merge ({
         alreadyMerged: true
       }
     } else if (baseOid === ourOid) {
-      await GitRefManager.writeRef({ fs, gitdir, ref: ourRef, value: theirOid });
-      await checkout({
-        dir,
-        gitdir,
-        fs,
-        ref: ourRef,
-        emitter,
-        emitterPrefix
-      });
+      if (!dryRun && !noUpdateBranch) {
+        await GitRefManager.writeRef({ fs, gitdir, ref: ourRef, value: theirOid });
+      }
+      if (!noCheckout) {
+        await checkout({
+          dir,
+          gitdir,
+          fs,
+          ref: ourRef,
+          emitter,
+          emitterPrefix
+        });
+      }
       return {
         oid: theirOid,
         fastForward: true
@@ -8299,6 +8398,19 @@ async function merge ({
       // not a simple fast-forward
       if (fastForwardOnly) {
         throw new GitError(E.FastForwardFail)
+      }
+
+      if (currentRef !== ourRef) {
+        // checkout our branch to begin non-fast-forward merge (needed for tests)
+        await checkout({
+          dir,
+          gitdir,
+          fs,
+          ref: ourRef,
+          emitter,
+          emitterPrefix,
+          dryRun
+        });
       }
 
       await GitRefManager.writeRef({ fs, gitdir, ref: 'MERGE_HEAD', value: theirOid });
@@ -8314,74 +8426,30 @@ async function merge ({
         theirOid,
         baseOid
       });
+      const total = mergeDiff.length;
 
-      await fs.write(join(gitdir, 'MERGE_MSG'), mergeMessage(ourRef, theirRef, mergeDiff), 'utf8');
-
+      let treeOid; let hasConflict = false;
       await GitIndexManager.acquire(
         { fs, filepath: `${gitdir}/index` },
         async function (index) {
-          const total = mergeDiff.length;
           let count = 0;
-
           for (const diff of mergeDiff) {
             const { ours, theirs, base } = diff;
             // for simple cases of add, remove, or modify files
             switch (diff.status) {
               case 'added':
-                const added = ours.exists ? ours : theirs;
-                await added.populateHash();
-                await added.populateStat();
-                await added.populateContent();
-                const { fullpath, stats, contents, oid } = added;
-                index.insert({ filepath: fullpath, stats, oid });
-                await fs.write(`${dir}/${fullpath}`, contents);
+                await processAdded({ ours, theirs, fs, index, dir });
                 break
               case 'deleted':
                 index.delete({ filepath: base.fullpath });
                 await fs.rm(`${dir}/${base.fullpath}`);
                 break
               case 'modified':
-                if (theirs.oid !== base.oid) {
-                  await theirs.populateStat();
-                  await theirs.populateContent();
-                  const { fullpath, stats, contents, oid } = theirs;
-                  index.insert({ filepath: fullpath, stats, oid });
-                  await fs.write(`${dir}/${fullpath}`, contents);
-                }
+                await processModified({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir });
                 break
               case 'conflict':
-                await ours.populateContent();
-                await theirs.populateContent();
-                await base.populateContent();
-                await base.populateStat();
-
-                const merged = await merge$1(ours.content, base.content, theirs.content);
-                const { baseFullpath, baseOid, baseStats } = base;
-                const mergedText = merged.result.join('\n');
-
-                if (merged.conflict) {
-                  index.writeConflict({
-                    filepath: baseFullpath,
-                    stats: baseStats,
-                    ourOid: ours.oid,
-                    theirOid: theirs.oid,
-                    baseOid
-                  });
-                  emitter.emit(`${emitterPrefix}conflict`, {
-                    filepath: baseFullpath,
-                    ourOid: ours.oid,
-                    theirOid: theirs.oid,
-                    baseOid
-                  });
-                } else {
-                  const oid = await hashObject$1({
-                    gitdir,
-                    type: 'blob',
-                    object: mergedText
-                  });
-                  index.insert({ filepath: baseFullpath, stats, oid });
-                }
-                await fs.write(`${dir}/${baseFullpath}`, mergedText);
+                const conflict = await processConflict({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir, gitdir });
+                hasConflict = hasConflict || conflict;
                 break
             }
 
@@ -8394,12 +8462,38 @@ async function merge ({
               });
             }
           }
+          treeOid = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index });
         }
       );
 
+      if (!message) {
+        message = `Merge branch '${abbreviateRef(theirRef)}' into ${abbreviateRef(ourRef)}`;
+      }
+
+      let oid;
+      if (!hasConflict) {
+        oid = await commit({
+          fs,
+          gitdir,
+          message,
+          ref: ourRef,
+          tree: treeOid,
+          parent: [ourOid], // theirOid should be handled by MERGE_HASH in commit
+          author,
+          committer,
+          signingKey,
+          dryRun,
+          noUpdateBranch
+        });
+      } else {
+        await fs.write(join(gitdir, 'MERGE_MSG'), message, 'utf8');
+      }
+
       return {
-        oid: ourOid,
-        mergeCommit: true
+        oid,
+        tree: treeOid,
+        recursiveMerge: true,
+        mergeCommit: !hasConflict
       }
     }
   } catch (err) {
@@ -8408,13 +8502,96 @@ async function merge ({
   }
 }
 
-async function mergeMessage ({ ourRef, theirRef, mergeDiff }) {
-  let msg = `Merge ${theirRef} into ${ourRef}`;
-  const conflicts = mergeDiff.filter(function (d) { return d.status === 'conflict' });
-  if (conflicts.length > 0) {
-    msg += '\nConflicts:\n' + conflicts.join('\n');
+async function processAdded ({ ours, theirs, fs, index, dir }) {
+  const added = ours.exists ? ours : theirs;
+  await Promise.all([
+    !added.oid && added.populateHash(),
+    !added.content && added.populateContent()
+  ]);
+  const { fullpath: filepath, contents, oid } = added;
+  const workingPath = `${dir}/${filepath}`;
+  await fs.write(workingPath, contents);
+  const stats = await fs.lstat(workingPath);
+  index.insert({ filepath, stats, oid });
+}
+
+async function processModified ({ ours, theirs, base, fs, index, dir }) {
+  await Promise.all([
+    !ours.oid && ours.populateHash(),
+    !base.oid && base.populateHash(),
+    !theirs.oid && theirs.populateHash(),
+    !ours.mode && ours.populateStats(),
+    !base.mode && base.populateStats(),
+    !theirs.mode && theirs.populateStats()
+  ]);
+  const mode = base.mode === ours.mode ? theirs.mode : ours.mode;
+  const { fullpath: filepath, content, oid } = base.oid === ours.oid ? theirs : ours;
+  const workingPath = `${dir}/${filepath}`;
+  await fs.write(
+    workingPath,
+    content,
+    mode === '100755' ? { mode: 0o777 } : undefined
+  );
+  const stats = await fs.lstat(workingPath);
+  // Lightning FS does not store mode in IDB - problem for testing
+  stats.mode = mode === '100755' ? 0o100755 : 0o100644;
+  index.insert({ filepath, stats, oid });
+}
+
+async function processConflict ({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir, gitdir }) {
+  await Promise.all([
+    !ours.content && ours.populateContent(),
+    !theirs.content && theirs.populateContent(),
+    !base.content && base.populateContent(),
+    !base.oid && base.populateHash(),
+    !ours.oid && ours.populateHash(),
+    !theirs.oid && theirs.populateHash()
+  ]);
+
+  const merged = await mergeFile({
+    ourContent: ours.content.toString('utf8'),
+    baseContent: base.content.toString('utf8'),
+    theirContent: theirs.content.toString('utf8')
+  });
+
+  const mode = base.mode === ours.mode ? theirs.mode : ours.mode;
+  const { fullpath: filepath, oid: baseOid } = base;
+  const workingPath = `${dir}/${filepath}`;
+  await fs.write(
+    workingPath,
+    merged.mergedText,
+    mode === '100755' ? { mode: 0o777 } : undefined
+  );
+
+  const stats = await fs.lstat(workingPath);
+  stats.mode = mode === '100755' ? 0o100755 : 0o100644;
+
+  if (!merged.cleanMerge) {
+    index.writeConflict({
+      filepath,
+      stats,
+      ourOid: ours.oid,
+      theirOid: theirs.oid,
+      baseOid
+    });
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}conflict`, {
+        filepath,
+        ourOid: ours.oid,
+        theirOid: theirs.oid,
+        baseOid
+      });
+    }
+    return true
+  } else {
+    const oid = await hashObject$1({
+      gitdir,
+      type: 'blob',
+      object: merged.mergedText
+    });
+    index.insert({ filepath, stats, oid });
+    return false
   }
-  return msg
 }
 
 const types = {
@@ -8625,7 +8802,7 @@ async function pull ({
       fs,
       path: `branch.${ref}.remote`
     });
-    const { fetchHead } = await fetch({
+    const { fetchHead, fetchHeadDescription } = await fetch({
       dir,
       gitdir,
       fs,
@@ -8643,16 +8820,20 @@ async function pull ({
       headers
     });
     // Merge the remote tracking branch into the local one.
-    return await merge({
+    await merge({
       dir,
       gitdir,
       fs,
       ourRef: ref,
       theirRef: fetchHead,
-      fastForwardOnly,
       emitter,
-      emitterPrefix
-    })
+      emitterPrefix,
+      fastForwardOnly,
+      message: `Merge ${fetchHeadDescription}`,
+      author,
+      committer,
+      signingKey
+    });
   } catch (err) {
     err.caller = 'git.pull';
     throw err
@@ -9852,15 +10033,19 @@ async function statusMatrix ({
           if (!match) return
         }
         // For now, just bail on directories
-        await stage.populateStat();
-        if (stage.type === 'tree' || stage.type === 'special') return
-        await workdir.populateStat();
-        if (workdir.type === 'tree' || workdir.type === 'special') return
-        await head.populateStat();
-        if (head.type === 'tree' || head.type === 'special') return
+        await Promise.all([
+          stage.populateStat(),
+          workdir.populateStat(),
+          head.populateStat()
+        ]);
+        if (stage.type === 'tree' || stage.type === 'special' ||
+            workdir.type === 'tree' || workdir.type === 'special' ||
+            head.type === 'tree' || head.type === 'special') return
         // Figure out the oids, using the staged oid for the working dir oid if the stats match.
-        await head.populateHash();
-        await stage.populateHash();
+        await Promise.all([
+          head.populateHash(),
+          stage.populateHash()
+        ]);
         if (!head.exists && workdir.exists && !stage.exists) {
           // We don't actually NEED the sha. Any sha will do
           // TODO: update this logic to handle N trees instead of just 3.

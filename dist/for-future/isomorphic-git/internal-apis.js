@@ -1,11 +1,11 @@
 import pify from 'pify';
+import AsyncLock from 'async-lock';
 import pako from 'pako';
 import crc32 from 'crc-32';
 import applyDelta from 'git-apply-delta';
 import { mark, stop } from 'marky';
 import Hash from 'sha.js/sha1';
 import ignore from 'ignore';
-import AsyncLock from 'async-lock';
 import diff3Merge from 'diff3';
 import _path from 'path';
 
@@ -1254,6 +1254,46 @@ class GitRefManager {
   }
 }
 
+let lock = null;
+
+class GitShallowManager {
+  static async read ({ fs: _fs, gitdir }) {
+    const fs = new FileSystem(_fs);
+    if (lock === null) lock = new AsyncLock();
+    const filepath = join(gitdir, 'shallow');
+    const oids = new Set();
+    await lock.acquire(filepath, async function () {
+      const text = await fs.read(filepath, { encoding: 'utf8' });
+      if (text === null) return oids // no file
+      if (text.trim() === '') return oids // empty file
+      text
+        .trim()
+        .split('\n')
+        .map(oid => oids.add(oid));
+    });
+    return oids
+  }
+
+  static async write ({ fs: _fs, gitdir, oids }) {
+    const fs = new FileSystem(_fs);
+    if (lock === null) lock = new AsyncLock();
+    const filepath = join(gitdir, 'shallow');
+    if (oids.size > 0) {
+      const text = [...oids].join('\n') + '\n';
+      await lock.acquire(filepath, async function () {
+        await fs.write(filepath, text, {
+          encoding: 'utf8'
+        });
+      });
+    } else {
+      // No shallows
+      await lock.acquire(filepath, async function () {
+        await fs.rm(filepath);
+      });
+    }
+  }
+}
+
 function formatAuthor ({ name, email, timestamp, timezoneOffset }) {
   timezoneOffset = formatTimezoneOffset(timezoneOffset);
   return `${name} <${email}> ${timestamp} ${timezoneOffset}`
@@ -1614,9 +1654,10 @@ class GitCommit {
 
 class GitObject {
   static wrap ({ type, object }) {
+    const buffer = typeof object === 'string' ? Buffer.from(object, 'utf8') : Buffer.from(object);
     return Buffer.concat([
-      Buffer.from(`${type} ${object.byteLength.toString()}\x00`),
-      Buffer.from(object)
+      Buffer.from(`${type} ${buffer.byteLength.toString()}\x00`),
+      buffer
     ])
   }
 
@@ -2712,6 +2753,7 @@ async function listCommitsAndTags ({
   finish
 }) {
   const fs = new FileSystem(_fs);
+  const shallows = await GitShallowManager.read({ fs, gitdir });
   const startingSet = new Set();
   const finishingSet = new Set();
   for (const ref of start) {
@@ -2744,11 +2786,13 @@ async function listCommitsAndTags ({
         expected: 'commit'
       })
     }
-    const commit = GitCommit.from(object);
-    const parents = commit.headers().parent;
-    for (oid of parents) {
-      if (!finishingSet.has(oid) && !visited.has(oid)) {
-        await walk(oid);
+    if (!shallows.has(oid)) {
+      const commit = GitCommit.from(object);
+      const parents = commit.headers().parent;
+      for (oid of parents) {
+        if (!finishingSet.has(oid) && !visited.has(oid)) {
+          await walk(oid);
+        }
       }
     }
   }
@@ -3648,6 +3692,108 @@ function justWhatMatters (e) {
   }
 }
 
+/*::
+type Node = {
+  type: string,
+  fullpath: string,
+  basename: string,
+  metadata: Object, // mode, oid
+  parent?: Node,
+  children: Array<Node>
+}
+*/
+
+function flatFileListToDirectoryStructure (files) {
+  const inodes = new Map();
+  const mkdir = function (name) {
+    if (!inodes.has(name)) {
+      const dir = {
+        type: 'tree',
+        fullpath: name,
+        basename: basename(name),
+        metadata: {},
+        children: []
+      };
+      inodes.set(name, dir);
+      // This recursively generates any missing parent folders.
+      // We do it after we've added the inode to the set so that
+      // we don't recurse infinitely trying to create the root '.' dirname.
+      dir.parent = mkdir(dirname(name));
+      if (dir.parent && dir.parent !== dir) dir.parent.children.push(dir);
+    }
+    return inodes.get(name)
+  };
+
+  const mkfile = function (name, metadata) {
+    if (!inodes.has(name)) {
+      const file = {
+        type: 'blob',
+        fullpath: name,
+        basename: basename(name),
+        metadata: metadata,
+        // This recursively generates any missing parent folders.
+        parent: mkdir(dirname(name)),
+        children: []
+      };
+      if (file.parent) file.parent.children.push(file);
+      inodes.set(name, file);
+    }
+    return inodes.get(name)
+  };
+
+  mkdir('.');
+  for (const file of files) {
+    mkfile(file.path, file);
+  }
+  return inodes
+}
+
+async function writeObjectLoose ({
+  fs: _fs,
+  gitdir,
+  type,
+  object,
+  format,
+  oid
+}) {
+  const fs = new FileSystem(_fs);
+  if (format !== 'deflated') {
+    throw new GitError(E.InternalFail, {
+      message:
+        'GitObjectStoreLoose expects objects to write to be in deflated format'
+    })
+  }
+  const source = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
+  const filepath = `${gitdir}/${source}`;
+  // Don't overwrite existing git objects - this helps avoid EPERM errors.
+  // Although I don't know how we'd fix corrupted objects then. Perhaps delete them
+  // on read?
+  if (!(await fs.exists(filepath))) await fs.write(filepath, object);
+}
+
+async function writeObject ({
+  fs: _fs,
+  gitdir,
+  type,
+  object,
+  format = 'content',
+  oid = undefined,
+  dryRun = false
+}) {
+  if (format !== 'deflated') {
+    if (format !== 'wrapped') {
+      object = GitObject.wrap({ type, object });
+    }
+    oid = shasum(object);
+    object = Buffer.from(pako.deflate(object));
+  }
+  if (!dryRun) {
+    const fs = new FileSystem(_fs);
+    await writeObjectLoose({ fs, gitdir, object, format: 'deflated', oid });
+  }
+  return oid
+}
+
 // import LockManager from 'travix-lock-manager'
 
 // import Lock from '../utils.js'
@@ -3656,7 +3802,7 @@ function justWhatMatters (e) {
 const map = new DeepMap();
 const stats = new DeepMap();
 // const lm = new LockManager()
-let lock = null;
+let lock$1 = null;
 
 async function updateCachedIndexFile (fs, filepath) {
   const stat = await fs.lstat(filepath);
@@ -3683,8 +3829,8 @@ async function isIndexStale (fs, filepath) {
 class GitIndexManager {
   static async acquire ({ fs: _fs, filepath }, closure) {
     const fs = new FileSystem(_fs);
-    if (lock === null) lock = new AsyncLock({ maxPending: Infinity });
-    await lock.acquire(filepath, async function () {
+    if (lock$1 === null) lock$1 = new AsyncLock({ maxPending: Infinity });
+    await lock$1.acquire(filepath, async function () {
       // Acquire a file lock while we're reading the index
       // to make sure other processes aren't writing to it
       // simultaneously, which could result in a corrupted index.
@@ -3705,6 +3851,39 @@ class GitIndexManager {
       }
     });
   }
+
+  static async constructTree ({ fs, gitdir, dryRun, index }) {
+    const inodes = flatFileListToDirectoryStructure(index.entries);
+    const inode = inodes.get('.');
+    const tree = await constructTree({ fs, gitdir, inode, dryRun });
+    return tree
+  }
+}
+
+async function constructTree ({ fs, gitdir, inode, dryRun }) {
+  // use depth first traversal
+  const children = inode.children;
+  for (const inode of children) {
+    if (inode.type === 'tree') {
+      inode.metadata.mode = '040000';
+      inode.metadata.oid = await constructTree({ fs, gitdir, inode, dryRun });
+    }
+  }
+  const entries = children.map(inode => ({
+    mode: inode.metadata.mode,
+    path: inode.basename,
+    oid: inode.metadata.oid,
+    type: inode.type
+  }));
+  const tree = GitTree.from(entries);
+  const oid = await writeObject({
+    fs,
+    gitdir,
+    type: 'tree',
+    object: tree.toObject(),
+    dryRun
+  });
+  return oid
 }
 
 function calculateBasicAuthHeader ({ username, password }) {
@@ -4125,46 +4304,6 @@ class GitRemoteManager {
   }
 }
 
-let lock$1 = null;
-
-class GitShallowManager {
-  static async read ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs);
-    if (lock$1 === null) lock$1 = new AsyncLock();
-    const filepath = join(gitdir, 'shallow');
-    const oids = new Set();
-    await lock$1.acquire(filepath, async function () {
-      const text = await fs.read(filepath, { encoding: 'utf8' });
-      if (text === null) return oids // no file
-      if (text.trim() === '') return oids // empty file
-      text
-        .trim()
-        .split('\n')
-        .map(oid => oids.add(oid));
-    });
-    return oids
-  }
-
-  static async write ({ fs: _fs, gitdir, oids }) {
-    const fs = new FileSystem(_fs);
-    if (lock$1 === null) lock$1 = new AsyncLock();
-    const filepath = join(gitdir, 'shallow');
-    if (oids.size > 0) {
-      const text = [...oids].join('\n') + '\n';
-      await lock$1.acquire(filepath, async function () {
-        await fs.write(filepath, text, {
-          encoding: 'utf8'
-        });
-      });
-    } else {
-      // No shallows
-      await lock$1.acquire(filepath, async function () {
-        await fs.rm(filepath);
-      });
-    }
-  }
-}
-
 class FIFO {
   constructor () {
     this._queue = [];
@@ -4399,52 +4538,6 @@ class SignedGitCommit extends GitCommit {
   }
 }
 
-async function writeObjectLoose ({
-  fs: _fs,
-  gitdir,
-  type,
-  object,
-  format,
-  oid
-}) {
-  const fs = new FileSystem(_fs);
-  if (format !== 'deflated') {
-    throw new GitError(E.InternalFail, {
-      message:
-        'GitObjectStoreLoose expects objects to write to be in deflated format'
-    })
-  }
-  const source = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
-  const filepath = `${gitdir}/${source}`;
-  // Don't overwrite existing git objects - this helps avoid EPERM errors.
-  // Although I don't know how we'd fix corrupted objects then. Perhaps delete them
-  // on read?
-  if (!(await fs.exists(filepath))) await fs.write(filepath, object);
-}
-
-async function writeObject ({
-  fs: _fs,
-  gitdir,
-  type,
-  object,
-  format = 'content',
-  oid = undefined,
-  dryRun = false
-}) {
-  if (format !== 'deflated') {
-    if (format !== 'wrapped') {
-      object = GitObject.wrap({ type, object });
-    }
-    oid = shasum(object);
-    object = Buffer.from(pako.deflate(object));
-  }
-  if (!dryRun) {
-    const fs = new FileSystem(_fs);
-    await writeObjectLoose({ fs, gitdir, object, format: 'deflated', oid });
-  }
-  return oid
-}
-
 /**
  * Use with push and fetch to set Basic Authentication headers.
  *
@@ -4462,62 +4555,6 @@ function auth (username, password) {
     }
   }
   return { username, password }
-}
-
-/*::
-type Node = {
-  type: string,
-  fullpath: string,
-  basename: string,
-  metadata: Object, // mode, oid
-  parent?: Node,
-  children: Array<Node>
-}
-*/
-
-function flatFileListToDirectoryStructure (files) {
-  const inodes = new Map();
-  const mkdir = function (name) {
-    if (!inodes.has(name)) {
-      const dir = {
-        type: 'tree',
-        fullpath: name,
-        basename: basename(name),
-        metadata: {},
-        children: []
-      };
-      inodes.set(name, dir);
-      // This recursively generates any missing parent folders.
-      // We do it after we've added the inode to the set so that
-      // we don't recurse infinitely trying to create the root '.' dirname.
-      dir.parent = mkdir(dirname(name));
-      if (dir.parent && dir.parent !== dir) dir.parent.children.push(dir);
-    }
-    return inodes.get(name)
-  };
-
-  const mkfile = function (name, metadata) {
-    if (!inodes.has(name)) {
-      const file = {
-        type: 'blob',
-        fullpath: name,
-        basename: basename(name),
-        metadata: metadata,
-        // This recursively generates any missing parent folders.
-        parent: mkdir(dirname(name)),
-        children: []
-      };
-      if (file.parent) file.parent.children.push(file);
-      inodes.set(name, file);
-    }
-    return inodes.get(name)
-  };
-
-  mkdir('.');
-  for (const file of files) {
-    mkfile(file.path, file);
-  }
-  return inodes
 }
 
 /**
@@ -4697,7 +4734,7 @@ class GitWalkerRepo {
       )
     }
     const { mode, type } = stats;
-    Object.assign(entry, { mode, type });
+    Object.assign(entry, { mode, type, stats });
   }
 
   async populateContent (entry) {
