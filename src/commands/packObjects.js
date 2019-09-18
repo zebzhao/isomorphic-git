@@ -1,5 +1,5 @@
 // @ts-check
-import { FileSystem } from '../models/FileSystem.js'
+
 import { collect } from '../utils/collect.js'
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
@@ -18,7 +18,7 @@ import { pack } from './pack'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string[]} args.oids - An array of SHA-1 object ids to be included in the packfile
@@ -40,12 +40,11 @@ export async function packObjects ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oids,
   write = false
 }) {
   try {
-    const fs = new FileSystem(_fs)
     const buffers = await pack({ core, gitdir, fs, oids })
     const packfile = await collect(buffers)
     const packfileSha = packfile.slice(-20).toString('hex')

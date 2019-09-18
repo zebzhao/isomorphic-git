@@ -1,15 +1,14 @@
-import { FileSystem } from '../models/FileSystem.js'
+
 import { E, GitError } from '../models/GitError.js'
 
 export async function writeObjectLoose ({
-  fs: _fs,
+  fs,
   gitdir,
   type,
   object,
   format,
   oid
 }) {
-  const fs = new FileSystem(_fs)
   if (format !== 'deflated') {
     throw new GitError(E.InternalFail, {
       message:

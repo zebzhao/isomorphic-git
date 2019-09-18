@@ -1,5 +1,5 @@
 // @ts-check
-import { FileSystem } from '../models/FileSystem.js'
+
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
 
@@ -15,7 +15,7 @@ import { init } from './init.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.url - The URL of the remote repository
@@ -55,7 +55,7 @@ export async function clone ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   url,
@@ -88,7 +88,6 @@ export async function clone ({
         'The `onprogress` callback has been deprecated. Please use the more generic `emitter` EventEmitter argument instead.'
       )
     }
-    const fs = new FileSystem(_fs)
     username = username === undefined ? authUsername : username
     password = password === undefined ? authPassword : password
     await init({ gitdir, fs })

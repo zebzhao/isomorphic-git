@@ -28,11 +28,9 @@ class PluginCore extends Map {
           'lstat',
           'mkdir',
           'readdir',
-          'readFile',
-          'rmdir',
-          'stat',
-          'unlink',
-          'writeFile'
+          'read',
+          'rm',
+          'write'
         ],
         pgp: ['sign', 'verify'],
         http: []

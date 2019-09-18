@@ -6,12 +6,10 @@ import { normalizeStats } from '../utils/normalizeStats.js'
 import { shasum } from '../utils/shasum.js'
 import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js'
 
-import { FileSystem } from './FileSystem.js'
 import { GitObject } from './GitObject.js'
 
 export class GitWalkerFs {
-  constructor ({ fs: _fs, dir, gitdir }) {
-    const fs = new FileSystem(_fs)
+  constructor ({ fs, dir, gitdir }) {
     const walker = this
     this.treePromise = (async () => {
       const result = (await fs.readdirDeep(dir)).map(path => {

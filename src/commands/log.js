@@ -1,7 +1,7 @@
 // @ts-check
 import { GitRefManager } from '../managers/GitRefManager.js'
 import { GitShallowManager } from '../managers/GitShallowManager.js'
-import { FileSystem } from '../models/FileSystem.js'
+
 import { compareAge } from '../utils/compareAge.js'
 import { join } from '../utils/join.js'
 import { logCommit } from '../utils/logCommit.js'
@@ -33,7 +33,7 @@ import { cores } from '../utils/plugins.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref = 'HEAD'] - The commit to begin walking backwards through the history from
@@ -53,14 +53,13 @@ export async function log ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref = 'HEAD',
   depth = undefined,
   since = undefined, // Date
   signing = false
 }) {
   try {
-    const fs = new FileSystem(_fs)
     const sinceTimestamp =
       since === undefined ? undefined : Math.floor(since.valueOf() / 1000)
     // TODO: In the future, we may want to have an API where we return a

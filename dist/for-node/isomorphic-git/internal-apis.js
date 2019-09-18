@@ -4,7 +4,6 @@ Object.defineProperty(exports, '__esModule', { value: true });
 
 function _interopDefault (ex) { return (ex && (typeof ex === 'object') && 'default' in ex) ? ex['default'] : ex; }
 
-var pify = _interopDefault(require('pify'));
 var AsyncLock = _interopDefault(require('async-lock'));
 var pako = _interopDefault(require('pako'));
 var crc32 = _interopDefault(require('crc-32'));
@@ -12,6 +11,7 @@ var applyDelta = _interopDefault(require('git-apply-delta'));
 var marky = require('marky');
 var Hash = _interopDefault(require('sha.js/sha1'));
 var ignore = _interopDefault(require('ignore'));
+var pify = _interopDefault(require('pify'));
 var diff3Merge = _interopDefault(require('diff3'));
 var _path = _interopDefault(require('path'));
 
@@ -203,271 +203,6 @@ class GitError extends Error {
 
   toString () {
     return this.stack.toString()
-  }
-}
-
-function compareStrings (a, b) {
-  // https://stackoverflow.com/a/40355107/2168416
-  return -(a < b) || +(a > b)
-}
-
-function dirname (path) {
-  const last = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-  if (last === -1) return '.'
-  if (last === 0) return '/'
-  return path.slice(0, last)
-}
-
-async function sleep (ms) {
-  return new Promise((resolve, reject) => setTimeout(resolve, ms))
-}
-
-const delayedReleases = new Map();
-const fsmap = new WeakMap();
-/**
- * This is just a collection of helper functions really. At least that's how it started.
- */
-class FileSystem {
-  constructor (fs) {
-    // This is not actually the most logical place to put this, but in practice
-    // putting the check here should work great.
-    if (fs === undefined) {
-      throw new GitError(E.PluginUndefined, { plugin: 'fs' })
-    }
-    // This is sad... but preserving reference equality is now necessary
-    // to deal with cache invalidation in GitIndexManager.
-    if (fsmap.has(fs)) {
-      return fsmap.get(fs)
-    }
-    if (fsmap.has(fs._original_unwrapped_fs)) {
-      return fsmap.get(fs._original_unwrapped_fs)
-    }
-
-    if (typeof fs._original_unwrapped_fs !== 'undefined') return fs
-
-    if (
-      Object.getOwnPropertyDescriptor(fs, 'promises') &&
-      Object.getOwnPropertyDescriptor(fs, 'promises').enumerable
-    ) {
-      this._readFile = fs.promises.readFile.bind(fs.promises);
-      this._writeFile = fs.promises.writeFile.bind(fs.promises);
-      this._mkdir = fs.promises.mkdir.bind(fs.promises);
-      this._rmdir = fs.promises.rmdir.bind(fs.promises);
-      this._unlink = fs.promises.unlink.bind(fs.promises);
-      this._stat = fs.promises.stat.bind(fs.promises);
-      this._lstat = fs.promises.lstat.bind(fs.promises);
-      this._readdir = fs.promises.readdir.bind(fs.promises);
-      this._readlink = fs.promises.readlink.bind(fs.promises);
-      this._symlink = fs.promises.symlink.bind(fs.promises);
-    } else {
-      this._readFile = pify(fs.readFile.bind(fs));
-      this._writeFile = pify(fs.writeFile.bind(fs));
-      this._mkdir = pify(fs.mkdir.bind(fs));
-      this._rmdir = pify(fs.rmdir.bind(fs));
-      this._unlink = pify(fs.unlink.bind(fs));
-      this._stat = pify(fs.stat.bind(fs));
-      this._lstat = pify(fs.lstat.bind(fs));
-      this._readdir = pify(fs.readdir.bind(fs));
-      this._readlink = pify(fs.readlink.bind(fs));
-      this._symlink = pify(fs.symlink.bind(fs));
-    }
-    this._original_unwrapped_fs = fs;
-    fsmap.set(fs, this);
-  }
-
-  /**
-   * Return true if a file exists, false if it doesn't exist.
-   * Rethrows errors that aren't related to file existance.
-   */
-  async exists (filepath, options = {}) {
-    try {
-      await this._stat(filepath);
-      return true
-    } catch (err) {
-      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
-        return false
-      } else {
-        console.log('Unhandled error in "FileSystem.exists()" function', err);
-        throw err
-      }
-    }
-  }
-
-  /**
-   * Return the contents of a file if it exists, otherwise returns null.
-   */
-  async read (filepath, options = {}) {
-    try {
-      let buffer = await this._readFile(filepath, options);
-      // Convert plain ArrayBuffers to Buffers
-      if (typeof buffer !== 'string') {
-        buffer = Buffer.from(buffer);
-      }
-      return buffer
-    } catch (err) {
-      return null
-    }
-  }
-
-  /**
-   * Write a file (creating missing directories if need be) without throwing errors.
-   */
-  async write (filepath, contents, options = {}) {
-    try {
-      await this._writeFile(filepath, contents, options);
-      return
-    } catch (err) {
-      // Hmm. Let's try mkdirp and try again.
-      await this.mkdir(dirname(filepath));
-      await this._writeFile(filepath, contents, options);
-    }
-  }
-
-  /**
-   * Make a directory (or series of nested directories) without throwing an error if it already exists.
-   */
-  async mkdir (filepath, _selfCall = false) {
-    try {
-      await this._mkdir(filepath);
-      return
-    } catch (err) {
-      // If err is null then operation succeeded!
-      if (err === null) return
-      // If the directory already exists, that's OK!
-      if (err.code === 'EEXIST') return
-      // Avoid infinite loops of failure
-      if (_selfCall) throw err
-      // If we got a "no such file or directory error" backup and try again.
-      if (err.code === 'ENOENT') {
-        const parent = dirname(filepath);
-        // Check to see if we've gone too far
-        if (parent === '.' || parent === '/' || parent === filepath) throw err
-        // Infinite recursion, what could go wrong?
-        await this.mkdir(parent);
-        await this.mkdir(filepath, true);
-      }
-    }
-  }
-
-  /**
-   * Delete a file without throwing an error if it is already deleted.
-   */
-  async rm (filepath) {
-    try {
-      await this._unlink(filepath);
-    } catch (err) {
-      if (err.code !== 'ENOENT') throw err
-    }
-  }
-
-  /**
-   * Read a directory without throwing an error is the directory doesn't exist
-   */
-  async readdir (filepath) {
-    try {
-      const names = await this._readdir(filepath);
-      // Ordering is not guaranteed, and system specific (Windows vs Unix)
-      // so we must sort them ourselves.
-      names.sort(compareStrings);
-      return names
-    } catch (err) {
-      if (err.code === 'ENOTDIR') return null
-      return []
-    }
-  }
-
-  /**
-   * Return a flast list of all the files nested inside a directory
-   *
-   * Based on an elegant concurrent recursive solution from SO
-   * https://stackoverflow.com/a/45130990/2168416
-   */
-  async readdirDeep (dir) {
-    const subdirs = await this._readdir(dir);
-    const files = await Promise.all(
-      subdirs.map(async subdir => {
-        const res = dir + '/' + subdir;
-        return (await this._stat(res)).isDirectory()
-          ? this.readdirDeep(res)
-          : res
-      })
-    );
-    return files.reduce((a, f) => a.concat(f), [])
-  }
-
-  /**
-   * Return the Stats of a file/symlink if it exists, otherwise returns null.
-   * Rethrows errors that aren't related to file existance.
-   */
-  async lstat (filename) {
-    try {
-      const stats = await this._lstat(filename);
-      return stats
-    } catch (err) {
-      if (err.code === 'ENOENT') {
-        return null
-      }
-      throw err
-    }
-  }
-
-  /**
-   * Reads the contents of a symlink if it exists, otherwise returns null.
-   * Rethrows errors that aren't related to file existance.
-   */
-  async readlink (filename, opts = { encoding: 'buffer' }) {
-    // Note: FileSystem.readlink returns a buffer by default
-    // so we can dump it into GitObject.write just like any other file.
-    try {
-      return this._readlink(filename, opts)
-    } catch (err) {
-      if (err.code === 'ENOENT') {
-        return null
-      }
-      throw err
-    }
-  }
-
-  /**
-   * Write the contents of buffer to a symlink.
-   */
-  async writelink (filename, buffer) {
-    return this._symlink(buffer.toString('utf8'), filename)
-  }
-
-  async lock (filename, triesLeft = 3) {
-    // check to see if we still have it
-    if (delayedReleases.has(filename)) {
-      clearTimeout(delayedReleases.get(filename));
-      delayedReleases.delete(filename);
-      return
-    }
-    if (triesLeft === 0) {
-      throw new GitError(E.AcquireLockFileFail, { filename })
-    }
-    try {
-      await this._mkdir(`${filename}.lock`);
-    } catch (err) {
-      if (err.code === 'EEXIST') {
-        await sleep(100);
-        await this.lock(filename, triesLeft - 1);
-      }
-    }
-  }
-
-  async unlock (filename, delayRelease = 50) {
-    if (delayedReleases.has(filename)) {
-      throw new GitError(E.DoubleReleaseLockFileFail, { filename })
-    }
-    // Basically, we lie and say it was deleted ASAP.
-    // But really we wait a bit to see if you want to acquire it again.
-    delayedReleases.set(
-      filename,
-      setTimeout(async () => {
-        delayedReleases.delete(filename);
-        await this._rmdir(`${filename}.lock`);
-      }, delayRelease)
-    );
   }
 }
 
@@ -915,16 +650,14 @@ class GitConfig {
 }
 
 class GitConfigManager {
-  static async get ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs);
+  static async get ({ fs, gitdir }) {
     // We can improve efficiency later if needed.
     // TODO: read from full list of git config files
     const text = await fs.read(`${gitdir}/config`, { encoding: 'utf8' });
     return GitConfig.from(text)
   }
 
-  static async save ({ fs: _fs, gitdir, config }) {
-    const fs = new FileSystem(_fs);
+  static async save ({ fs, gitdir, config }) {
     // We can improve efficiency later if needed.
     // TODO: handle saving to the correct global/user/repo location
     await fs.write(`${gitdir}/config`, config.toString(), {
@@ -950,7 +683,7 @@ const GIT_FILES = ['config', 'description', 'index', 'shallow', 'commondir'];
 
 class GitRefManager {
   static async updateRemoteRefs ({
-    fs: _fs,
+    fs,
     gitdir,
     remote,
     refs,
@@ -960,7 +693,6 @@ class GitRefManager {
     prune = false,
     pruneTags = false
   }) {
-    const fs = new FileSystem(_fs);
     // Validate input
     for (const value of refs.values()) {
       if (!value.match(/[0-9a-f]{40}/)) {
@@ -1059,8 +791,7 @@ class GitRefManager {
   }
 
   // TODO: make this less crude?
-  static async writeRef ({ fs: _fs, gitdir, ref, value }) {
-    const fs = new FileSystem(_fs);
+  static async writeRef ({ fs, gitdir, ref, value }) {
     // Validate input
     if (!value.match(/[0-9a-f]{40}/)) {
       throw new GitError(E.NotAnOidFail, { value })
@@ -1068,8 +799,7 @@ class GitRefManager {
     await fs.write(join(gitdir, ref), `${value.trim()}\n`, 'utf8');
   }
 
-  static async writeSymbolicRef ({ fs: _fs, gitdir, ref, value }) {
-    const fs = new FileSystem(_fs);
+  static async writeSymbolicRef ({ fs, gitdir, ref, value }) {
     await fs.write(join(gitdir, ref), 'ref: ' + `${value.trim()}\n`, 'utf8');
   }
 
@@ -1077,8 +807,7 @@ class GitRefManager {
     return GitRefManager.deleteRefs({ fs, gitdir, refs: [ref] })
   }
 
-  static async deleteRefs ({ fs: _fs, gitdir, refs }) {
-    const fs = new FileSystem(_fs);
+  static async deleteRefs ({ fs, gitdir, refs }) {
     // Delete regular ref
     await Promise.all(refs.map(ref => fs.rm(join(gitdir, ref))));
     // Delete any packed ref
@@ -1096,8 +825,7 @@ class GitRefManager {
     }
   }
 
-  static async resolve ({ fs: _fs, gitdir, ref, depth = undefined }) {
-    const fs = new FileSystem(_fs);
+  static async resolve ({ fs, gitdir, ref, depth = undefined }) {
     if (depth !== undefined) {
       depth--;
       if (depth === -1) {
@@ -1140,8 +868,7 @@ class GitRefManager {
     }
   }
 
-  static async expand ({ fs: _fs, gitdir, ref }) {
-    const fs = new FileSystem(_fs);
+  static async expand ({ fs, gitdir, ref }) {
     // Is it a complete and valid SHA?
     if (ref.length === 40 && /[0-9a-f]{40}/.test(ref)) {
       return ref
@@ -1201,16 +928,14 @@ class GitRefManager {
     throw new GitError(E.ResolveRefError, { ref })
   }
 
-  static async packedRefs ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs);
+  static async packedRefs ({ fs, gitdir }) {
     const text = await fs.read(`${gitdir}/packed-refs`, { encoding: 'utf8' });
     const packed = GitPackedRefs.from(text);
     return packed.refs
   }
 
   // List all the refs that match the `filepath` prefix
-  static async listRefs ({ fs: _fs, gitdir, filepath }) {
-    const fs = new FileSystem(_fs);
+  static async listRefs ({ fs, gitdir, filepath }) {
     const packedMap = GitRefManager.packedRefs({ fs, gitdir });
     let files = null;
     try {
@@ -1236,8 +961,7 @@ class GitRefManager {
     return files
   }
 
-  static async listBranches ({ fs: _fs, gitdir, remote }) {
-    const fs = new FileSystem(_fs);
+  static async listBranches ({ fs, gitdir, remote }) {
     if (remote) {
       return GitRefManager.listRefs({
         fs,
@@ -1249,8 +973,7 @@ class GitRefManager {
     }
   }
 
-  static async listTags ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs);
+  static async listTags ({ fs, gitdir }) {
     const tags = await GitRefManager.listRefs({
       fs,
       gitdir,
@@ -1263,8 +986,7 @@ class GitRefManager {
 let lock = null;
 
 class GitShallowManager {
-  static async read ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs);
+  static async read ({ fs, gitdir }) {
     if (lock === null) lock = new AsyncLock();
     const filepath = join(gitdir, 'shallow');
     const oids = new Set();
@@ -1280,8 +1002,7 @@ class GitShallowManager {
     return oids
   }
 
-  static async write ({ fs: _fs, gitdir, oids }) {
-    const fs = new FileSystem(_fs);
+  static async write ({ fs, gitdir, oids }) {
     if (lock === null) lock = new AsyncLock();
     const filepath = join(gitdir, 'shallow');
     if (oids.size > 0) {
@@ -1686,8 +1407,7 @@ class GitObject {
   }
 }
 
-async function readObjectLoose ({ fs: _fs, gitdir, oid }) {
-  const fs = new FileSystem(_fs);
+async function readObjectLoose ({ fs, gitdir, oid }) {
   const source = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
   const file = await fs.read(`${gitdir}/${source}`);
   if (!file) {
@@ -2609,13 +2329,12 @@ function readPackIndex ({
 }
 
 async function readObjectPacked ({
-  fs: _fs,
+  fs,
   gitdir,
   oid,
   format = 'content',
   getExternalRefDelta
 }) {
-  const fs = new FileSystem(_fs);
   // Check to see if it's in a packfile.
   // Iterate through all the .idx files
   let list = await fs.readdir(join(gitdir, 'objects/pack'));
@@ -2645,8 +2364,7 @@ async function readObjectPacked ({
   return null
 }
 
-async function readObject ({ fs: _fs, gitdir, oid, format = 'content' }) {
-  const fs = new FileSystem(_fs);
+async function readObject ({ fs, gitdir, oid, format = 'content' }) {
   // Curry the current read method so that the packfile un-deltification
   // process can acquire external ref-deltas.
   const getExternalRefDelta = oid => readObject({ fs, gitdir, oid });
@@ -2735,11 +2453,9 @@ class PluginCore extends Map {
           'lstat',
           'mkdir',
           'readdir',
-          'readFile',
-          'rmdir',
-          'stat',
-          'unlink',
-          'writeFile'
+          'read',
+          'rm',
+          'write'
         ],
         pgp: ['sign', 'verify'],
         http: []
@@ -2797,11 +2513,10 @@ async function listCommitsAndTags ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   start,
   finish
 }) {
-  const fs = new FileSystem(_fs);
   const shallows = await GitShallowManager.read({ fs, gitdir });
   const startingSet = new Set();
   const finishingSet = new Set();
@@ -2850,6 +2565,11 @@ async function listCommitsAndTags ({
     await walk(oid);
   }
   return visited
+}
+
+function compareStrings (a, b) {
+  // https://stackoverflow.com/a/40355107/2168416
+  return -(a < b) || +(a > b)
 }
 
 function comparePath (a, b) {
@@ -2990,10 +2710,9 @@ async function listObjects ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oids
 }) {
-  const fs = new FileSystem(_fs);
   const visited = new Set();
   // We don't do the purest simplest recursion, because we can
   // avoid reading Blob objects entirely since the Tree objects
@@ -3048,7 +2767,7 @@ const types = {
 /**
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string[]} args.oids
@@ -3057,10 +2776,9 @@ async function pack ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oids
 }) {
-  const fs = new FileSystem(_fs);
   const hash = new Hash();
   const outputStream = [];
   function write (chunk, enc) {
@@ -3226,10 +2944,9 @@ async function uploadPack ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   advertiseRefs = false
 }) {
-  const fs = new FileSystem(_fs);
   try {
     if (advertiseRefs) {
       // Send a refs advertisement
@@ -3281,6 +2998,13 @@ function basename (path) {
   return path
 }
 
+function dirname (path) {
+  const last = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  if (last === -1) return '.'
+  if (last === 0) return '/'
+  return path.slice(0, last)
+}
+
 // I'm putting this in a Manager because I reckon it could benefit
 // from a LOT of cacheing.
 
@@ -3288,12 +3012,11 @@ function basename (path) {
 
 class GitIgnoreManager {
   static async isIgnored ({
-    fs: _fs,
+    fs,
     dir,
     gitdir = join(dir, '.git'),
     filepath
   }) {
-    const fs = new FileSystem(_fs);
     // ALWAYS ignore ".git" folders.
     if (basename(filepath) === '.git') return true
     // '.' is not a valid gitignore entry, so '.' is never ignored
@@ -3798,14 +3521,13 @@ function flatFileListToDirectoryStructure (files) {
 }
 
 async function writeObjectLoose ({
-  fs: _fs,
+  fs,
   gitdir,
   type,
   object,
   format,
   oid
 }) {
-  const fs = new FileSystem(_fs);
   if (format !== 'deflated') {
     throw new GitError(E.InternalFail, {
       message:
@@ -3821,7 +3543,7 @@ async function writeObjectLoose ({
 }
 
 async function writeObject ({
-  fs: _fs,
+  fs,
   gitdir,
   type,
   object,
@@ -3837,7 +3559,6 @@ async function writeObject ({
     object = Buffer.from(pako.deflate(object));
   }
   if (!dryRun) {
-    const fs = new FileSystem(_fs);
     await writeObjectLoose({ fs, gitdir, object, format: 'deflated', oid });
   }
   return oid
@@ -3876,8 +3597,7 @@ async function isIndexStale (fs, filepath) {
 }
 
 class GitIndexManager {
-  static async acquire ({ fs: _fs, filepath }, closure) {
-    const fs = new FileSystem(_fs);
+  static async acquire ({ fs, filepath }, closure) {
     if (lock$1 === null) lock$1 = new AsyncLock({ maxPending: Infinity });
     await lock$1.acquire(filepath, async function () {
       // Acquire a file lock while we're reading the index
@@ -4370,6 +4090,259 @@ class GitRemoteManager {
   }
 }
 
+async function sleep (ms) {
+  return new Promise((resolve, reject) => setTimeout(resolve, ms))
+}
+
+const delayedReleases = new Map();
+const fsmap = new WeakMap();
+/**
+ * This is just a collection of helper functions really. At least that's how it started.
+ */
+class FileSystem {
+  constructor (fs) {
+    // This is not actually the most logical place to put this, but in practice
+    // putting the check here should work great.
+    if (fs === undefined) {
+      throw new GitError(E.PluginUndefined, { plugin: 'fs' })
+    }
+    // This is sad... but preserving reference equality is now necessary
+    // to deal with cache invalidation in GitIndexManager.
+    if (fsmap.has(fs)) {
+      return fsmap.get(fs)
+    }
+    if (fsmap.has(fs._original_unwrapped_fs)) {
+      return fsmap.get(fs._original_unwrapped_fs)
+    }
+
+    if (typeof fs._original_unwrapped_fs !== 'undefined') return fs
+
+    if (
+      Object.getOwnPropertyDescriptor(fs, 'promises') &&
+      Object.getOwnPropertyDescriptor(fs, 'promises').enumerable
+    ) {
+      this._readFile = fs.promises.readFile.bind(fs.promises);
+      this._writeFile = fs.promises.writeFile.bind(fs.promises);
+      this._mkdir = fs.promises.mkdir.bind(fs.promises);
+      this._rmdir = fs.promises.rmdir.bind(fs.promises);
+      this._unlink = fs.promises.unlink.bind(fs.promises);
+      this._stat = fs.promises.stat.bind(fs.promises);
+      this._lstat = fs.promises.lstat.bind(fs.promises);
+      this._readdir = fs.promises.readdir.bind(fs.promises);
+      this._readlink = fs.promises.readlink.bind(fs.promises);
+      this._symlink = fs.promises.symlink.bind(fs.promises);
+    } else {
+      this._readFile = pify(fs.readFile.bind(fs));
+      this._writeFile = pify(fs.writeFile.bind(fs));
+      this._mkdir = pify(fs.mkdir.bind(fs));
+      this._rmdir = pify(fs.rmdir.bind(fs));
+      this._unlink = pify(fs.unlink.bind(fs));
+      this._stat = pify(fs.stat.bind(fs));
+      this._lstat = pify(fs.lstat.bind(fs));
+      this._readdir = pify(fs.readdir.bind(fs));
+      this._readlink = pify(fs.readlink.bind(fs));
+      this._symlink = pify(fs.symlink.bind(fs));
+    }
+    this._original_unwrapped_fs = fs;
+    fsmap.set(fs, this);
+  }
+
+  /**
+   * Return true if a file exists, false if it doesn't exist.
+   * Rethrows errors that aren't related to file existance.
+   */
+  async exists (filepath, options = {}) {
+    try {
+      await this._stat(filepath);
+      return true
+    } catch (err) {
+      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
+        return false
+      } else {
+        console.log('Unhandled error in "FileSystem.exists()" function', err);
+        throw err
+      }
+    }
+  }
+
+  /**
+   * Return the contents of a file if it exists, otherwise returns null.
+   */
+  async read (filepath, options = {}) {
+    try {
+      let buffer = await this._readFile(filepath, options);
+      // Convert plain ArrayBuffers to Buffers
+      if (typeof buffer !== 'string') {
+        buffer = Buffer.from(buffer);
+      }
+      return buffer
+    } catch (err) {
+      return null
+    }
+  }
+
+  /**
+   * Write a file (creating missing directories if need be) without throwing errors.
+   */
+  async write (filepath, contents, options = {}) {
+    try {
+      await this._writeFile(filepath, contents, options);
+      return
+    } catch (err) {
+      // Hmm. Let's try mkdirp and try again.
+      await this.mkdir(dirname(filepath));
+      await this._writeFile(filepath, contents, options);
+    }
+  }
+
+  /**
+   * Make a directory (or series of nested directories) without throwing an error if it already exists.
+   */
+  async mkdir (filepath, _selfCall = false) {
+    try {
+      await this._mkdir(filepath);
+      return
+    } catch (err) {
+      // If err is null then operation succeeded!
+      if (err === null) return
+      // If the directory already exists, that's OK!
+      if (err.code === 'EEXIST') return
+      // Avoid infinite loops of failure
+      if (_selfCall) throw err
+      // If we got a "no such file or directory error" backup and try again.
+      if (err.code === 'ENOENT') {
+        const parent = dirname(filepath);
+        // Check to see if we've gone too far
+        if (parent === '.' || parent === '/' || parent === filepath) throw err
+        // Infinite recursion, what could go wrong?
+        await this.mkdir(parent);
+        await this.mkdir(filepath, true);
+      }
+    }
+  }
+
+  /**
+   * Delete a file without throwing an error if it is already deleted.
+   */
+  async rm (filepath) {
+    try {
+      await this._unlink(filepath);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err
+    }
+  }
+
+  /**
+   * Read a directory without throwing an error is the directory doesn't exist
+   */
+  async readdir (filepath) {
+    try {
+      const names = await this._readdir(filepath);
+      // Ordering is not guaranteed, and system specific (Windows vs Unix)
+      // so we must sort them ourselves.
+      names.sort(compareStrings);
+      return names
+    } catch (err) {
+      if (err.code === 'ENOTDIR') return null
+      return []
+    }
+  }
+
+  /**
+   * Return a flast list of all the files nested inside a directory
+   *
+   * Based on an elegant concurrent recursive solution from SO
+   * https://stackoverflow.com/a/45130990/2168416
+   */
+  async readdirDeep (dir) {
+    const subdirs = await this._readdir(dir);
+    const files = await Promise.all(
+      subdirs.map(async subdir => {
+        const res = dir + '/' + subdir;
+        return (await this._stat(res)).isDirectory()
+          ? this.readdirDeep(res)
+          : res
+      })
+    );
+    return files.reduce((a, f) => a.concat(f), [])
+  }
+
+  /**
+   * Return the Stats of a file/symlink if it exists, otherwise returns null.
+   * Rethrows errors that aren't related to file existance.
+   */
+  async lstat (filename) {
+    try {
+      const stats = await this._lstat(filename);
+      return stats
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        return null
+      }
+      throw err
+    }
+  }
+
+  /**
+   * Reads the contents of a symlink if it exists, otherwise returns null.
+   * Rethrows errors that aren't related to file existance.
+   */
+  async readlink (filename, opts = { encoding: 'buffer' }) {
+    // Note: FileSystem.readlink returns a buffer by default
+    // so we can dump it into GitObject.write just like any other file.
+    try {
+      return this._readlink(filename, opts)
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        return null
+      }
+      throw err
+    }
+  }
+
+  /**
+   * Write the contents of buffer to a symlink.
+   */
+  async writelink (filename, buffer) {
+    return this._symlink(buffer.toString('utf8'), filename)
+  }
+
+  async lock (filename, triesLeft = 3) {
+    // check to see if we still have it
+    if (delayedReleases.has(filename)) {
+      clearTimeout(delayedReleases.get(filename));
+      delayedReleases.delete(filename);
+      return
+    }
+    if (triesLeft === 0) {
+      throw new GitError(E.AcquireLockFileFail, { filename })
+    }
+    try {
+      await this._mkdir(`${filename}.lock`);
+    } catch (err) {
+      if (err.code === 'EEXIST') {
+        await sleep(100);
+        await this.lock(filename, triesLeft - 1);
+      }
+    }
+  }
+
+  async unlock (filename, delayRelease = 50) {
+    if (delayedReleases.has(filename)) {
+      throw new GitError(E.DoubleReleaseLockFileFail, { filename })
+    }
+    // Basically, we lie and say it was deleted ASAP.
+    // But really we wait a bit to see if you want to acquire it again.
+    delayedReleases.set(
+      filename,
+      setTimeout(async () => {
+        delayedReleases.delete(filename);
+        await this._rmdir(`${filename}.lock`);
+      }, delayRelease)
+    );
+  }
+}
+
 class FIFO {
   constructor () {
     this._queue = [];
@@ -4717,8 +4690,7 @@ async function resolveTree ({ fs, gitdir, oid }) {
 }
 
 class GitWalkerRepo {
-  constructor ({ fs: _fs, gitdir, ref }) {
-    const fs = new FileSystem(_fs);
+  constructor ({ fs, gitdir, ref }) {
     this.fs = fs;
     this.gitdir = gitdir;
     this.mapPromise = (async () => {
@@ -4852,7 +4824,7 @@ const GitWalkerSymbol = Symbol('GitWalkerSymbol');
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref='HEAD'] - [required] The commit to walk
@@ -4864,10 +4836,9 @@ function TREE ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref = 'HEAD'
 }) {
-  const fs = new FileSystem(_fs);
   const o = Object.create(null);
   Object.defineProperty(o, GitWalkerSymbol, {
     value: function () {
@@ -5257,7 +5228,7 @@ async function walkBeta1 ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ourOid - The SHA-1 object id of our tree
@@ -5275,7 +5246,7 @@ async function mergeTree ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ourOid,
   baseOid,
   theirOid,
@@ -5284,7 +5255,6 @@ async function mergeTree ({
   theirName = 'theirs',
   dryRun = false
 }) {
-  const fs = new FileSystem(_fs);
   const ourTree = TREE({ core, dir, gitdir, fs, ref: ourOid });
   const baseTree = TREE({ core, dir, gitdir, fs, ref: baseOid });
   const theirTree = TREE({ core, dir, gitdir, fs, ref: theirOid });

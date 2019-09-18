@@ -9,11 +9,11 @@ describe('cores', () => {
   })
   it('cores.get', async () => {
     // Setup
-    const { _fs } = await makeFixture('test-cores')
-    cores.get('default').set('fs', _fs)
+    const { fs } = await makeFixture('test-cores')
+    cores.get('default').set('fs', fs)
     let error = null
     try {
-      cores.get('first').set('fs', _fs)
+      cores.get('first').set('fs', fs)
     } catch (err) {
       error = err
     }
@@ -22,22 +22,22 @@ describe('cores', () => {
   })
   it('core.create', async () => {
     // Setup
-    const { _fs } = await makeFixture('test-cores')
-    cores.get('default').set('fs', _fs)
+    const { fs } = await makeFixture('test-cores')
+    cores.get('default').set('fs', fs)
     let error = null
     try {
-      cores.create('second').set('fs', _fs)
+      cores.create('second').set('fs', fs)
     } catch (err) {
       error = err
     }
     expect(error).toBeNull()
-    expect(cores.get('second').get('fs')).toBe(_fs)
+    expect(cores.get('second').get('fs')).toBe(fs)
   })
   it('cores have separate plugins', async () => {
     // Setup
-    const { _fs } = await makeFixture('test-cores')
-    plugins.set('fs', _fs)
-    cores.create('third').set('foo', _fs)
+    const { fs } = await makeFixture('test-cores')
+    plugins.set('fs', fs)
+    cores.create('third').set('foo', fs)
     expect(cores.get('default').has('fs')).toBeTruthy()
     expect(cores.get('default').has('foo')).toBeFalsy()
     expect(cores.get('third').has('fs')).toBeFalsy()
@@ -59,10 +59,10 @@ describe('cores', () => {
   })
   it('unrecognized plugin', async () => {
     // Setup
-    const { _fs } = await makeFixture('test-cores')
+    const { fs } = await makeFixture('test-cores')
     let error = null
     try {
-      plugins.set('fz', _fs)
+      plugins.set('fz', fs)
     } catch (err) {
       error = err
     }

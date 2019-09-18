@@ -3,7 +3,7 @@ import globrex from 'globrex'
 
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
-import { FileSystem } from '../models/FileSystem.js'
+
 import { GitIndex } from '../models/GitIndex'
 import { E, GitError } from '../models/GitError.js'
 import { join } from '../utils/join.js'
@@ -23,7 +23,7 @@ import { walkBeta1 } from './walkBeta1'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
@@ -51,7 +51,7 @@ export async function checkout ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   remote = 'origin',
@@ -61,7 +61,6 @@ export async function checkout ({
   noCheckout = false
 }) {
   try {
-    const fs = new FileSystem(_fs)
     if (ref === undefined) {
       throw new GitError(E.MissingRequiredParameterError, {
         function: 'checkout',

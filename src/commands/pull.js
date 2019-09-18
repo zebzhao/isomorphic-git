@@ -1,6 +1,6 @@
 // @ts-check
 // import diff3 from 'node-diff3'
-import { FileSystem } from '../models/FileSystem.js'
+
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
 
@@ -16,7 +16,7 @@ import { merge } from './merge'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref] - Which branch to fetch. By default this is the currently checked out branch.
@@ -50,7 +50,7 @@ export async function pull ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref,
   fastForwardOnly = false,
   noGitSuffix = false,
@@ -72,7 +72,6 @@ export async function pull ({
   signingKey
 }) {
   try {
-    const fs = new FileSystem(_fs)
     // If ref is undefined, use 'HEAD'
     if (!ref) {
       ref = await currentBranch({ fs, gitdir })

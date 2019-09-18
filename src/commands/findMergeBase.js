@@ -1,5 +1,5 @@
 // @ts-check
-import { FileSystem } from '../models/FileSystem.js'
+
 import { GitCommit } from '../models/GitCommit.js'
 import { readObject } from '../storage/readObject.js'
 import { join } from '../utils/join.js'
@@ -14,7 +14,7 @@ export async function findMergeBase ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oids
 }) {
   // Note: right now, the tests are geared so that the output should match that of
@@ -22,7 +22,6 @@ export async function findMergeBase ({
   // because without the --octopus flag, git's output seems to depend on the ORDER of the oids,
   // and computing virtual merge bases is just too much for me to fathom right now.
   try {
-    const fs = new FileSystem(_fs)
     // If we start N independent walkers, one at each of the given `oids`, and walk backwards
     // through ancestors, eventually we'll discover a commit where each one of these N walkers
     // has passed through. So we just need to keep tallies until we find one where we've walked

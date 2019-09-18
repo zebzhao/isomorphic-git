@@ -5,7 +5,6 @@ Object.defineProperty(exports, '__esModule', { value: true });
 function _interopDefault (ex) { return (ex && (typeof ex === 'object') && 'default' in ex) ? ex['default'] : ex; }
 
 var ignore = _interopDefault(require('ignore'));
-var pify = _interopDefault(require('pify'));
 var AsyncLock = _interopDefault(require('async-lock'));
 var Hash = _interopDefault(require('sha.js/sha1'));
 var pako = _interopDefault(require('pako'));
@@ -259,9 +258,12 @@ function oauth2 (company, token) {
   }
 }
 
-function compareStrings (a, b) {
-  // https://stackoverflow.com/a/40355107/2168416
-  return -(a < b) || +(a > b)
+function basename (path) {
+  const last = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  if (last > -1) {
+    path = path.slice(last + 1);
+  }
+  return path
 }
 
 function dirname (path) {
@@ -269,267 +271,6 @@ function dirname (path) {
   if (last === -1) return '.'
   if (last === 0) return '/'
   return path.slice(0, last)
-}
-
-async function sleep (ms) {
-  return new Promise((resolve, reject) => setTimeout(resolve, ms))
-}
-
-const delayedReleases = new Map();
-const fsmap = new WeakMap();
-/**
- * This is just a collection of helper functions really. At least that's how it started.
- */
-class FileSystem {
-  constructor (fs) {
-    // This is not actually the most logical place to put this, but in practice
-    // putting the check here should work great.
-    if (fs === undefined) {
-      throw new GitError(E.PluginUndefined, { plugin: 'fs' })
-    }
-    // This is sad... but preserving reference equality is now necessary
-    // to deal with cache invalidation in GitIndexManager.
-    if (fsmap.has(fs)) {
-      return fsmap.get(fs)
-    }
-    if (fsmap.has(fs._original_unwrapped_fs)) {
-      return fsmap.get(fs._original_unwrapped_fs)
-    }
-
-    if (typeof fs._original_unwrapped_fs !== 'undefined') return fs
-
-    if (
-      Object.getOwnPropertyDescriptor(fs, 'promises') &&
-      Object.getOwnPropertyDescriptor(fs, 'promises').enumerable
-    ) {
-      this._readFile = fs.promises.readFile.bind(fs.promises);
-      this._writeFile = fs.promises.writeFile.bind(fs.promises);
-      this._mkdir = fs.promises.mkdir.bind(fs.promises);
-      this._rmdir = fs.promises.rmdir.bind(fs.promises);
-      this._unlink = fs.promises.unlink.bind(fs.promises);
-      this._stat = fs.promises.stat.bind(fs.promises);
-      this._lstat = fs.promises.lstat.bind(fs.promises);
-      this._readdir = fs.promises.readdir.bind(fs.promises);
-      this._readlink = fs.promises.readlink.bind(fs.promises);
-      this._symlink = fs.promises.symlink.bind(fs.promises);
-    } else {
-      this._readFile = pify(fs.readFile.bind(fs));
-      this._writeFile = pify(fs.writeFile.bind(fs));
-      this._mkdir = pify(fs.mkdir.bind(fs));
-      this._rmdir = pify(fs.rmdir.bind(fs));
-      this._unlink = pify(fs.unlink.bind(fs));
-      this._stat = pify(fs.stat.bind(fs));
-      this._lstat = pify(fs.lstat.bind(fs));
-      this._readdir = pify(fs.readdir.bind(fs));
-      this._readlink = pify(fs.readlink.bind(fs));
-      this._symlink = pify(fs.symlink.bind(fs));
-    }
-    this._original_unwrapped_fs = fs;
-    fsmap.set(fs, this);
-  }
-
-  /**
-   * Return true if a file exists, false if it doesn't exist.
-   * Rethrows errors that aren't related to file existance.
-   */
-  async exists (filepath, options = {}) {
-    try {
-      await this._stat(filepath);
-      return true
-    } catch (err) {
-      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
-        return false
-      } else {
-        console.log('Unhandled error in "FileSystem.exists()" function', err);
-        throw err
-      }
-    }
-  }
-
-  /**
-   * Return the contents of a file if it exists, otherwise returns null.
-   */
-  async read (filepath, options = {}) {
-    try {
-      let buffer = await this._readFile(filepath, options);
-      // Convert plain ArrayBuffers to Buffers
-      if (typeof buffer !== 'string') {
-        buffer = Buffer.from(buffer);
-      }
-      return buffer
-    } catch (err) {
-      return null
-    }
-  }
-
-  /**
-   * Write a file (creating missing directories if need be) without throwing errors.
-   */
-  async write (filepath, contents, options = {}) {
-    try {
-      await this._writeFile(filepath, contents, options);
-      return
-    } catch (err) {
-      // Hmm. Let's try mkdirp and try again.
-      await this.mkdir(dirname(filepath));
-      await this._writeFile(filepath, contents, options);
-    }
-  }
-
-  /**
-   * Make a directory (or series of nested directories) without throwing an error if it already exists.
-   */
-  async mkdir (filepath, _selfCall = false) {
-    try {
-      await this._mkdir(filepath);
-      return
-    } catch (err) {
-      // If err is null then operation succeeded!
-      if (err === null) return
-      // If the directory already exists, that's OK!
-      if (err.code === 'EEXIST') return
-      // Avoid infinite loops of failure
-      if (_selfCall) throw err
-      // If we got a "no such file or directory error" backup and try again.
-      if (err.code === 'ENOENT') {
-        const parent = dirname(filepath);
-        // Check to see if we've gone too far
-        if (parent === '.' || parent === '/' || parent === filepath) throw err
-        // Infinite recursion, what could go wrong?
-        await this.mkdir(parent);
-        await this.mkdir(filepath, true);
-      }
-    }
-  }
-
-  /**
-   * Delete a file without throwing an error if it is already deleted.
-   */
-  async rm (filepath) {
-    try {
-      await this._unlink(filepath);
-    } catch (err) {
-      if (err.code !== 'ENOENT') throw err
-    }
-  }
-
-  /**
-   * Read a directory without throwing an error is the directory doesn't exist
-   */
-  async readdir (filepath) {
-    try {
-      const names = await this._readdir(filepath);
-      // Ordering is not guaranteed, and system specific (Windows vs Unix)
-      // so we must sort them ourselves.
-      names.sort(compareStrings);
-      return names
-    } catch (err) {
-      if (err.code === 'ENOTDIR') return null
-      return []
-    }
-  }
-
-  /**
-   * Return a flast list of all the files nested inside a directory
-   *
-   * Based on an elegant concurrent recursive solution from SO
-   * https://stackoverflow.com/a/45130990/2168416
-   */
-  async readdirDeep (dir) {
-    const subdirs = await this._readdir(dir);
-    const files = await Promise.all(
-      subdirs.map(async subdir => {
-        const res = dir + '/' + subdir;
-        return (await this._stat(res)).isDirectory()
-          ? this.readdirDeep(res)
-          : res
-      })
-    );
-    return files.reduce((a, f) => a.concat(f), [])
-  }
-
-  /**
-   * Return the Stats of a file/symlink if it exists, otherwise returns null.
-   * Rethrows errors that aren't related to file existance.
-   */
-  async lstat (filename) {
-    try {
-      const stats = await this._lstat(filename);
-      return stats
-    } catch (err) {
-      if (err.code === 'ENOENT') {
-        return null
-      }
-      throw err
-    }
-  }
-
-  /**
-   * Reads the contents of a symlink if it exists, otherwise returns null.
-   * Rethrows errors that aren't related to file existance.
-   */
-  async readlink (filename, opts = { encoding: 'buffer' }) {
-    // Note: FileSystem.readlink returns a buffer by default
-    // so we can dump it into GitObject.write just like any other file.
-    try {
-      return this._readlink(filename, opts)
-    } catch (err) {
-      if (err.code === 'ENOENT') {
-        return null
-      }
-      throw err
-    }
-  }
-
-  /**
-   * Write the contents of buffer to a symlink.
-   */
-  async writelink (filename, buffer) {
-    return this._symlink(buffer.toString('utf8'), filename)
-  }
-
-  async lock (filename, triesLeft = 3) {
-    // check to see if we still have it
-    if (delayedReleases.has(filename)) {
-      clearTimeout(delayedReleases.get(filename));
-      delayedReleases.delete(filename);
-      return
-    }
-    if (triesLeft === 0) {
-      throw new GitError(E.AcquireLockFileFail, { filename })
-    }
-    try {
-      await this._mkdir(`${filename}.lock`);
-    } catch (err) {
-      if (err.code === 'EEXIST') {
-        await sleep(100);
-        await this.lock(filename, triesLeft - 1);
-      }
-    }
-  }
-
-  async unlock (filename, delayRelease = 50) {
-    if (delayedReleases.has(filename)) {
-      throw new GitError(E.DoubleReleaseLockFileFail, { filename })
-    }
-    // Basically, we lie and say it was deleted ASAP.
-    // But really we wait a bit to see if you want to acquire it again.
-    delayedReleases.set(
-      filename,
-      setTimeout(async () => {
-        delayedReleases.delete(filename);
-        await this._rmdir(`${filename}.lock`);
-      }, delayRelease)
-    );
-  }
-}
-
-function basename (path) {
-  const last = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-  if (last > -1) {
-    path = path.slice(last + 1);
-  }
-  return path
 }
 
 function normalizePath (path) {
@@ -557,12 +298,11 @@ function join (...parts) {
 
 class GitIgnoreManager {
   static async isIgnored ({
-    fs: _fs,
+    fs,
     dir,
     gitdir = join(dir, '.git'),
     filepath
   }) {
-    const fs = new FileSystem(_fs);
     // ALWAYS ignore ".git" folders.
     if (basename(filepath) === '.git') return true
     // '.' is not a valid gitignore entry, so '.' is never ignored
@@ -681,6 +421,11 @@ class BufferCursor {
     this._start += 4;
     return r
   }
+}
+
+function compareStrings (a, b) {
+  // https://stackoverflow.com/a/40355107/2168416
+  return -(a < b) || +(a > b)
 }
 
 /**
@@ -1331,14 +1076,13 @@ class GitObject {
 }
 
 async function writeObjectLoose ({
-  fs: _fs,
+  fs,
   gitdir,
   type,
   object,
   format,
   oid
 }) {
-  const fs = new FileSystem(_fs);
   if (format !== 'deflated') {
     throw new GitError(E.InternalFail, {
       message:
@@ -1354,7 +1098,7 @@ async function writeObjectLoose ({
 }
 
 async function writeObject ({
-  fs: _fs,
+  fs,
   gitdir,
   type,
   object,
@@ -1370,7 +1114,6 @@ async function writeObject ({
     object = Buffer.from(pako.deflate(object));
   }
   if (!dryRun) {
-    const fs = new FileSystem(_fs);
     await writeObjectLoose({ fs, gitdir, object, format: 'deflated', oid });
   }
   return oid
@@ -1409,8 +1152,7 @@ async function isIndexStale (fs, filepath) {
 }
 
 class GitIndexManager {
-  static async acquire ({ fs: _fs, filepath }, closure) {
-    const fs = new FileSystem(_fs);
+  static async acquire ({ fs, filepath }, closure) {
     if (lock === null) lock = new AsyncLock({ maxPending: Infinity });
     await lock.acquire(filepath, async function () {
       // Acquire a file lock while we're reading the index
@@ -1496,11 +1238,9 @@ class PluginCore extends Map {
           'lstat',
           'mkdir',
           'readdir',
-          'readFile',
-          'rmdir',
-          'stat',
-          'unlink',
-          'writeFile'
+          'read',
+          'rm',
+          'write'
         ],
         pgp: ['sign', 'verify'],
         http: []
@@ -1561,7 +1301,7 @@ const cores = {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.filepath - The path to the file to add to the index
@@ -1582,13 +1322,12 @@ async function add ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   filepath
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const added = [];
     await GitIndexManager.acquire(
       { fs, filepath: `${gitdir}/index` },
@@ -1903,16 +1642,14 @@ class GitConfig {
 }
 
 class GitConfigManager {
-  static async get ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs);
+  static async get ({ fs, gitdir }) {
     // We can improve efficiency later if needed.
     // TODO: read from full list of git config files
     const text = await fs.read(`${gitdir}/config`, { encoding: 'utf8' });
     return GitConfig.from(text)
   }
 
-  static async save ({ fs: _fs, gitdir, config }) {
-    const fs = new FileSystem(_fs);
+  static async save ({ fs, gitdir, config }) {
     // We can improve efficiency later if needed.
     // TODO: handle saving to the correct global/user/repo location
     await fs.write(`${gitdir}/config`, config.toString(), {
@@ -1928,7 +1665,7 @@ class GitConfigManager {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.remote - The name of the remote
@@ -1946,13 +1683,12 @@ async function addRemote ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   remote,
   url,
   force = false
 }) {
   try {
-    const fs = new FileSystem(_fs);
     if (remote === undefined) {
       throw new GitError(E.MissingRequiredParameterError, {
         function: 'addRemote',
@@ -2179,7 +1915,7 @@ const GIT_FILES = ['config', 'description', 'index', 'shallow', 'commondir'];
 
 class GitRefManager {
   static async updateRemoteRefs ({
-    fs: _fs,
+    fs,
     gitdir,
     remote,
     refs,
@@ -2189,7 +1925,6 @@ class GitRefManager {
     prune = false,
     pruneTags = false
   }) {
-    const fs = new FileSystem(_fs);
     // Validate input
     for (const value of refs.values()) {
       if (!value.match(/[0-9a-f]{40}/)) {
@@ -2288,8 +2023,7 @@ class GitRefManager {
   }
 
   // TODO: make this less crude?
-  static async writeRef ({ fs: _fs, gitdir, ref, value }) {
-    const fs = new FileSystem(_fs);
+  static async writeRef ({ fs, gitdir, ref, value }) {
     // Validate input
     if (!value.match(/[0-9a-f]{40}/)) {
       throw new GitError(E.NotAnOidFail, { value })
@@ -2297,8 +2031,7 @@ class GitRefManager {
     await fs.write(join(gitdir, ref), `${value.trim()}\n`, 'utf8');
   }
 
-  static async writeSymbolicRef ({ fs: _fs, gitdir, ref, value }) {
-    const fs = new FileSystem(_fs);
+  static async writeSymbolicRef ({ fs, gitdir, ref, value }) {
     await fs.write(join(gitdir, ref), 'ref: ' + `${value.trim()}\n`, 'utf8');
   }
 
@@ -2306,8 +2039,7 @@ class GitRefManager {
     return GitRefManager.deleteRefs({ fs, gitdir, refs: [ref] })
   }
 
-  static async deleteRefs ({ fs: _fs, gitdir, refs }) {
-    const fs = new FileSystem(_fs);
+  static async deleteRefs ({ fs, gitdir, refs }) {
     // Delete regular ref
     await Promise.all(refs.map(ref => fs.rm(join(gitdir, ref))));
     // Delete any packed ref
@@ -2325,8 +2057,7 @@ class GitRefManager {
     }
   }
 
-  static async resolve ({ fs: _fs, gitdir, ref, depth = undefined }) {
-    const fs = new FileSystem(_fs);
+  static async resolve ({ fs, gitdir, ref, depth = undefined }) {
     if (depth !== undefined) {
       depth--;
       if (depth === -1) {
@@ -2369,8 +2100,7 @@ class GitRefManager {
     }
   }
 
-  static async expand ({ fs: _fs, gitdir, ref }) {
-    const fs = new FileSystem(_fs);
+  static async expand ({ fs, gitdir, ref }) {
     // Is it a complete and valid SHA?
     if (ref.length === 40 && /[0-9a-f]{40}/.test(ref)) {
       return ref
@@ -2430,16 +2160,14 @@ class GitRefManager {
     throw new GitError(E.ResolveRefError, { ref })
   }
 
-  static async packedRefs ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs);
+  static async packedRefs ({ fs, gitdir }) {
     const text = await fs.read(`${gitdir}/packed-refs`, { encoding: 'utf8' });
     const packed = GitPackedRefs.from(text);
     return packed.refs
   }
 
   // List all the refs that match the `filepath` prefix
-  static async listRefs ({ fs: _fs, gitdir, filepath }) {
-    const fs = new FileSystem(_fs);
+  static async listRefs ({ fs, gitdir, filepath }) {
     const packedMap = GitRefManager.packedRefs({ fs, gitdir });
     let files = null;
     try {
@@ -2465,8 +2193,7 @@ class GitRefManager {
     return files
   }
 
-  static async listBranches ({ fs: _fs, gitdir, remote }) {
-    const fs = new FileSystem(_fs);
+  static async listBranches ({ fs, gitdir, remote }) {
     if (remote) {
       return GitRefManager.listRefs({
         fs,
@@ -2478,8 +2205,7 @@ class GitRefManager {
     }
   }
 
-  static async listTags ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs);
+  static async listTags ({ fs, gitdir }) {
     const tags = await GitRefManager.listRefs({
       fs,
       gitdir,
@@ -2669,8 +2395,7 @@ ${obj.signature ? obj.signature : ''}`
   }
 }
 
-async function readObjectLoose ({ fs: _fs, gitdir, oid }) {
-  const fs = new FileSystem(_fs);
+async function readObjectLoose ({ fs, gitdir, oid }) {
   const source = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
   const file = await fs.read(`${gitdir}/${source}`);
   if (!file) {
@@ -3490,13 +3215,12 @@ function readPackIndex ({
 }
 
 async function readObjectPacked ({
-  fs: _fs,
+  fs,
   gitdir,
   oid,
   format = 'content',
   getExternalRefDelta
 }) {
-  const fs = new FileSystem(_fs);
   // Check to see if it's in a packfile.
   // Iterate through all the .idx files
   let list = await fs.readdir(join(gitdir, 'objects/pack'));
@@ -3526,8 +3250,7 @@ async function readObjectPacked ({
   return null
 }
 
-async function readObject ({ fs: _fs, gitdir, oid, format = 'content' }) {
-  const fs = new FileSystem(_fs);
+async function readObject ({ fs, gitdir, oid, format = 'content' }) {
   // Curry the current read method so that the packfile un-deltification
   // process can acquire external ref-deltas.
   const getExternalRefDelta = oid => readObject({ fs, gitdir, oid });
@@ -3599,7 +3322,7 @@ async function readObject ({ fs: _fs, gitdir, oid, format = 'content' }) {
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.path - The key of the git config entry
@@ -3633,14 +3356,13 @@ async function config (args) {
     core = 'default',
     dir,
     gitdir = join(dir, '.git'),
-    fs: _fs = cores.get(core).get('fs'),
+    fs = cores.get(core).get('fs'),
     all = false,
     append = false,
     path,
     value
   } = args;
   try {
-    const fs = new FileSystem(_fs);
     const config = await GitConfigManager.get({ fs, gitdir });
     // This carefully distinguishes between
     // 1) there is no 'value' argument (do a "get")
@@ -3693,7 +3415,7 @@ async function normalizeAuthorObject ({ fs, gitdir, author = {} }) {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ref - What to name the tag
@@ -3728,7 +3450,7 @@ async function annotatedTag ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref,
   tagger,
   message = ref,
@@ -3738,8 +3460,6 @@ async function annotatedTag ({
   force = false
 }) {
   try {
-    const fs = new FileSystem(_fs);
-
     if (ref === undefined) {
       throw new GitError(E.MissingRequiredParameterError, {
         function: 'annotatedTag',
@@ -3807,7 +3527,7 @@ async function annotatedTag ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ref - What to name the branch
@@ -3824,12 +3544,11 @@ async function branch ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref,
   checkout = false
 }) {
   try {
-    const fs = new FileSystem(_fs);
     if (ref === undefined) {
       throw new GitError(E.MissingRequiredParameterError, {
         function: 'branch',
@@ -4099,8 +3818,7 @@ async function resolveTree ({ fs, gitdir, oid }) {
 }
 
 class GitWalkerRepo {
-  constructor ({ fs: _fs, gitdir, ref }) {
-    const fs = new FileSystem(_fs);
+  constructor ({ fs, gitdir, ref }) {
     this.fs = fs;
     this.gitdir = gitdir;
     this.mapPromise = (async () => {
@@ -4234,7 +3952,7 @@ const GitWalkerSymbol = Symbol('GitWalkerSymbol');
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref='HEAD'] - [required] The commit to walk
@@ -4246,10 +3964,9 @@ function TREE ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref = 'HEAD'
 }) {
-  const fs = new FileSystem(_fs);
   const o = Object.create(null);
   Object.defineProperty(o, GitWalkerSymbol, {
     value: function () {
@@ -4261,8 +3978,7 @@ function TREE ({
 }
 
 class GitWalkerFs {
-  constructor ({ fs: _fs, dir, gitdir }) {
-    const fs = new FileSystem(_fs);
+  constructor ({ fs, dir, gitdir }) {
     const walker = this;
     this.treePromise = (async () => {
       const result = (await fs.readdirDeep(dir)).map(path => {
@@ -4382,7 +4098,7 @@ class GitWalkerFs {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - The [git directory](dir-vs-gitdir.md) path
  *
@@ -4393,9 +4109,8 @@ function WORKDIR ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs')
+  fs = cores.get(core).get('fs')
 }) {
-  const fs = new FileSystem(_fs);
   const o = Object.create(null);
   Object.defineProperty(o, GitWalkerSymbol, {
     value: function () {
@@ -4782,7 +4497,7 @@ async function walkBeta1 ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
@@ -4810,7 +4525,7 @@ async function checkout ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   remote = 'origin',
@@ -4820,7 +4535,6 @@ async function checkout ({
   noCheckout = false
 }) {
   try {
-    const fs = new FileSystem(_fs);
     if (ref === undefined) {
       throw new GitError(E.MissingRequiredParameterError, {
         function: 'checkout',
@@ -5517,8 +5231,7 @@ class GitRemoteManager {
 let lock$1 = null;
 
 class GitShallowManager {
-  static async read ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs);
+  static async read ({ fs, gitdir }) {
     if (lock$1 === null) lock$1 = new AsyncLock();
     const filepath = join(gitdir, 'shallow');
     const oids = new Set();
@@ -5534,8 +5247,7 @@ class GitShallowManager {
     return oids
   }
 
-  static async write ({ fs: _fs, gitdir, oids }) {
-    const fs = new FileSystem(_fs);
+  static async write ({ fs, gitdir, oids }) {
     if (lock$1 === null) lock$1 = new AsyncLock();
     const filepath = join(gitdir, 'shallow');
     if (oids.size > 0) {
@@ -5554,19 +5266,17 @@ class GitShallowManager {
   }
 }
 
-async function hasObjectLoose ({ fs: _fs, gitdir, oid }) {
-  const fs = new FileSystem(_fs);
+async function hasObjectLoose ({ fs, gitdir, oid }) {
   const source = `objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
   return fs.exists(`${gitdir}/${source}`)
 }
 
 async function hasObjectPacked ({
-  fs: _fs,
+  fs,
   gitdir,
   oid,
   getExternalRefDelta
 }) {
-  const fs = new FileSystem(_fs);
   // Check to see if it's in a packfile.
   // Iterate through all the .idx files
   let list = await fs.readdir(join(gitdir, 'objects/pack'));
@@ -5588,8 +5298,7 @@ async function hasObjectPacked ({
   return false
 }
 
-async function hasObject ({ fs: _fs, gitdir, oid, format = 'content' }) {
-  const fs = new FileSystem(_fs);
+async function hasObject ({ fs, gitdir, oid, format = 'content' }) {
   // Curry the current read method so that the packfile un-deltification
   // process can acquire external ref-deltas.
   const getExternalRefDelta = oid => readObject({ fs, gitdir, oid });
@@ -5958,7 +5667,7 @@ function writeUploadPackRequest ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.url] - The URL of the remote repository. Will be gotten from gitconfig if absent.
@@ -6002,7 +5711,7 @@ async function fetch ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   ref = 'HEAD',
@@ -6038,7 +5747,6 @@ async function fetch ({
         'The `onprogress` callback has been deprecated. Please use the more generic `emitter` EventEmitter argument instead.'
       );
     }
-    const fs = new FileSystem(_fs);
     const response = await fetchPackfile({
       core,
       gitdir,
@@ -6133,7 +5841,7 @@ async function fetch ({
 async function fetchPackfile ({
   core,
   gitdir,
-  fs: _fs,
+  fs,
   emitter,
   emitterPrefix,
   ref,
@@ -6156,7 +5864,6 @@ async function fetchPackfile ({
   prune,
   pruneTags
 }) {
-  const fs = new FileSystem(_fs);
   // Sanity checks
   if (depth !== null) {
     if (Number.isNaN(parseInt(depth))) {
@@ -6389,7 +6096,7 @@ async function fetchPackfile ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {boolean} [args.bare = false] - Initialize a bare repository
@@ -6405,10 +6112,9 @@ async function init ({
   bare = false,
   dir,
   gitdir = bare ? dir : join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs')
+  fs = cores.get(core).get('fs')
 }) {
   try {
-    const fs = new FileSystem(_fs);
     let folders = [
       'hooks',
       'info',
@@ -6447,7 +6153,7 @@ async function init ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.url - The URL of the remote repository
@@ -6487,7 +6193,7 @@ async function clone ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   url,
@@ -6520,7 +6226,6 @@ async function clone ({
         'The `onprogress` callback has been deprecated. Please use the more generic `emitter` EventEmitter argument instead.'
       );
     }
-    const fs = new FileSystem(_fs);
     username = username === undefined ? authUsername : username;
     password = password === undefined ? authPassword : password;
     await init({ gitdir, fs });
@@ -6594,7 +6299,7 @@ async function clone ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.message - The commit message to use.
@@ -6630,7 +6335,7 @@ async function commit ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   message,
   author,
   committer,
@@ -6642,8 +6347,6 @@ async function commit ({
   tree
 }) {
   try {
-    const fs = new FileSystem(_fs);
-
     if (!ref) {
       ref = await GitRefManager.resolve({
         fs,
@@ -6763,7 +6466,7 @@ async function commit ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {boolean} [args.fullname = false] - Return the full path (e.g. "refs/heads/master") instead of the abbreviated form.
@@ -6780,11 +6483,10 @@ async function currentBranch ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   fullname = false
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const ref = await GitRefManager.resolve({
       fs,
       gitdir,
@@ -6809,7 +6511,7 @@ async function currentBranch ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ref - The branch to delete
@@ -6825,11 +6527,10 @@ async function deleteBranch ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref
 }) {
   try {
-    const fs = new FileSystem(_fs);
     if (ref === undefined) {
       throw new GitError(E.MissingRequiredParameterError, {
         function: 'deleteBranch',
@@ -6877,7 +6578,7 @@ async function deleteBranch ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ref - The ref to delete
@@ -6893,11 +6594,10 @@ async function deleteRef ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref
 }) {
   try {
-    const fs = new FileSystem(_fs);
     await GitRefManager.deleteRef({ fs, gitdir, ref });
   } catch (err) {
     err.caller = 'git.deleteRef';
@@ -6912,7 +6612,7 @@ async function deleteRef ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.remote - The name of the remote to delete
@@ -6928,11 +6628,10 @@ async function deleteRemote ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   remote
 }) {
   try {
-    const fs = new FileSystem(_fs);
     if (remote === undefined) {
       throw new GitError(E.MissingRequiredParameterError, {
         function: 'deleteRemote',
@@ -6955,7 +6654,7 @@ async function deleteRemote ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ref - The tag to delete
@@ -6971,11 +6670,10 @@ async function deleteTag ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref
 }) {
   try {
-    const fs = new FileSystem(_fs);
     if (ref === undefined) {
       throw new GitError(E.MissingRequiredParameterError, {
         function: 'deleteTag',
@@ -6990,8 +6688,7 @@ async function deleteTag ({
   }
 }
 
-async function expandOidLoose ({ fs: _fs, gitdir, oid: short }) {
-  const fs = new FileSystem(_fs);
+async function expandOidLoose ({ fs, gitdir, oid: short }) {
   const prefix = short.slice(0, 2);
   const objectsSuffixes = await fs.readdir(`${gitdir}/objects/${prefix}`);
   return objectsSuffixes
@@ -7000,12 +6697,11 @@ async function expandOidLoose ({ fs: _fs, gitdir, oid: short }) {
 }
 
 async function expandOidPacked ({
-  fs: _fs,
+  fs,
   gitdir,
   oid: short,
   getExternalRefDelta
 }) {
-  const fs = new FileSystem(_fs);
   // Iterate through all the .pack files
   const results = [];
   let list = await fs.readdir(join(gitdir, 'objects/pack'));
@@ -7026,11 +6722,10 @@ async function expandOidPacked ({
   return results
 }
 
-async function expandOid ({ fs: _fs, gitdir, oid: short }) {
-  const fs = new FileSystem(_fs);
+async function expandOid ({ fs, gitdir, oid: short }) {
   // Curry the current read method so that the packfile un-deltification
   // process can acquire external ref-deltas.
-  const getExternalRefDelta = oid => readObject({ fs: _fs, gitdir, oid });
+  const getExternalRefDelta = oid => readObject({ fs, gitdir, oid });
 
   const results1 = await expandOidLoose({ fs, gitdir, oid: short });
   const results2 = await expandOidPacked({
@@ -7060,7 +6755,7 @@ async function expandOid ({ fs: _fs, gitdir, oid: short }) {
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.oid - The shortened oid prefix to expand (like "0414d2a")
@@ -7076,11 +6771,10 @@ async function expandOid$1 ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oid
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const fullOid = await expandOid({
       fs,
       gitdir,
@@ -7100,7 +6794,7 @@ async function expandOid$1 ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ref - The ref to expand (like "v1.0.0")
@@ -7116,11 +6810,10 @@ async function expandRef ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const fullref = await GitRefManager.expand({
       fs,
       gitdir,
@@ -7144,7 +6837,7 @@ async function findMergeBase ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oids
 }) {
   // Note: right now, the tests are geared so that the output should match that of
@@ -7152,7 +6845,6 @@ async function findMergeBase ({
   // because without the --octopus flag, git's output seems to depend on the ORDER of the oids,
   // and computing virtual merge bases is just too much for me to fathom right now.
   try {
-    const fs = new FileSystem(_fs);
     // If we start N independent walkers, one at each of the given `oids`, and walk backwards
     // through ancestors, eventually we'll discover a commit where each one of these N walkers
     // has passed through. So we just need to keep tallies until we find one where we've walked
@@ -7212,7 +6904,7 @@ async function findMergeBase ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.filepath - The file directory to start searching in.
  *
  * @returns {Promise<string>} Resolves successfully with a root git directory path
@@ -7227,11 +6919,10 @@ async function findMergeBase ({
  */
 async function findRoot ({
   core = 'default',
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   filepath
 }) {
   try {
-    const fs = new FileSystem(_fs);
     return _findRoot(fs, filepath)
   } catch (err) {
     err.caller = 'git.findRoot';
@@ -7434,7 +7125,7 @@ async function hashBlob ({ core = 'default', object }) {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.filepath - The path to the .pack file to index
@@ -7452,13 +7143,12 @@ async function indexPack ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   filepath
 }) {
   try {
-    const fs = new FileSystem(_fs);
     filepath = join(dir, filepath);
     const pack = await fs.read(filepath);
     const getExternalRefDelta = oid => readObject({ fs, gitdir, oid });
@@ -7482,7 +7172,7 @@ async function indexPack ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.oid - The descendent commit
@@ -7502,13 +7192,12 @@ async function isDescendent ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oid,
   ancestor,
   depth = -1
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const shallows = await GitShallowManager.read({ fs, gitdir });
     if (!oid) {
       throw new GitError(E.MissingRequiredParameterError, {
@@ -7582,7 +7271,7 @@ async function isDescendent ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.remote] - Instead of the branches in `refs/heads`, list the branches in `refs/remotes/${remote}`.
@@ -7600,11 +7289,10 @@ async function listBranches ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   remote = undefined
 }) {
   try {
-    const fs = new FileSystem(_fs);
     return GitRefManager.listBranches({ fs, gitdir, remote })
   } catch (err) {
     err.caller = 'git.listBranches';
@@ -7616,11 +7304,10 @@ async function listCommitsAndTags ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   start,
   finish
 }) {
-  const fs = new FileSystem(_fs);
   const shallows = await GitShallowManager.read({ fs, gitdir });
   const startingSet = new Set();
   const finishingSet = new Set();
@@ -7741,7 +7428,7 @@ async function listCommitsAndTags ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.oid - The SHA-1 object id to get
@@ -7795,14 +7482,13 @@ async function readObject$1 ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oid,
   format = 'parsed',
   filepath = undefined,
   encoding = undefined
 }) {
   try {
-    const fs = new FileSystem(_fs);
     if (filepath !== undefined) {
       // Ensure there are no leading or trailing directory separators.
       // I was going to do this automatically, but then found that the Git Terminal for Windows
@@ -7910,7 +7596,7 @@ async function resolveFile ({ fs, gitdir, tree, pathArray, oid, filepath }) {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref] - Return a list of all the files in the commit at `ref` instead of the files currently in the git index (aka staging area)
@@ -7930,11 +7616,10 @@ async function listFiles ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref
 }) {
   try {
-    const fs = new FileSystem(_fs);
     let filenames;
     if (ref) {
       const oid = await GitRefManager.resolve({ gitdir, fs, ref });
@@ -7981,7 +7666,7 @@ async function accumulateFilesFromOid ({ gitdir, fs, oid, filenames, prefix }) {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  *
@@ -7996,10 +7681,9 @@ async function listRemotes ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs')
+  fs = cores.get(core).get('fs')
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const config = await GitConfigManager.get({ fs, gitdir });
     const remoteNames = await config.getSubsections('remote');
     const remotes = Promise.all(
@@ -8022,7 +7706,7 @@ async function listRemotes ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  *
@@ -8037,10 +7721,9 @@ async function listTags ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs')
+  fs = cores.get(core).get('fs')
 }) {
   try {
-    const fs = new FileSystem(_fs);
     return GitRefManager.listTags({ fs, gitdir })
   } catch (err) {
     err.caller = 'git.listTags';
@@ -8104,7 +7787,7 @@ async function logCommit ({ fs, gitdir, oid, signing }) {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref = 'HEAD'] - The commit to begin walking backwards through the history from
@@ -8124,14 +7807,13 @@ async function log$1 ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref = 'HEAD',
   depth = undefined,
   since = undefined, // Date
   signing = false
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const sinceTimestamp =
       since === undefined ? undefined : Math.floor(since.valueOf() / 1000);
     // TODO: In the future, we may want to have an API where we return a
@@ -8201,7 +7883,7 @@ async function findChangedFiles ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   ourOid,
@@ -8210,7 +7892,6 @@ async function findChangedFiles ({
 }) {
   // Adapted from: http://gitlet.maryrosecook.com/docs/gitlet.html#section-220
   try {
-    const fs = new FileSystem(_fs);
     let count = 0;
     return await walkBeta1({
       fs,
@@ -8358,7 +8039,7 @@ function mergeFile ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ourRef] - The branch receiving the merge. If undefined, defaults to the current branch.
@@ -8384,7 +8065,7 @@ async function merge ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   ourRef,
@@ -8399,7 +8080,6 @@ async function merge ({
   signingKey
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const currentRef = await currentBranch({ fs, gitdir, fullname: true });
     if (ourRef === undefined) {
       ourRef = currentRef;
@@ -8672,7 +8352,7 @@ const types = {
 /**
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string[]} args.oids
@@ -8681,10 +8361,9 @@ async function pack ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oids
 }) {
-  const fs = new FileSystem(_fs);
   const hash = new Hash();
   const outputStream = [];
   function write (chunk, enc) {
@@ -8746,7 +8425,7 @@ async function pack ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string[]} args.oids - An array of SHA-1 object ids to be included in the packfile
@@ -8768,12 +8447,11 @@ async function packObjects ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oids,
   write = false
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const buffers = await pack({ core, gitdir, fs, oids });
     const packfile = await collect(buffers);
     const packfileSha = packfile.slice(-20).toString('hex');
@@ -8801,7 +8479,7 @@ async function packObjects ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref] - Which branch to fetch. By default this is the currently checked out branch.
@@ -8835,7 +8513,7 @@ async function pull ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref,
   fastForwardOnly = false,
   noGitSuffix = false,
@@ -8857,7 +8535,6 @@ async function pull ({
   signingKey
 }) {
   try {
-    const fs = new FileSystem(_fs);
     // If ref is undefined, use 'HEAD'
     if (!ref) {
       ref = await currentBranch({ fs, gitdir });
@@ -8963,10 +8640,9 @@ async function listObjects ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   oids
 }) {
-  const fs = new FileSystem(_fs);
   const visited = new Set();
   // We don't do the purest simplest recursion, because we can
   // avoid reading Blob objects entirely since the Tree objects
@@ -9032,7 +8708,7 @@ async function listObjects ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref] - Which branch to push. By default this is the currently checked out branch.
@@ -9067,7 +8743,7 @@ async function push ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   ref,
@@ -9088,7 +8764,6 @@ async function push ({
   headers = {}
 }) {
   try {
-    const fs = new FileSystem(_fs);
     // TODO: Figure out how pushing tags works. (This only works for branches.)
     if (url === undefined) {
       url = await config({ fs, gitdir, path: `remote.${remote}.url` });
@@ -9251,7 +8926,7 @@ async function push ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.filepath - The path to the file to remove from the index
@@ -9267,11 +8942,10 @@ async function remove ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   filepath
 }) {
   try {
-    const fs = new FileSystem(_fs);
     await GitIndexManager.acquire(
       { fs, filepath: `${gitdir}/index` },
       async function (index) {
@@ -9294,7 +8968,7 @@ async function remove ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.filepath - The path to the file to reset in the index
@@ -9311,12 +8985,11 @@ async function resetIndex ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   filepath,
   ref = 'HEAD'
 }) {
   try {
-    const fs = new FileSystem(_fs);
     // Resolve commit
     let oid = await GitRefManager.resolve({ fs, gitdir, ref });
     let workdirOid;
@@ -9381,7 +9054,7 @@ async function resetIndex ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ref - The ref to resolve
@@ -9400,12 +9073,11 @@ async function resolveRef ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref,
   depth
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const oid = await GitRefManager.resolve({
       fs,
       gitdir,
@@ -9492,7 +9164,7 @@ class SignedGitCommit extends GitCommit {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.openpgp - An instance of the [OpenPGP library](https://unpkg.com/openpgp%402.6.2)
@@ -9516,12 +9188,11 @@ async function sign ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   privateKeys,
   openpgp
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const oid = await GitRefManager.resolve({ fs, gitdir, ref: 'HEAD' });
     const { type, object } = await readObject({ fs, gitdir, oid });
     if (type !== 'commit') {
@@ -9586,7 +9257,7 @@ async function sign ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.filepath - The path to the file to query
@@ -9602,11 +9273,10 @@ async function status ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   filepath
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const ignored = await GitIgnoreManager.isIgnored({
       gitdir,
       dir,
@@ -9777,8 +9447,7 @@ async function getTree ({ fs, gitdir, oid }) {
 }
 
 class GitWalkerIndex {
-  constructor ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs);
+  constructor ({ fs, gitdir }) {
     this.treePromise = (async () => {
       let result;
       await GitIndexManager.acquire(
@@ -9882,7 +9551,7 @@ class GitWalkerIndex {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  *
@@ -9893,9 +9562,8 @@ function STAGE ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs')
+  fs = cores.get(core).get('fs')
 }) {
-  const fs = new FileSystem(_fs);
   const o = Object.create(null);
   Object.defineProperty(o, GitWalkerSymbol, {
     value: function () {
@@ -10030,7 +9698,7 @@ function STAGE ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref = 'HEAD'] - Optionally specify a different commit to compare against the workdir and stage instead of the HEAD
@@ -10043,7 +9711,7 @@ async function statusMatrix ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   ref = 'HEAD',
@@ -10051,7 +9719,6 @@ async function statusMatrix ({
   pattern = null
 }) {
   try {
-    const fs = new FileSystem(_fs);
     let count = 0;
     let patternPart = '';
     let patternGlobrex;
@@ -10147,7 +9814,7 @@ async function statusMatrix ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ref - What to name the tag
@@ -10165,14 +9832,12 @@ async function tag ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref,
   object,
   force = false
 }) {
   try {
-    const fs = new FileSystem(_fs);
-
     if (ref === undefined) {
       throw new GitError(E.MissingRequiredParameterError, {
         function: 'tag',
@@ -10219,7 +9884,7 @@ async function tag ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ref - A reference to the commit or tag to verify
@@ -10245,13 +9910,12 @@ async function verify ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref,
   publicKeys,
   openpgp
 }) {
   try {
-    const fs = new FileSystem(_fs);
     const oid = await GitRefManager.resolve({ fs, gitdir, ref });
     const { type, object } = await readObject({ fs, gitdir, oid });
     if (type !== 'commit' && type !== 'tag') {
@@ -10339,7 +10003,7 @@ function version () {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {Buffer|string|Object} args.object - The object to write.
@@ -10381,7 +10045,7 @@ async function writeObject$1 ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   type,
   object,
   format = 'parsed',
@@ -10389,7 +10053,6 @@ async function writeObject$1 ({
   encoding = undefined
 }) {
   try {
-    const fs = new FileSystem(_fs);
     // Convert object to buffer
     if (format === 'parsed') {
       switch (type) {
@@ -10433,7 +10096,7 @@ async function writeObject$1 ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ref - The name of the ref to write
@@ -10463,15 +10126,13 @@ async function writeRef ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ref,
   value,
   force = false,
   symbolic = false
 }) {
   try {
-    const fs = new FileSystem(_fs);
-
     if (ref !== cleanGitRef.clean(ref)) {
       throw new GitError(E.InvalidRefNameError, {
         verb: 'write',

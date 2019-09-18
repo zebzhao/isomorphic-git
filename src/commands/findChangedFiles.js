@@ -1,4 +1,4 @@
-import { FileSystem } from '../models/FileSystem.js'
+
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
 
@@ -13,7 +13,7 @@ export async function findChangedFiles ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   ourOid,
@@ -22,7 +22,6 @@ export async function findChangedFiles ({
 }) {
   // Adapted from: http://gitlet.maryrosecook.com/docs/gitlet.html#section-220
   try {
-    const fs = new FileSystem(_fs)
     let count = 0
     return await walkBeta1({
       fs,

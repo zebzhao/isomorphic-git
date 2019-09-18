@@ -1,6 +1,5 @@
 import { GitRefManager } from '../managers/GitRefManager'
 import { GitIndexManager } from '../managers/GitIndexManager'
-import { FileSystem } from '../models/FileSystem'
 import { E, GitError } from '../models/GitError'
 import { join } from '../utils/join'
 import { cores } from '../utils/plugins'
@@ -39,7 +38,7 @@ import { mergeFile } from '../utils/mergeFile'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ourRef] - The branch receiving the merge. If undefined, defaults to the current branch.
@@ -65,7 +64,7 @@ export async function merge ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   ourRef,
@@ -80,7 +79,6 @@ export async function merge ({
   signingKey
 }) {
   try {
-    const fs = new FileSystem(_fs)
     const currentRef = await currentBranch({ fs, gitdir, fullname: true })
     if (ourRef === undefined) {
       ourRef = currentRef

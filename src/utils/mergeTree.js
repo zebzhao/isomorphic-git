@@ -1,7 +1,7 @@
 // @ts-check
 import { TREE } from '../commands/TREE.js'
 import { walkBeta1 } from '../commands/walkBeta1.js'
-import { FileSystem } from '../models/FileSystem.js'
+
 import { E, GitError } from '../models/GitError.js'
 import { GitTree } from '../models/GitTree.js'
 import { writeObject } from '../storage/writeObject.js'
@@ -20,7 +20,7 @@ import { cores } from './plugins.js'
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ourOid - The SHA-1 object id of our tree
@@ -38,7 +38,7 @@ export async function mergeTree ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   ourOid,
   baseOid,
   theirOid,
@@ -47,7 +47,6 @@ export async function mergeTree ({
   theirName = 'theirs',
   dryRun = false
 }) {
-  const fs = new FileSystem(_fs)
   const ourTree = TREE({ core, dir, gitdir, fs, ref: ourOid })
   const baseTree = TREE({ core, dir, gitdir, fs, ref: baseOid })
   const theirTree = TREE({ core, dir, gitdir, fs, ref: theirOid })

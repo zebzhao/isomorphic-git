@@ -1,14 +1,12 @@
 import pako from 'pako'
 
-import { FileSystem } from '../models/FileSystem.js'
 import { E, GitError } from '../models/GitError.js'
 import { GitObject } from '../models/GitObject.js'
 import { readObjectLoose } from '../storage/readObjectLoose.js'
 import { readObjectPacked } from '../storage/readObjectPacked.js'
 import { shasum } from '../utils/shasum.js'
 
-export async function readObject ({ fs: _fs, gitdir, oid, format = 'content' }) {
-  const fs = new FileSystem(_fs)
+export async function readObject ({ fs, gitdir, oid, format = 'content' }) {
   // Curry the current read method so that the packfile un-deltification
   // process can acquire external ref-deltas.
   const getExternalRefDelta = oid => readObject({ fs, gitdir, oid })
