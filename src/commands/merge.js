@@ -79,6 +79,13 @@ export async function merge ({
   signingKey
 }) {
   try {
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Merging repo',
+        loaded: 0,
+        lengthComputable: false
+      })
+    }
     const currentRef = await currentBranch({ fs, gitdir, fullname: true })
     if (ourRef === undefined) {
       ourRef = currentRef

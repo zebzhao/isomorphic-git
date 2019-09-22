@@ -12,6 +12,8 @@ import { cores } from '../utils/plugins.js'
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {boolean} [args.bare = false] - Initialize a bare repository
+ * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
+ * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
  * @returns {Promise<void>}  Resolves successfully when filesystem operations are complete
  *
  * @example
@@ -24,9 +26,12 @@ export async function init ({
   bare = false,
   dir,
   gitdir = bare ? dir : join(dir, '.git'),
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
   fs = cores.get(core).get('fs')
 }) {
   try {
+    let count = 0
     let folders = [
       'hooks',
       'info',
@@ -35,9 +40,26 @@ export async function init ({
       'refs/heads',
       'refs/tags'
     ]
+    let total = folders.length
     folders = folders.map(dir => gitdir + '/' + dir)
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Initializing repo',
+        loaded: 0,
+        total,
+        lengthComputable: true
+      })
+    }
     for (const folder of folders) {
       await fs.mkdir(folder)
+      if (emitter) {
+        emitter.emit(`${emitterPrefix}progress`, {
+          phase: 'Initializing repo',
+          loaded: ++count,
+          total,
+          lengthComputable: true
+        })
+      }
     }
     await fs.write(
       gitdir + '/config',

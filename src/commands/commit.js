@@ -31,6 +31,8 @@ import { cores } from '../utils/plugins.js'
  * @param {string} [args.ref] - The fully expanded name of the branch to commit to. Default is the current branch pointed to by HEAD. (TODO: fix it so it can expand branch names without throwing if the branch doesn't exist yet.)
  * @param {string[]} [args.parent] - The SHA-1 object ids of the commits to use as parents. If not specified, the commit pointed to by `ref` is used.
  * @param {string} [args.tree] - The SHA-1 object id of the tree to use. If not specified, a new tree object is created from the current git index.
+ * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
+ * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
  *
  * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly created commit.
  *
@@ -57,11 +59,20 @@ export async function commit ({
   signingKey,
   dryRun = false,
   noUpdateBranch = false,
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
   ref,
   parent,
   tree
 }) {
   try {
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Creating commit',
+        loaded: 0,
+        lengthComputable: false
+      })
+    }
     if (!ref) {
       ref = await GitRefManager.resolve({
         fs,
@@ -90,6 +101,14 @@ export async function commit ({
     committer = await normalizeAuthorObject({ fs, gitdir, author: committer })
     if (committer === undefined) {
       throw new GitError(E.MissingCommitterError)
+    }
+
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Creating commit tree',
+        loaded: 0,
+        lengthComputable: false
+      })
     }
 
     let oid
@@ -132,6 +151,14 @@ export async function commit ({
 
         if (!tree) {
           tree = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index })
+        }
+
+        if (emitter) {
+          emitter.emit(`${emitterPrefix}progress`, {
+            phase: 'Writing commit',
+            loaded: 0,
+            lengthComputable: false
+          })
         }
 
         let comm = GitCommit.from({

@@ -72,6 +72,13 @@ export async function pull ({
   signingKey
 }) {
   try {
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Pulling repo',
+        loaded: 0,
+        lengthComputable: false
+      })
+    }
     // If ref is undefined, use 'HEAD'
     if (!ref) {
       ref = await currentBranch({ fs, gitdir })

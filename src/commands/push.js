@@ -102,6 +102,13 @@ export async function push ({
   headers = {}
 }) {
   try {
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Pushing repo',
+        loaded: 0,
+        lengthComputable: false
+      })
+    }
     // TODO: Figure out how pushing tags works. (This only works for branches.)
     if (url === undefined) {
       url = await config({ fs, gitdir, path: `remote.${remote}.url` })

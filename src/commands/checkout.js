@@ -67,6 +67,13 @@ export async function checkout ({
         parameter: 'ref'
       })
     }
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: `Checking out ${remote}/${ref}`,
+        loaded: 0,
+        lengthComputable: false
+      })
+    }
     let patternPart = ''
     let patternGlobrex
     if (pattern) {
@@ -122,7 +129,7 @@ export async function checkout ({
           // are not in the index or are in the index but have the wrong SHA.
           try {
             await walkBeta1({
-              trees: [TREE({ fs, gitdir, ref }), WORKDIR({ fs, dir, gitdir })],
+              trees: [TREE({ fs, dir, gitdir, ref }), WORKDIR({ fs, dir, gitdir })],
               filter: async function ([head, workdir]) {
                 // match against base paths
                 return bases.some(base => worthWalking(head.fullpath, base))
