@@ -4541,6 +4541,13 @@ async function checkout ({
         parameter: 'ref'
       })
     }
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: `Checking out ${remote}/${ref}`,
+        loaded: 0,
+        lengthComputable: false
+      });
+    }
     let patternPart = '';
     let patternGlobrex;
     if (pattern) {
@@ -4596,7 +4603,7 @@ async function checkout ({
           // are not in the index or are in the index but have the wrong SHA.
           try {
             await walkBeta1({
-              trees: [TREE({ fs, gitdir, ref }), WORKDIR({ fs, dir, gitdir })],
+              trees: [TREE({ fs, dir, gitdir, ref }), WORKDIR({ fs, dir, gitdir })],
               filter: async function ([head, workdir]) {
                 // match against base paths
                 return bases.some(base => worthWalking(head.fullpath, base))
@@ -6100,6 +6107,8 @@ async function fetchPackfile ({
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {boolean} [args.bare = false] - Initialize a bare repository
+ * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
+ * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
  * @returns {Promise<void>}  Resolves successfully when filesystem operations are complete
  *
  * @example
@@ -6112,9 +6121,12 @@ async function init ({
   bare = false,
   dir,
   gitdir = bare ? dir : join(dir, '.git'),
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
   fs = cores.get(core).get('fs')
 }) {
   try {
+    let count = 0;
     let folders = [
       'hooks',
       'info',
@@ -6123,9 +6135,26 @@ async function init ({
       'refs/heads',
       'refs/tags'
     ];
+    let total = folders.length;
     folders = folders.map(dir => gitdir + '/' + dir);
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Initializing repo',
+        loaded: 0,
+        total,
+        lengthComputable: true
+      });
+    }
     for (const folder of folders) {
       await fs.mkdir(folder);
+      if (emitter) {
+        emitter.emit(`${emitterPrefix}progress`, {
+          phase: 'Initializing repo',
+          loaded: ++count,
+          total,
+          lengthComputable: true
+        });
+      }
     }
     await fs.write(
       gitdir + '/config',
@@ -6316,6 +6345,8 @@ async function clone ({
  * @param {string} [args.ref] - The fully expanded name of the branch to commit to. Default is the current branch pointed to by HEAD. (TODO: fix it so it can expand branch names without throwing if the branch doesn't exist yet.)
  * @param {string[]} [args.parent] - The SHA-1 object ids of the commits to use as parents. If not specified, the commit pointed to by `ref` is used.
  * @param {string} [args.tree] - The SHA-1 object id of the tree to use. If not specified, a new tree object is created from the current git index.
+ * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
+ * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
  *
  * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly created commit.
  *
@@ -6342,11 +6373,20 @@ async function commit ({
   signingKey,
   dryRun = false,
   noUpdateBranch = false,
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
   ref,
   parent,
   tree
 }) {
   try {
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Creating commit',
+        loaded: 0,
+        lengthComputable: false
+      });
+    }
     if (!ref) {
       ref = await GitRefManager.resolve({
         fs,
@@ -6375,6 +6415,14 @@ async function commit ({
     committer = await normalizeAuthorObject({ fs, gitdir, author: committer });
     if (committer === undefined) {
       throw new GitError(E.MissingCommitterError)
+    }
+
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Creating commit tree',
+        loaded: 0,
+        lengthComputable: false
+      });
     }
 
     let oid;
@@ -6417,6 +6465,14 @@ async function commit ({
 
         if (!tree) {
           tree = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index });
+        }
+
+        if (emitter) {
+          emitter.emit(`${emitterPrefix}progress`, {
+            phase: 'Writing commit',
+            loaded: 0,
+            lengthComputable: false
+          });
         }
 
         let comm = GitCommit.from({
@@ -8080,6 +8136,13 @@ async function merge ({
   signingKey
 }) {
   try {
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Merging repo',
+        loaded: 0,
+        lengthComputable: false
+      });
+    }
     const currentRef = await currentBranch({ fs, gitdir, fullname: true });
     if (ourRef === undefined) {
       ourRef = currentRef;
@@ -8535,6 +8598,13 @@ async function pull ({
   signingKey
 }) {
   try {
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Pulling repo',
+        loaded: 0,
+        lengthComputable: false
+      });
+    }
     // If ref is undefined, use 'HEAD'
     if (!ref) {
       ref = await currentBranch({ fs, gitdir });
@@ -8764,6 +8834,13 @@ async function push ({
   headers = {}
 }) {
   try {
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Pushing repo',
+        loaded: 0,
+        lengthComputable: false
+      });
+    }
     // TODO: Figure out how pushing tags works. (This only works for branches.)
     if (url === undefined) {
       url = await config({ fs, gitdir, path: `remote.${remote}.url` });
