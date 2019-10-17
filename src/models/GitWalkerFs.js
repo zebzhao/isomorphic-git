@@ -20,14 +20,13 @@ export class GitWalkerFs {
     })()
     this.indexPromise = (async () => {
       const result = await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
-          return index.entries
-            .filter(entry => entry.flags.stage === 0)
-            .reduce((index, entry) => {
-              index[entry.path] = entry
-              return index
-            }, {})
-        }
-      )
+        return index.entries
+          .filter(entry => entry.flags.stage === 0)
+          .reduce((index, entry) => {
+            index[entry.path] = entry
+            return index
+          }, {})
+      })
       return result
     })()
     this.fs = fs

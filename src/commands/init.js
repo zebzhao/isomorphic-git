@@ -40,7 +40,7 @@ export async function init ({
       'refs/heads',
       'refs/tags'
     ]
-    let total = folders.length
+    const total = folders.length
     folders = folders.map(dir => gitdir + '/' + dir)
     if (emitter) {
       emitter.emit(`${emitterPrefix}progress`, {

@@ -25,6 +25,7 @@ Array [
   "fetch",
   "findMergeBase",
   "findRoot",
+  "getOidAtPath",
   "getRemoteInfo",
   "hashBlob",
   "indexPack",

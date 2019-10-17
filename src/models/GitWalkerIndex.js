@@ -5,7 +5,7 @@ import { normalizeStats } from '../utils/normalizeStats'
 
 export class GitWalkerIndex {
   constructor ({ fs, gitdir }) {
-    this.treePromise = await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+    this.treePromise = GitIndexManager.acquire({ fs, gitdir }, async function (index) {
       const result = flatFileListToDirectoryStructure(index.entries)
       const conflicts = index.conflictedPaths
       for (const path of conflicts) {

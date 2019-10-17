@@ -31,10 +31,9 @@ export async function remove ({
   filepath
 }) {
   try {
-      await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
-        index.delete({ filepath })
-      }
-    )
+    await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+      index.delete({ filepath })
+    })
     // TODO: return oid?
   } catch (err) {
     err.caller = 'git.remove'

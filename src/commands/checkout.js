@@ -224,9 +224,8 @@ export async function checkout ({
                         lengthComputable: false
                       })
                     }
-                    break
                   }
-                  
+                  break
                 }
                 default: {
                   throw new GitError(E.ObjectTypeAssertionInTreeFail, {

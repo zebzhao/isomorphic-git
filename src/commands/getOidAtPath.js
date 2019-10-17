@@ -6,6 +6,7 @@ import { E, GitError } from '../models/GitError.js'
 import { GitTree } from '../models/GitTree.js'
 import { readObject } from '../storage/readObject.js'
 
+import { join } from '../utils/join.js'
 /**
  * Find the root git directory
  *
@@ -29,7 +30,7 @@ import { readObject } from '../storage/readObject.js'
   * console.log(gitroot) // '/path/to/some/gitrepo'
   *
   */
-export async function getOidAtPath({
+export async function getOidAtPath ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
@@ -38,7 +39,7 @@ export async function getOidAtPath({
   path
 }) {
   if (typeof path === 'string') path = path.split('/')
-  if (!tree) tree = getHeadTree({ fs, gitdir })
+  if (!tree) tree = await getHeadTree({ fs, gitdir })
   const dirname = path.shift()
   for (const entry of tree) {
     if (entry.path === dirname) {
@@ -65,7 +66,7 @@ export async function getOidAtPath({
   return null
 }
 
-async function getHeadTree({ fs, gitdir }) {
+async function getHeadTree ({ fs, gitdir }) {
   // Get the tree from the HEAD commit.
   let oid
   try {
@@ -85,7 +86,7 @@ async function getHeadTree({ fs, gitdir }) {
   return getTree({ fs, gitdir, oid })
 }
 
-async function getTree({ fs, gitdir, oid }) {
+async function getTree ({ fs, gitdir, oid }) {
   const { type, object } = await readObject({
     fs,
     gitdir,

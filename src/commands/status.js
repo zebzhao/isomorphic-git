@@ -66,10 +66,10 @@ export async function status ({
       path: filepath
     })
     // Acquire a lock on the index
-    const {indexEntry, conflictEntry} = await GitIndexManager.acquire(
+    const { indexEntry, conflictEntry } = await GitIndexManager.acquire(
       { fs, gitdir },
       async function (index) {
-        return  {
+        return {
           indexEntry: index.entriesMap.get(GitIndex.key(filepath, 0)),
           conflictEntry: index.entriesMap.get(GitIndex.key(filepath, 2))
         }
