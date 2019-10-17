@@ -2,9 +2,10 @@ import { E, GitError } from '../models/GitError.js'
 
 export class GitObject {
   static wrap ({ type, object }) {
+    const buffer = typeof object === 'string' ? Buffer.from(object, 'utf8') : Buffer.from(object)
     return Buffer.concat([
-      Buffer.from(`${type} ${object.byteLength.toString()}\x00`),
-      Buffer.from(object)
+      Buffer.from(`${type} ${buffer.byteLength.toString()}\x00`),
+      buffer
     ])
   }
 

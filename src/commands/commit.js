@@ -1,12 +1,10 @@
 // @ts-check
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
-import { FileSystem } from '../models/FileSystem.js'
+
 import { GitCommit } from '../models/GitCommit.js'
 import { E, GitError } from '../models/GitError.js'
-import { GitTree } from '../models/GitTree.js'
 import { writeObject } from '../storage/writeObject.js'
-import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js'
 import { join } from '../utils/join.js'
 import { normalizeAuthorObject } from '../utils/normalizeAuthorObject.js'
 import { cores } from '../utils/plugins.js'
@@ -16,7 +14,7 @@ import { cores } from '../utils/plugins.js'
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.message - The commit message to use.
@@ -33,6 +31,8 @@ import { cores } from '../utils/plugins.js'
  * @param {string} [args.ref] - The fully expanded name of the branch to commit to. Default is the current branch pointed to by HEAD. (TODO: fix it so it can expand branch names without throwing if the branch doesn't exist yet.)
  * @param {string[]} [args.parent] - The SHA-1 object ids of the commits to use as parents. If not specified, the commit pointed to by `ref` is used.
  * @param {string} [args.tree] - The SHA-1 object id of the tree to use. If not specified, a new tree object is created from the current git index.
+ * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
+ * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
  *
  * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly created commit.
  *
@@ -52,20 +52,27 @@ export async function commit ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   message,
   author,
   committer,
   signingKey,
   dryRun = false,
   noUpdateBranch = false,
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
   ref,
   parent,
   tree
 }) {
   try {
-    const fs = new FileSystem(_fs)
-
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Creating commit',
+        loaded: 0,
+        lengthComputable: false
+      })
+    }
     if (!ref) {
       ref = await GitRefManager.resolve({
         fs,
@@ -96,12 +103,15 @@ export async function commit ({
       throw new GitError(E.MissingCommitterError)
     }
 
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Creating commit tree',
+        loaded: 0,
+        lengthComputable: false
+      })
+    }
+
     return GitIndexManager.acquire({ fs, gitdir }, async function (index) {
-      const inodes = flatFileListToDirectoryStructure(index.entries)
-      const inode = inodes.get('.')
-      if (!tree) {
-        tree = await constructTree({ fs, gitdir, inode, dryRun })
-      }
       if (!parent) {
         try {
           parent = [
@@ -116,6 +126,38 @@ export async function commit ({
           parent = []
         }
       }
+
+      let mergeHash
+      try {
+        mergeHash = await GitRefManager.resolve({ fs, gitdir, ref: 'MERGE_HEAD' })
+      } catch (err) {
+        // No merge hash
+      }
+
+      if (mergeHash) {
+        const conflictedPaths = index.conflictedPaths
+        if (conflictedPaths.length > 0) {
+          throw new GitError(E.CommitUnmergedConflictsFail, { paths: conflictedPaths })
+        }
+        if (parent.length) {
+          if (!parent.includes(mergeHash)) parent.push(mergeHash)
+        } else {
+          throw new GitError(E.NoHeadCommitError, { noun: 'merge commit', ref: mergeHash })
+        }
+      }
+
+      if (!tree) {
+        tree = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index })
+      }
+
+      if (emitter) {
+        emitter.emit(`${emitterPrefix}progress`, {
+          phase: 'Writing commit',
+          loaded: 0,
+          lengthComputable: false
+        })
+      }
+
       let comm = GitCommit.from({
         tree,
         parent,
@@ -142,6 +184,10 @@ export async function commit ({
           ref,
           value: oid
         })
+        if (mergeHash) {
+          await GitRefManager.deleteRef({ fs, gitdir, ref: 'MERGE_HEAD' })
+          await fs.rm(join(gitdir, 'MERGE_MSG'))
+        }
       }
       return oid
     })
@@ -149,30 +195,4 @@ export async function commit ({
     err.caller = 'git.commit'
     throw err
   }
-}
-
-async function constructTree ({ fs, gitdir, inode, dryRun }) {
-  // use depth first traversal
-  const children = inode.children
-  for (const inode of children) {
-    if (inode.type === 'tree') {
-      inode.metadata.mode = '040000'
-      inode.metadata.oid = await constructTree({ fs, gitdir, inode, dryRun })
-    }
-  }
-  const entries = children.map(inode => ({
-    mode: inode.metadata.mode,
-    path: inode.basename,
-    oid: inode.metadata.oid,
-    type: inode.type
-  }))
-  const tree = GitTree.from(entries)
-  const oid = await writeObject({
-    fs,
-    gitdir,
-    type: 'tree',
-    object: tree.toObject(),
-    dryRun
-  })
-  return oid
 }

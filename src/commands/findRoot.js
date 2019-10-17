@@ -1,5 +1,5 @@
 // @ts-check
-import { FileSystem } from '../models/FileSystem.js'
+
 import { E, GitError } from '../models/GitError.js'
 import { dirname } from '../utils/dirname.js'
 import { join } from '../utils/join.js'
@@ -12,7 +12,7 @@ import { cores } from '../utils/plugins.js'
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.filepath - The file directory to start searching in.
  *
  * @returns {Promise<string>} Resolves successfully with a root git directory path
@@ -27,11 +27,10 @@ import { cores } from '../utils/plugins.js'
  */
 export async function findRoot ({
   core = 'default',
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   filepath
 }) {
   try {
-    const fs = new FileSystem(_fs)
     return _findRoot(fs, filepath)
   } catch (err) {
     err.caller = 'git.findRoot'

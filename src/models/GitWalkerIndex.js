@@ -3,15 +3,16 @@ import { compareStrings } from '../utils/compareStrings.js'
 import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js'
 import { normalizeStats } from '../utils/normalizeStats'
 
-import { FileSystem } from './FileSystem.js'
-
 export class GitWalkerIndex {
-  constructor ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs)
-    this.treePromise = GitIndexManager.acquire({ fs, gitdir }, async function (
-      index
-    ) {
-      return flatFileListToDirectoryStructure(index.entries)
+  constructor ({ fs, gitdir }) {
+    this.treePromise = await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+      const result = flatFileListToDirectoryStructure(index.entries)
+      const conflicts = index.conflictedPaths
+      for (const path of conflicts) {
+        const inode = result.get(path)
+        if (inode) inode.conflict = true
+      }
+      return result
     })
     const walker = this
     this.ConstructEntry = class IndexEntry {

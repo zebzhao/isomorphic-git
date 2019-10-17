@@ -1,5 +1,5 @@
 // @ts-check
-import { FileSystem } from '../models/FileSystem.js'
+
 import { GitAnnotatedTag } from '../models/GitAnnotatedTag.js'
 import { GitCommit } from '../models/GitCommit.js'
 import { E, GitError } from '../models/GitError.js'
@@ -25,7 +25,7 @@ import { cores } from '../utils/plugins.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {Buffer|string|Object} args.object - The object to write.
@@ -67,7 +67,7 @@ export async function writeObject ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   type,
   object,
   format = 'parsed',
@@ -75,7 +75,6 @@ export async function writeObject ({
   encoding = undefined
 }) {
   try {
-    const fs = new FileSystem(_fs)
     // Convert object to buffer
     if (format === 'parsed') {
       switch (type) {

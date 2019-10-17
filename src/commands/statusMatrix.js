@@ -2,7 +2,7 @@
 import globrex from 'globrex'
 
 import { GitIgnoreManager } from '../managers/GitIgnoreManager.js'
-import { FileSystem } from '../models/FileSystem.js'
+
 import { join } from '../utils/join.js'
 import { patternRoot } from '../utils/patternRoot.js'
 import { cores } from '../utils/plugins.js'
@@ -135,7 +135,7 @@ import { walkBeta1 } from './walkBeta1.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref = 'HEAD'] - Optionally specify a different commit to compare against the workdir and stage instead of the HEAD
@@ -148,13 +148,15 @@ export async function statusMatrix ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
   ref = 'HEAD',
   filepaths = ['.'],
   pattern = null
 }) {
   try {
-    const fs = new FileSystem(_fs)
+    let count = 0
     let patternPart = ''
     let patternGlobrex
     if (pattern) {
@@ -201,15 +203,19 @@ export async function statusMatrix ({
           if (!match) return
         }
         // For now, just bail on directories
-        await head.populateStat()
-        if (head.type === 'tree' || head.type === 'special') return
-        await workdir.populateStat()
-        if (workdir.type === 'tree' || workdir.type === 'special') return
-        await stage.populateStat()
-        if (stage.type === 'tree' || stage.type === 'special') return
+        await Promise.all([
+          stage.populateStat(),
+          workdir.populateStat(),
+          head.populateStat()
+        ])
+        if (stage.type === 'tree' || stage.type === 'special' ||
+            workdir.type === 'tree' || workdir.type === 'special' ||
+            head.type === 'tree' || head.type === 'special') return
         // Figure out the oids, using the staged oid for the working dir oid if the stats match.
-        await head.populateHash()
-        await stage.populateHash()
+        await Promise.all([
+          head.populateHash(),
+          stage.populateHash()
+        ])
         if (!head.exists && workdir.exists && !stage.exists) {
           // We don't actually NEED the sha. Any sha will do
           // TODO: update this logic to handle N trees instead of just 3.
@@ -217,11 +223,18 @@ export async function statusMatrix ({
         } else if (workdir.exists) {
           await workdir.populateHash()
         }
+        if (emitter) {
+          emitter.emit(`${emitterPrefix}progress`, {
+            phase: 'Calculating status',
+            loaded: ++count,
+            lengthComputable: false
+          })
+        }
         const entry = [undefined, head.oid, workdir.oid, stage.oid]
         const result = entry.map(value => entry.indexOf(value))
         result.shift() // remove leading undefined entry
         const fullpath = head.fullpath || workdir.fullpath || stage.fullpath
-        return [fullpath, ...result]
+        return [fullpath, ...result, !!stage.conflict]
       }
     })
     return results

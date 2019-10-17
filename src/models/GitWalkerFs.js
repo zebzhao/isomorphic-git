@@ -4,17 +4,35 @@ import { join } from '../utils/join'
 import { log } from '../utils/log.js'
 import { normalizeStats } from '../utils/normalizeStats.js'
 import { shasum } from '../utils/shasum.js'
+import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js'
 
-import { FileSystem } from './FileSystem.js'
 import { GitObject } from './GitObject.js'
 
 export class GitWalkerFs {
-  constructor ({ fs: _fs, dir, gitdir }) {
-    const fs = new FileSystem(_fs)
+  constructor ({ fs, dir, gitdir }) {
+    const walker = this
+    this.treePromise = (async () => {
+      const result = (await fs.readdirDeep(dir)).map(path => {
+        // +1 index for trailing slash
+        return { path: path.slice(dir.length + 1) }
+      })
+      return flatFileListToDirectoryStructure(result)
+    })()
+    this.indexPromise = (async () => {
+      const result = await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+          return index.entries
+            .filter(entry => entry.flags.stage === 0)
+            .reduce((index, entry) => {
+              index[entry.path] = entry
+              return index
+            }, {})
+        }
+      )
+      return result
+    })()
     this.fs = fs
     this.dir = dir
     this.gitdir = gitdir
-    const walker = this
     this.ConstructEntry = class FSEntry {
       constructor (entry) {
         Object.assign(this, entry)
@@ -78,32 +96,17 @@ export class GitWalkerFs {
 
   async populateHash (entry) {
     if (!entry.exists) return
-    const { fs, gitdir } = this
-    // See if we can use the SHA1 hash in the index.
-    const oid = await GitIndexManager.acquire({ fs, gitdir }, async function (
-      index
-    ) {
-      const stage = index.entriesMap.get(entry.fullpath)
-      if (!entry.type) await entry.populateStat()
-      if (!stage || compareStats(entry, stage)) {
-        log(`INDEX CACHE MISS: calculating SHA for ${entry.fullpath}`)
-        if (!entry.content) await entry.populateContent()
-        const oid = shasum(
-          GitObject.wrap({ type: 'blob', object: entry.content })
-        )
-        if (stage && oid === stage.oid) {
-          index.insert({
-            filepath: entry.fullpath,
-            stats: entry,
-            oid: oid
-          })
-        }
-        return oid
-      } else {
-        // Use the index SHA1 rather than compute it
-        return stage.oid
-      }
-    })
+    const index = await this.indexPromise
+    const stage = index[entry.fullpath]
+    let oid
+    if (!stage || compareStats(entry, stage)) {
+      log(`INDEX CACHE MISS: calculating SHA for ${entry.fullpath}`)
+      if (!entry.content) await entry.populateContent()
+      oid = shasum(GitObject.wrap({ type: 'blob', object: entry.content }))
+    } else {
+      // Use the index SHA1 rather than compute it
+      oid = stage.oid
+    }
     Object.assign(entry, { oid })
   }
 }

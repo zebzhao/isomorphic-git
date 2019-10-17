@@ -1,7 +1,7 @@
 // @ts-check
 import { GitRefManager } from '../managers/GitRefManager.js'
 import { GitRemoteManager } from '../managers/GitRemoteManager.js'
-import { FileSystem } from '../models/FileSystem.js'
+
 import { E, GitError } from '../models/GitError.js'
 import { GitSideBand } from '../models/GitSideBand.js'
 import { filterCapabilities } from '../utils/filterCapabilities.js'
@@ -46,7 +46,7 @@ import { pack } from './pack.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref] - Which branch to push. By default this is the currently checked out branch.
@@ -81,7 +81,7 @@ export async function push ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   ref,
@@ -102,7 +102,13 @@ export async function push ({
   headers = {}
 }) {
   try {
-    const fs = new FileSystem(_fs)
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Pushing repo',
+        loaded: 0,
+        lengthComputable: false
+      })
+    }
     // TODO: Figure out how pushing tags works. (This only works for branches.)
     if (url === undefined) {
       url = await config({ fs, gitdir, path: `remote.${remote}.url` })
@@ -155,14 +161,38 @@ export async function push ({
         }
       }
     }
+    const emptyOid = '0000000000000000000000000000000000000000'
     const oldoid =
-      httpRemote.refs.get(fullRemoteRef) ||
-      '0000000000000000000000000000000000000000'
+      httpRemote.refs.get(fullRemoteRef) || emptyOid
     const finish = [...httpRemote.refs.values()]
     // hack to speed up common force push scenarios
     // @ts-ignore
     const mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] })
-    for (const oid of mergebase) finish.push(oid)
+    for (const baseOid of mergebase) finish.push(baseOid)
+    // TODO: handle shallow depth cutoff gracefully
+    if (
+      mergebase.length === 0 &&
+      oid !== emptyOid &&
+      oldoid !== emptyOid
+    ) {
+      throw new GitError(E.PushRejectedNoCommonAncestry, {})
+    } else if (!force) {
+      // Is it a tag that already exists?
+      if (
+        fullRef.startsWith('refs/tags') &&
+        oldoid !== emptyOid
+      ) {
+        throw new GitError(E.PushRejectedTagExists, {})
+      }
+      // Is it a non-fast-forward commit?
+      if (
+        oid !== emptyOid &&
+        oldoid !== emptyOid &&
+        !(await isDescendent({ fs, gitdir, oid, ancestor: oldoid }))
+      ) {
+        throw new GitError(E.PushRejectedNonFastForward, {})
+      }
+    }
     // @ts-ignore
     const commits = await listCommitsAndTags({
       fs,
@@ -172,23 +202,6 @@ export async function push ({
     })
     // @ts-ignore
     const objects = await listObjects({ fs, gitdir, oids: commits })
-    if (!force) {
-      // Is it a tag that already exists?
-      if (
-        fullRef.startsWith('refs/tags') &&
-        oldoid !== '0000000000000000000000000000000000000000'
-      ) {
-        throw new GitError(E.PushRejectedTagExists, {})
-      }
-      // Is it a non-fast-forward commit?
-      if (
-        oid !== '0000000000000000000000000000000000000000' &&
-        oldoid !== '0000000000000000000000000000000000000000' &&
-        !(await isDescendent({ fs, gitdir, oid, ancestor: oldoid }))
-      ) {
-        throw new GitError(E.PushRejectedNonFastForward, {})
-      }
-    }
     // We can only safely use capabilities that the server also understands.
     // For instance, AWS CodeCommit aborts a push if you include the `agent`!!!
     const capabilities = filterCapabilities(
@@ -227,6 +240,20 @@ export async function push ({
     const result = await parseReceivePackResponse(packfile)
     if (res.headers) {
       result.headers = res.headers
+    }
+    if (!result.errors || result.errors.length === 0) {
+      // no errors pushing
+      const refs = new Map()
+      refs.set(fullRemoteRef, oid)
+      const symrefs = new Map()
+      // @ts-ignore
+      await GitRefManager.updateRemoteRefs({
+        fs,
+        gitdir,
+        remote,
+        refs,
+        symrefs
+      })
     }
     return result
   } catch (err) {

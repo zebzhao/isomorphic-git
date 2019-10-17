@@ -1,5 +1,5 @@
 // @ts-check
-import { FileSystem } from '../models/FileSystem.js'
+
 import { GitWalkerFs } from '../models/GitWalkerFs.js'
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
@@ -18,7 +18,7 @@ import { GitWalkerSymbol } from '../utils/symbols.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - The [git directory](dir-vs-gitdir.md) path
  *
@@ -29,9 +29,8 @@ export function WORKDIR ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs')
+  fs = cores.get(core).get('fs')
 }) {
-  const fs = new FileSystem(_fs)
   const o = Object.create(null)
   Object.defineProperty(o, GitWalkerSymbol, {
     value: function () {

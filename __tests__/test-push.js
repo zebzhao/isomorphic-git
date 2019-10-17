@@ -11,6 +11,10 @@ const { plugins, config, push } = require('isomorphic-git')
 const localhost =
   typeof window === 'undefined' ? 'localhost' : window.location.hostname
 
+// this is so it works with either Node local tests or Browser WAN tests
+const localhost =
+  typeof window === 'undefined' ? 'localhost' : window.location.hostname
+
 describe('push', () => {
   beforeAll(() => {
     registerSnapshots(snapshots)

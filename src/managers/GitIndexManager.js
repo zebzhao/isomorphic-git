@@ -1,10 +1,12 @@
 // import LockManager from 'travix-lock-manager'
 import AsyncLock from 'async-lock'
 
-import { FileSystem } from '../models/FileSystem.js'
 import { GitIndex } from '../models/GitIndex.js'
 import { DeepMap } from '../utils/DeepMap.js'
 import { compareStats } from '../utils/compareStats.js'
+import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js'
+import { GitTree } from '../models/GitTree.js'
+import { writeObject } from '../storage/writeObject.js'
 
 // import Lock from '../utils.js'
 
@@ -37,8 +39,7 @@ async function isIndexStale (fs, filepath) {
 }
 
 export class GitIndexManager {
-  static async acquire ({ fs: _fs, gitdir }, closure) {
-    const fs = new FileSystem(_fs)
+  static async acquire ({ fs, gitdir }, closure) {
     const filepath = `${gitdir}/index`
     if (lock === null) lock = new AsyncLock({ maxPending: Infinity })
     let result
@@ -64,4 +65,37 @@ export class GitIndexManager {
     })
     return result
   }
+
+  static async constructTree ({ fs, gitdir, dryRun, index }) {
+    const inodes = flatFileListToDirectoryStructure(index.entries)
+    const inode = inodes.get('.')
+    const tree = await constructTree({ fs, gitdir, inode, dryRun })
+    return tree
+  }
+}
+
+async function constructTree ({ fs, gitdir, inode, dryRun }) {
+  // use depth first traversal
+  const children = inode.children
+  for (const inode of children) {
+    if (inode.type === 'tree') {
+      inode.metadata.mode = '040000'
+      inode.metadata.oid = await constructTree({ fs, gitdir, inode, dryRun })
+    }
+  }
+  const entries = children.map(inode => ({
+    mode: inode.metadata.mode,
+    path: inode.basename,
+    oid: inode.metadata.oid,
+    type: inode.type
+  }))
+  const tree = GitTree.from(entries)
+  const oid = await writeObject({
+    fs,
+    gitdir,
+    type: 'tree',
+    object: tree.toObject(),
+    dryRun
+  })
+  return oid
 }

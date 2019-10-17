@@ -1,7 +1,8 @@
 // @ts-check
 import { GitIgnoreManager } from '../managers/GitIgnoreManager.js'
 import { GitIndexManager } from '../managers/GitIndexManager.js'
-import { FileSystem } from '../models/FileSystem.js'
+import { GitIndex } from '../models/GitIndex'
+
 import { E, GitError } from '../models/GitError.js'
 import { writeObject } from '../storage/writeObject.js'
 import { join } from '../utils/join.js'
@@ -12,12 +13,12 @@ import { cores } from '../utils/plugins.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.filepath - The path to the file to add to the index
  *
- * @returns {Promise<void>} Resolves successfully once the git index has been updated
+ * @returns {Promise<string[]>} Resolves successfully once the git index has been updated
  *
  * @example
  * await new Promise((resolve, reject) => fs.writeFile(
@@ -33,37 +34,48 @@ export async function add ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
   filepath
 }) {
   try {
-    const fs = new FileSystem(_fs)
-
+    const added = []
     await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
-      await addToIndex({ dir, gitdir, fs, filepath, index })
+      await addToIndex({ dir, gitdir, fs, filepath, index, added })
     })
-    // TODO: return all oids for all files added?
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}add`, {
+        filepath,
+        added
+      })
+    }
+    return added
   } catch (err) {
     err.caller = 'git.add'
     throw err
   }
 }
 
-async function addToIndex ({ dir, gitdir, fs, filepath, index }) {
-  // TODO: Should ignore UNLESS it's already in the index.
-  const ignored = await GitIgnoreManager.isIgnored({
-    fs,
-    dir,
-    gitdir,
-    filepath
-  })
-  if (ignored) return
+async function addToIndex ({ dir, gitdir, fs, filepath, index, added }) {
+  const stage = index.entriesMap.get(GitIndex.key(filepath, 0)) ||
+    index.entriesMap.get(GitIndex.key(filepath, 2))
+  if (!stage) {
+    // Should ignore UNLESS it's already in the index.
+    const ignored = await GitIgnoreManager.isIgnored({
+      fs,
+      dir,
+      gitdir,
+      filepath
+    })
+    if (ignored) return
+  }
   const stats = await fs.lstat(join(dir, filepath))
   if (!stats) throw new GitError(E.FileReadError, { filepath })
   if (stats.isDirectory()) {
     const children = await fs.readdir(join(dir, filepath))
     const promises = children.map(child =>
-      addToIndex({ dir, gitdir, fs, filepath: join(filepath, child), index })
+      addToIndex({ dir, gitdir, fs, filepath: join(filepath, child), index, added })
     )
     await Promise.all(promises)
   } else {
@@ -72,6 +84,8 @@ async function addToIndex ({ dir, gitdir, fs, filepath, index }) {
       : await fs.read(join(dir, filepath))
     if (object === null) throw new GitError(E.FileReadError, { filepath })
     const oid = await writeObject({ fs, gitdir, type: 'blob', object })
+    if (stage) index.delete({ filepath })
     index.insert({ filepath, stats, oid })
+    added.push({ filepath, oid })
   }
 }

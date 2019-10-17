@@ -28,21 +28,18 @@ async function makeBrowserFS (dir) {
       browserFS = BrowserFS.BFSRequire('fs')
       browserFSwritable = writable
     }
-    const _fs = Object.assign({}, browserFS)
+    const fs = new FileSystem(Object.assign({}, browserFS))
     browserFSwritable.empty()
 
     const core = `core-browserfs-${i++}`
-    cores.create(core).set('fs', _fs)
-    plugins.set('fs', _fs) // deprecated
-
-    const fs = new FileSystem(_fs)
+    cores.create(core).set('fs', fs)
+    plugins.set('fs', fs) // deprecated
 
     dir = `/${dir}`
     const gitdir = `/${dir}.git`
     await fs.mkdir(dir)
     await fs.mkdir(gitdir)
     return {
-      _fs,
       fs,
       dir,
       gitdir,

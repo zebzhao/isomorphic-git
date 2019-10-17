@@ -1,5 +1,5 @@
 // @ts-check
-import { FileSystem } from '../models/FileSystem.js'
+
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
 
@@ -8,10 +8,12 @@ import { cores } from '../utils/plugins.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {boolean} [args.bare = false] - Initialize a bare repository
+ * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
+ * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
  * @returns {Promise<void>}  Resolves successfully when filesystem operations are complete
  *
  * @example
@@ -24,10 +26,12 @@ export async function init ({
   bare = false,
   dir,
   gitdir = bare ? dir : join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs')
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
+  fs = cores.get(core).get('fs')
 }) {
   try {
-    const fs = new FileSystem(_fs)
+    let count = 0
     let folders = [
       'hooks',
       'info',
@@ -36,9 +40,26 @@ export async function init ({
       'refs/heads',
       'refs/tags'
     ]
+    let total = folders.length
     folders = folders.map(dir => gitdir + '/' + dir)
+    if (emitter) {
+      emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Initializing repo',
+        loaded: 0,
+        total,
+        lengthComputable: true
+      })
+    }
     for (const folder of folders) {
       await fs.mkdir(folder)
+      if (emitter) {
+        emitter.emit(`${emitterPrefix}progress`, {
+          phase: 'Initializing repo',
+          loaded: ++count,
+          total,
+          lengthComputable: true
+        })
+      }
     }
     await fs.write(
       gitdir + '/config',

@@ -1,16 +1,14 @@
 // @ts-check
 import { GitIgnoreManager } from '../managers/GitIgnoreManager.js'
 import { GitIndexManager } from '../managers/GitIndexManager.js'
-import { GitRefManager } from '../managers/GitRefManager.js'
-import { FileSystem } from '../models/FileSystem.js'
-import { GitCommit } from '../models/GitCommit.js'
-import { E, GitError } from '../models/GitError.js'
-import { GitTree } from '../models/GitTree.js'
-import { readObject } from '../storage/readObject.js'
+
+import { GitIndex } from '../models/GitIndex'
+
 import { compareStats } from '../utils/compareStats.js'
 import { hashObject } from '../utils/hashObject.js'
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
+import { getOidAtPath } from './getOidAtPath.js'
 
 /**
  * Tell whether a file has been changed
@@ -33,7 +31,7 @@ import { cores } from '../utils/plugins.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.filepath - The path to the file to query
@@ -49,11 +47,10 @@ export async function status ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   filepath
 }) {
   try {
-    const fs = new FileSystem(_fs)
     const ignored = await GitIgnoreManager.isIgnored({
       gitdir,
       dir,
@@ -63,27 +60,27 @@ export async function status ({
     if (ignored) {
       return 'ignored'
     }
-    const headTree = await getHeadTree({ fs, gitdir })
     const treeOid = await getOidAtPath({
       fs,
       gitdir,
-      tree: headTree,
       path: filepath
     })
-    const indexEntry = await GitIndexManager.acquire(
+    // Acquire a lock on the index
+    const {indexEntry, conflictEntry} = await GitIndexManager.acquire(
       { fs, gitdir },
       async function (index) {
-        for (const entry of index) {
-          if (entry.path === filepath) return entry
+        return  {
+          indexEntry: index.entriesMap.get(GitIndex.key(filepath, 0)),
+          conflictEntry: index.entriesMap.get(GitIndex.key(filepath, 2))
         }
-        return null
       }
     )
     const stats = await fs.lstat(join(dir, filepath))
 
     const H = treeOid !== null // head
-    const I = indexEntry !== null // index
+    const I = !!indexEntry // index
     const W = stats !== null // working dir
+    const C = !!conflictEntry // in conflict
 
     const getWorkdirOid = async () => {
       if (I && !compareStats(indexEntry, stats)) {
@@ -111,31 +108,28 @@ export async function status ({
       }
     }
 
-    if (!H && !W && !I) return 'absent' // ---
-    if (!H && !W && I) return '*absent' // -A-
-    if (!H && W && !I) return '*added' // --A
+    const prefix = C ? '!' : ''
+    if (!H && !W && !I) return prefix + 'absent' // ---
+    if (!H && !W && I) return prefix + '*absent' // -A-
+    if (!H && W && !I) return prefix + '*added' // --A
     if (!H && W && I) {
       const workdirOid = await getWorkdirOid()
-      // @ts-ignore
-      return workdirOid === indexEntry.oid ? 'added' : '*added' // -AA : -AB
+      return prefix + (workdirOid === indexEntry.oid ? 'added' : '*added') // -AA : -AB
     }
-    if (H && !W && !I) return 'deleted' // A--
+    if (H && !W && !I) return prefix + 'deleted' // A--
     if (H && !W && I) {
-      // @ts-ignore
-      return treeOid === indexEntry.oid ? '*deleted' : '*deleted' // AA- : AB-
+      return prefix + (treeOid === indexEntry.oid ? '*deleted' : '*deleted') // AA- : AB-
     }
     if (H && W && !I) {
       const workdirOid = await getWorkdirOid()
-      return workdirOid === treeOid ? '*undeleted' : '*undeletemodified' // A-A : A-B
+      return prefix + (workdirOid === treeOid ? '*undeleted' : '*undeletemodified') // A-A : A-B
     }
     if (H && W && I) {
       const workdirOid = await getWorkdirOid()
       if (workdirOid === treeOid) {
-        // @ts-ignore
-        return workdirOid === indexEntry.oid ? 'unmodified' : '*unmodified' // AAA : ABA
+        return prefix + (workdirOid === indexEntry.oid ? 'unmodified' : '*unmodified') // AAA : ABA
       } else {
-        // @ts-ignore
-        return workdirOid === indexEntry.oid ? 'modified' : '*modified' // ABB : AAB
+        return prefix + (workdirOid === indexEntry.oid ? 'modified' : '*modified') // ABB : AAB
       }
     }
     /*
@@ -158,65 +152,4 @@ export async function status ({
     err.caller = 'git.status'
     throw err
   }
-}
-
-async function getOidAtPath ({ fs, gitdir, tree, path }) {
-  if (typeof path === 'string') path = path.split('/')
-  const dirname = path.shift()
-  for (const entry of tree) {
-    if (entry.path === dirname) {
-      if (path.length === 0) {
-        return entry.oid
-      }
-      const { type, object } = await readObject({
-        fs,
-        gitdir,
-        oid: entry.oid
-      })
-      if (type === 'tree') {
-        const tree = GitTree.from(object)
-        return getOidAtPath({ fs, gitdir, tree, path })
-      }
-      if (type === 'blob') {
-        throw new GitError(E.ObjectTypeAssertionInPathFail, {
-          oid: entry.oid,
-          path: path.join('/')
-        })
-      }
-    }
-  }
-  return null
-}
-
-async function getHeadTree ({ fs, gitdir }) {
-  // Get the tree from the HEAD commit.
-  let oid
-  try {
-    oid = await GitRefManager.resolve({ fs, gitdir, ref: 'HEAD' })
-  } catch (e) {
-    // Handle fresh branches with no commits
-    if (e.code === E.ResolveRefError) {
-      return []
-    }
-  }
-  const { type, object } = await readObject({ fs, gitdir, oid })
-  if (type !== 'commit') {
-    throw new GitError(E.ResolveCommitError, { oid })
-  }
-  const commit = GitCommit.from(object)
-  oid = commit.parseHeaders().tree
-  return getTree({ fs, gitdir, oid })
-}
-
-async function getTree ({ fs, gitdir, oid }) {
-  const { type, object } = await readObject({
-    fs,
-    gitdir,
-    oid
-  })
-  if (type !== 'tree') {
-    throw new GitError(E.ResolveTreeError, { oid })
-  }
-  const tree = GitTree.from(object).entries()
-  return tree
 }
