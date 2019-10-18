@@ -809,16 +809,23 @@ let shouldLog = null;
 
 function log (...args) {
   if (shouldLog === null) {
-    shouldLog =
-      (process &&
-        process.env &&
-        process.env.DEBUG &&
-        (process.env.DEBUG === '*' ||
-          process.env.DEBUG === 'isomorphic-git')) ||
-      (typeof window !== 'undefined' &&
-        typeof window.localStorage !== 'undefined' &&
-        (window.localStorage.debug === '*' ||
-          window.localStorage.debug === 'isomorphic-git'));
+    // Reading localStorage can throw a SECURITY_ERR in Chrome Mobile if "Block third-party cookies and site data" is enabled
+    // and maybe in other scenarios too. I started seeing this error doing Karma testing on my Android phone via local WLAN.
+    // Using the Object.getPropertyDescriptor(window, 'localStorage').enumerable trick didn't avoid the error so using try/catch.
+    try {
+      shouldLog =
+        (process &&
+          process.env &&
+          process.env.DEBUG &&
+          (process.env.DEBUG === '*' ||
+            process.env.DEBUG === 'isomorphic-git')) ||
+        (typeof window !== 'undefined' &&
+          typeof window.localStorage !== 'undefined' &&
+          (window.localStorage.debug === '*' ||
+            window.localStorage.debug === 'isomorphic-git'));
+    } catch (_) {
+      shouldLog = false;
+    }
   }
   if (shouldLog) {
     console.log(...args);
@@ -1152,8 +1159,10 @@ async function isIndexStale (fs, filepath) {
 }
 
 class GitIndexManager {
-  static async acquire ({ fs, filepath }, closure) {
+  static async acquire ({ fs, gitdir }, closure) {
+    const filepath = `${gitdir}/index`;
     if (lock === null) lock = new AsyncLock({ maxPending: Infinity });
+    let result;
     await lock.acquire(filepath, async function () {
       // Acquire a file lock while we're reading the index
       // to make sure other processes aren't writing to it
@@ -1163,7 +1172,7 @@ class GitIndexManager {
         await updateCachedIndexFile(fs, filepath);
       }
       const index = map.get([fs, filepath]);
-      await closure(index);
+      result = await closure(index);
       if (index._dirty) {
         // Acquire a file lock while we're writing the index file
         // let fileLock = await Lock(filepath)
@@ -1174,6 +1183,7 @@ class GitIndexManager {
         index._dirty = false;
       }
     });
+    return result
   }
 
   static async constructTree ({ fs, gitdir, dryRun, index }) {
@@ -1329,12 +1339,9 @@ async function add ({
 }) {
   try {
     const added = [];
-    await GitIndexManager.acquire(
-      { fs, filepath: `${gitdir}/index` },
-      async function (index) {
-        await addToIndex({ dir, gitdir, fs, filepath, index, added });
-      }
-    );
+    await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+      await addToIndex({ dir, gitdir, fs, filepath, index, added });
+    });
     if (emitter) {
       emitter.emit(`${emitterPrefix}add`, {
         filepath,
@@ -3869,14 +3876,17 @@ class GitWalkerRepo {
     if (!obj) throw new Error(`No obj for ${filepath}`)
     const oid = obj.oid;
     if (!oid) throw new Error(`No oid for obj ${JSON.stringify(obj)}`)
-    if (obj.type === 'commit') {
-      // TODO: support submodules
+    if (obj.type !== 'tree') {
+      // TODO: support submodules (type === 'commit')
       return null
     }
     const { type, object } = await readObject({ fs, gitdir, oid });
-    if (type === 'blob') return null
-    if (type !== 'tree') {
-      throw new Error(`ENOTDIR: not a directory, scandir '${filepath}'`)
+    if (type !== obj.type) {
+      throw new GitError(E.ObjectTypeAssertionFail, {
+        oid,
+        expected: obj.type,
+        type
+      })
     }
     const tree = GitTree.from(object);
     // cache all entries
@@ -3988,18 +3998,14 @@ class GitWalkerFs {
       return flatFileListToDirectoryStructure(result)
     })();
     this.indexPromise = (async () => {
-      let result;
-      await GitIndexManager.acquire(
-        { fs, filepath: `${gitdir}/index` },
-        async function (index) {
-          result = index.entries
-            .filter(entry => entry.flags.stage === 0)
-            .reduce((index, entry) => {
-              index[entry.path] = entry;
-              return index
-            }, {});
-        }
-      );
+      const result = await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+        return index.entries
+          .filter(entry => entry.flags.stage === 0)
+          .reduce((index, entry) => {
+            index[entry.path] = entry;
+            return index
+          }, {})
+      });
       return result
     })();
     this.fs = fs;
@@ -4595,134 +4601,131 @@ async function checkout ({
       let count = 0;
       const gitdirBasename = dir ? gitdir.replace(dir + '/', '') : gitdir;
       // Acquire a lock on the index
-      await GitIndexManager.acquire(
-        { fs, filepath: `${gitdir}/index` },
-        async function (index) {
-          // Instead of deleting and rewriting everything, only delete files
-          // that are not present in the new branch, and only write files that
-          // are not in the index or are in the index but have the wrong SHA.
-          try {
-            await walkBeta1({
-              trees: [TREE({ fs, dir, gitdir, ref }), WORKDIR({ fs, dir, gitdir })],
-              filter: async function ([head, workdir]) {
-                // match against base paths
-                return bases.some(base => worthWalking(head.fullpath, base))
-              },
-              map: async function ([head, workdir]) {
-                if (head.fullpath === '.') return
-                const workdirPath = workdir.fullpath;
-                if (workdirPath === gitdirBasename) return
-                // Late filter against file names
-                if (patternGlobrex) {
-                  let match = false;
-                  for (const base of bases) {
-                    const partToMatch = head.fullpath.replace(base + '/', '');
-                    if (patternGlobrex.regex.test(partToMatch)) {
-                      match = true;
-                      break
-                    }
+      await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+        // Instead of deleting and rewriting everything, only delete files
+        // that are not present in the new branch, and only write files that
+        // are not in the index or are in the index but have the wrong SHA.
+        try {
+          await walkBeta1({
+            trees: [TREE({ fs, dir, gitdir, ref }), WORKDIR({ fs, dir, gitdir })],
+            filter: async function ([head, workdir]) {
+              // match against base paths
+              return bases.some(base => worthWalking(head.fullpath, base))
+            },
+            map: async function ([head, workdir]) {
+              if (head.fullpath === '.') return
+              const workdirPath = workdir.fullpath;
+              if (workdirPath === gitdirBasename) return
+              // Late filter against file names
+              if (patternGlobrex) {
+                let match = false;
+                for (const base of bases) {
+                  const partToMatch = head.fullpath.replace(base + '/', '');
+                  if (patternGlobrex.regex.test(partToMatch)) {
+                    match = true;
+                    break
                   }
-                  if (!match) return
                 }
-                const stage = index.entriesMap.get(GitIndex.key(workdirPath, 0));
-                if (!head.exists) {
-                  // if file is not staged, ignore it
-                  if (workdir.exists && stage) {
-                    await fs.rm(join(dir, workdirPath));
-                    // remove from index
-                    index.delete(workdirPath);
-                    if (emitter) {
-                      emitter.emit(`${emitterPrefix}progress`, {
-                        phase: 'Updating workdir',
-                        loaded: ++count,
-                        lengthComputable: false
-                      });
-                    }
+                if (!match) return
+              }
+              const stage = index.entriesMap.get(GitIndex.key(workdirPath, 0));
+              if (!head.exists) {
+                // if file is not staged, ignore it
+                if (workdir.exists && stage) {
+                  await fs.rm(join(dir, workdirPath));
+                  // remove from index
+                  index.delete(workdirPath);
+                  if (emitter) {
+                    emitter.emit(`${emitterPrefix}progress`, {
+                      phase: 'Updating workdir',
+                      loaded: ++count,
+                      lengthComputable: false
+                    });
                   }
-                  return
                 }
-                await head.populateStat();
-                const filepath = `${dir}/${head.fullpath}`;
-                switch (head.type) {
-                  case 'tree': {
-                    // ignore directories for now
-                    if (!workdir.exists) await fs.mkdir(filepath);
-                    break
-                  }
-                  case 'commit': {
-                    // gitlinks
-                    console.log(
-                      new GitError(E.NotImplementedFail, {
-                        thing: 'submodule support'
-                      })
-                    );
-                    break
-                  }
-                  case 'blob': {
-                    await head.populateHash();
-                    const { fullpath, oid, mode } = head;
-                    if (!stage || stage.oid !== oid || !workdir.exists) {
-                      await head.populateContent();
-                      switch (mode) {
-                        case '100644':
-                          // regular file
-                          await fs.write(filepath, head.content);
-                          break
-                        case '100755':
-                          // executable file
-                          await fs.write(filepath, head.content, { mode: 0o777 });
-                          break
-                        case '120000':
-                          // symlink
-                          await fs.writelink(filepath, head.content);
-                          break
-                        default:
-                          throw new GitError(E.InternalFail, {
-                            message: `Invalid mode "${mode}" detected in blob ${oid}`
-                          })
-                      }
-                      const stats = await fs.lstat(filepath);
-                      // We can't trust the executable bit returned by lstat on Windows,
-                      // so we need to preserve this value from the TREE.
-                      // TODO: Figure out how git handles this internally.
-                      if (mode === '100755') {
-                        stats.mode = 0o755;
-                      }
-                      index.insert({
-                        filepath: fullpath,
-                        stats,
-                        oid
-                      });
-                    }
-                    if (emitter) {
-                      emitter.emit(`${emitterPrefix}progress`, {
-                        phase: 'Updating workdir',
-                        loaded: ++count,
-                        lengthComputable: false
-                      });
-                    }
-                    break
-                  }
-                  default: {
-                    throw new GitError(E.ObjectTypeAssertionInTreeFail, {
-                      type: head.type,
-                      oid: head.oid,
-                      entrypath: head.fullpath
+                return
+              }
+              await head.populateStat();
+              const filepath = `${dir}/${head.fullpath}`;
+              switch (head.type) {
+                case 'tree': {
+                  // ignore directories for now
+                  if (!workdir.exists) await fs.mkdir(filepath);
+                  break
+                }
+                case 'commit': {
+                  // gitlinks
+                  console.log(
+                    new GitError(E.NotImplementedFail, {
+                      thing: 'submodule support'
                     })
+                  );
+                  break
+                }
+                case 'blob': {
+                  await head.populateHash();
+                  const { fullpath, oid, mode } = head;
+                  if (!stage || stage.oid !== oid || !workdir.exists) {
+                    await head.populateContent();
+                    switch (mode) {
+                      case '100644':
+                        // regular file
+                        await fs.write(filepath, head.content);
+                        break
+                      case '100755':
+                        // executable file
+                        await fs.write(filepath, head.content, { mode: 0o777 });
+                        break
+                      case '120000':
+                        // symlink
+                        await fs.writelink(filepath, head.content);
+                        break
+                      default:
+                        throw new GitError(E.InternalFail, {
+                          message: `Invalid mode "${mode}" detected in blob ${oid}`
+                        })
+                    }
+                    const stats = await fs.lstat(filepath);
+                    // We can't trust the executable bit returned by lstat on Windows,
+                    // so we need to preserve this value from the TREE.
+                    // TODO: Figure out how git handles this internally.
+                    if (mode === '100755') {
+                      stats.mode = 0o755;
+                    }
+                    index.insert({
+                      filepath: fullpath,
+                      stats,
+                      oid
+                    });
+                    if (emitter) {
+                      emitter.emit(`${emitterPrefix}progress`, {
+                        phase: 'Updating workdir',
+                        loaded: ++count,
+                        lengthComputable: false
+                      });
+                    }
                   }
+                  break
+                }
+                default: {
+                  throw new GitError(E.ObjectTypeAssertionInTreeFail, {
+                    type: head.type,
+                    oid: head.oid,
+                    entrypath: head.fullpath
+                  })
                 }
               }
-            });
-          } catch (err) {
-            // Throw a more helpful error message for this common mistake.
-            if (err.code === E.ReadObjectFail && err.data.oid === oid) {
-              throw new GitError(E.CommitNotFetchedError, { ref, oid })
-            } else {
-              throw err
             }
+          });
+        } catch (err) {
+          // Throw a more helpful error message for this common mistake.
+          if (err.code === E.ReadObjectFail && err.data.oid === oid) {
+            throw new GitError(E.CommitNotFetchedError, { ref, oid })
+          } else {
+            throw err
           }
         }
-      );
+      });
     }
     // Update HEAD
     const content = fullRef.startsWith('refs/heads') ? `ref: ${fullRef}` : oid;
@@ -5944,7 +5947,11 @@ async function fetchPackfile ({
       'multi_ack_detailed',
       'no-done',
       'side-band-64k',
-      'thin-pack',
+      // Note: I removed 'thin-pack' option since our code doesn't "fatten" packfiles,
+      // which is necessary for compatibility with git. It was the cause of mysterious
+      // 'fatal: pack has [x] unresolved deltas' errors that plagued us for some time.
+      // isomorphic-git is perfectly happy with thin packfiles in .git/objects/pack but
+      // canonical git it turns out is NOT.
       'ofs-delta',
       `agent=${pkg.agent}`
     ]
@@ -6135,7 +6142,7 @@ async function init ({
       'refs/heads',
       'refs/tags'
     ];
-    let total = folders.length;
+    const total = folders.length;
     folders = folders.map(dir => gitdir + '/' + dir);
     if (emitter) {
       emitter.emit(`${emitterPrefix}progress`, {
@@ -6425,90 +6432,86 @@ async function commit ({
       });
     }
 
-    let oid;
-    await GitIndexManager.acquire(
-      { fs, filepath: `${gitdir}/index` },
-      async function (index) {
-        if (!parent) {
-          try {
-            parent = [
-              await GitRefManager.resolve({
-                fs,
-                gitdir,
-                ref
-              })
-            ];
-          } catch (err) {
-            // Probably an initial commit
-            parent = [];
-          }
-        }
-
-        let mergeHash;
+    return GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+      if (!parent) {
         try {
-          mergeHash = await GitRefManager.resolve({ fs, gitdir, ref: 'MERGE_HEAD' });
+          parent = [
+            await GitRefManager.resolve({
+              fs,
+              gitdir,
+              ref
+            })
+          ];
         } catch (err) {
-          // No merge hash
-        }
-
-        if (mergeHash) {
-          const conflictedPaths = index.conflictedPaths;
-          if (conflictedPaths.length > 0) {
-            throw new GitError(E.CommitUnmergedConflictsFail, { paths: conflictedPaths })
-          }
-          if (parent.length) {
-            if (!parent.includes(mergeHash)) parent.push(mergeHash);
-          } else {
-            throw new GitError(E.NoHeadCommitError, { noun: 'merge commit', ref: mergeHash })
-          }
-        }
-
-        if (!tree) {
-          tree = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index });
-        }
-
-        if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
-            phase: 'Writing commit',
-            loaded: 0,
-            lengthComputable: false
-          });
-        }
-
-        let comm = GitCommit.from({
-          tree,
-          parent,
-          author,
-          committer,
-          message
-        });
-        if (signingKey) {
-          const pgp = cores.get(core).get('pgp');
-          comm = await GitCommit.sign(comm, pgp, signingKey);
-        }
-        oid = await writeObject({
-          fs,
-          gitdir,
-          type: 'commit',
-          object: comm.toObject(),
-          dryRun
-        });
-        if (!noUpdateBranch && !dryRun) {
-          // Update branch pointer
-          await GitRefManager.writeRef({
-            fs,
-            gitdir,
-            ref,
-            value: oid
-          });
-          if (mergeHash) {
-            await GitRefManager.deleteRef({ fs, gitdir, ref: 'MERGE_HEAD' });
-            await fs.rm(join(gitdir, 'MERGE_MSG'));
-          }
+          // Probably an initial commit
+          parent = [];
         }
       }
-    );
-    return oid
+
+      let mergeHash;
+      try {
+        mergeHash = await GitRefManager.resolve({ fs, gitdir, ref: 'MERGE_HEAD' });
+      } catch (err) {
+        // No merge hash
+      }
+
+      if (mergeHash) {
+        const conflictedPaths = index.conflictedPaths;
+        if (conflictedPaths.length > 0) {
+          throw new GitError(E.CommitUnmergedConflictsFail, { paths: conflictedPaths })
+        }
+        if (parent.length) {
+          if (!parent.includes(mergeHash)) parent.push(mergeHash);
+        } else {
+          throw new GitError(E.NoHeadCommitError, { noun: 'merge commit', ref: mergeHash })
+        }
+      }
+
+      if (!tree) {
+        tree = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index });
+      }
+
+      if (emitter) {
+        emitter.emit(`${emitterPrefix}progress`, {
+          phase: 'Writing commit',
+          loaded: 0,
+          lengthComputable: false
+        });
+      }
+
+      let comm = GitCommit.from({
+        tree,
+        parent,
+        author,
+        committer,
+        message
+      });
+      if (signingKey) {
+        const pgp = cores.get(core).get('pgp');
+        comm = await GitCommit.sign(comm, pgp, signingKey);
+      }
+      const oid = await writeObject({
+        fs,
+        gitdir,
+        type: 'commit',
+        object: comm.toObject(),
+        dryRun
+      });
+      if (!noUpdateBranch && !dryRun) {
+        // Update branch pointer
+        await GitRefManager.writeRef({
+          fs,
+          gitdir,
+          ref,
+          value: oid
+        });
+        if (mergeHash) {
+          await GitRefManager.deleteRef({ fs, gitdir, ref: 'MERGE_HEAD' });
+          await fs.rm(join(gitdir, 'MERGE_MSG'));
+        }
+      }
+      return oid
+    })
   } catch (err) {
     err.caller = 'git.commit';
     throw err
@@ -6996,6 +6999,98 @@ async function _findRoot (fs, filepath) {
     }
     return _findRoot(fs, parent)
   }
+}
+
+/**
+ * Find the root git directory
+ *
+ * Starting at `filepath`, walks upward until it finds a directory that contains a subdirectory called '.git'.
+ *
+ * @param {Object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {GitTree} [args.tree] - The tree to start searching in.
+ * @param {string} args.path - The file path to search for.
+ *
+ * @returns {Promise<string>} Resolves successfully with a root git directory path
+ * @throws {GitRootNotFoundError}
+ *
+ * @example
+ * let gitroot = await git.findRoot({
+  *   filepath: '$input((/path/to/some/gitrepo/path/to/some/file.txt))'
+  * })
+  * console.log(gitroot) // '/path/to/some/gitrepo'
+  *
+  */
+async function getOidAtPath ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs = cores.get(core).get('fs'),
+  tree = null,
+  path
+}) {
+  if (typeof path === 'string') path = path.split('/');
+  if (!tree) tree = await getHeadTree({ fs, gitdir });
+  const dirname = path.shift();
+  for (const entry of tree) {
+    if (entry.path === dirname) {
+      if (path.length === 0) {
+        return entry.oid
+      }
+      const { type, object } = await readObject({
+        fs,
+        gitdir,
+        oid: entry.oid
+      });
+      if (type === 'tree') {
+        const tree = GitTree.from(object);
+        return getOidAtPath({ fs, gitdir, tree, path })
+      }
+      if (type === 'blob') {
+        throw new GitError(E.ObjectTypeAssertionInPathFail, {
+          oid: entry.oid,
+          path: path.join('/')
+        })
+      }
+    }
+  }
+  return null
+}
+
+async function getHeadTree ({ fs, gitdir }) {
+  // Get the tree from the HEAD commit.
+  let oid;
+  try {
+    oid = await GitRefManager.resolve({ fs, gitdir, ref: 'HEAD' });
+  } catch (e) {
+    // Handle fresh branches with no commits
+    if (e.code === E.ResolveRefError) {
+      return []
+    }
+  }
+  const { type, object } = await readObject({ fs, gitdir, oid });
+  if (type !== 'commit') {
+    throw new GitError(E.ResolveCommitError, { oid })
+  }
+  const commit = GitCommit.from(object);
+  oid = commit.parseHeaders().tree;
+  return getTree({ fs, gitdir, oid })
+}
+
+async function getTree ({ fs, gitdir, oid }) {
+  const { type, object } = await readObject({
+    fs,
+    gitdir,
+    oid
+  });
+  if (type !== 'tree') {
+    throw new GitError(E.ResolveTreeError, { oid })
+  }
+  const tree = GitTree.from(object).entries();
+  return tree
 }
 
 // @ts-check
@@ -7676,20 +7771,16 @@ async function listFiles ({
   ref
 }) {
   try {
-    let filenames;
     if (ref) {
       const oid = await GitRefManager.resolve({ gitdir, fs, ref });
-      filenames = [];
+      const filenames = [];
       await accumulateFilesFromOid({ gitdir, fs, oid, filenames, prefix: '' });
+      return filenames
     } else {
-      await GitIndexManager.acquire(
-        { fs, filepath: `${gitdir}/index` },
-        async function (index) {
-          filenames = index.entries.map(x => x.path);
-        }
-      );
+      return GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+        return index.entries.map(x => x.path)
+      })
     }
-    return filenames
   } catch (err) {
     err.caller = 'git.listFiles';
     throw err
@@ -8238,42 +8329,39 @@ async function merge ({
       const total = mergeDiff.length;
 
       let treeOid; let hasConflict = false;
-      await GitIndexManager.acquire(
-        { fs, filepath: `${gitdir}/index` },
-        async function (index) {
-          let count = 0;
-          for (const diff of mergeDiff) {
-            const { ours, theirs, base } = diff;
-            // for simple cases of add, remove, or modify files
-            switch (diff.status) {
-              case 'added':
-                await processAdded({ ours, theirs, fs, index, dir });
-                break
-              case 'deleted':
-                index.delete({ filepath: base.fullpath });
-                await fs.rm(`${dir}/${base.fullpath}`);
-                break
-              case 'modified':
-                await processModified({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir });
-                break
-              case 'conflict':
-                const conflict = await processConflict({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir, gitdir });
-                hasConflict = hasConflict || conflict;
-                break
-            }
-
-            if (emitter) {
-              emitter.emit(`${emitterPrefix}progress`, {
-                phase: 'Applying changes',
-                loaded: ++count,
-                total,
-                lengthComputable: true
-              });
-            }
+      await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+        let count = 0;
+        for (const diff of mergeDiff) {
+          const { ours, theirs, base } = diff;
+          // for simple cases of add, remove, or modify files
+          switch (diff.status) {
+            case 'added':
+              await processAdded({ ours, theirs, fs, index, dir });
+              break
+            case 'deleted':
+              index.delete({ filepath: base.fullpath });
+              await fs.rm(`${dir}/${base.fullpath}`);
+              break
+            case 'modified':
+              await processModified({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir });
+              break
+            case 'conflict':
+              const conflict = await processConflict({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir, gitdir });
+              hasConflict = hasConflict || conflict;
+              break
           }
-          treeOid = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index });
+
+          if (emitter) {
+            emitter.emit(`${emitterPrefix}progress`, {
+              phase: 'Applying changes',
+              loaded: ++count,
+              total,
+              lengthComputable: true
+            });
+          }
         }
-      );
+        treeOid = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index });
+      });
 
       if (!message) {
         message = `Merge branch '${abbreviateRef(theirRef)}' into ${abbreviateRef(ourRef)}`;
@@ -8317,9 +8405,9 @@ async function processAdded ({ ours, theirs, fs, index, dir }) {
     !added.oid && added.populateHash(),
     !added.content && added.populateContent()
   ]);
-  const { fullpath: filepath, contents, oid } = added;
+  const { fullpath: filepath, content, oid } = added;
   const workingPath = `${dir}/${filepath}`;
-  await fs.write(workingPath, contents);
+  await fs.write(workingPath, content);
   const stats = await fs.lstat(workingPath);
   index.insert({ filepath, stats, oid });
 }
@@ -9023,12 +9111,9 @@ async function remove ({
   filepath
 }) {
   try {
-    await GitIndexManager.acquire(
-      { fs, filepath: `${gitdir}/index` },
-      async function (index) {
-        index.delete({ filepath });
-      }
-    );
+    await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+      index.delete({ filepath });
+    });
     // TODO: return oid?
   } catch (err) {
     err.caller = 'git.remove';
@@ -9109,15 +9194,12 @@ async function resetIndex ({
         stats = await fs.lstat(join(dir, filepath));
       }
     }
-    await GitIndexManager.acquire(
-      { fs, filepath: `${gitdir}/index` },
-      async function (index) {
-        index.delete({ filepath });
-        if (oid) {
-          index.insert({ filepath, stats, oid });
-        }
+    await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+      index.delete({ filepath });
+      if (oid) {
+        index.insert({ filepath, stats, oid });
       }
-    );
+    });
   } catch (err) {
     err.caller = 'git.reset';
     throw err
@@ -9363,23 +9445,19 @@ async function status ({
     if (ignored) {
       return 'ignored'
     }
-    const headTree = await getHeadTree({ fs, gitdir });
     const treeOid = await getOidAtPath({
       fs,
+      dir,
       gitdir,
-      tree: headTree,
       path: filepath
     });
-    let indexEntry;
-    let conflictEntry;
     // Acquire a lock on the index
-    await GitIndexManager.acquire(
-      { fs, filepath: `${gitdir}/index` },
-      async function (index) {
-        indexEntry = index.entriesMap.get(GitIndex.key(filepath, 0));
-        conflictEntry = index.entriesMap.get(GitIndex.key(filepath, 2));
+    const { indexEntry, conflictEntry } = await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+      return {
+        indexEntry: index.entriesMap.get(GitIndex.key(filepath, 0)),
+        conflictEntry: index.entriesMap.get(GitIndex.key(filepath, 2))
       }
-    );
+    });
     const stats = await fs.lstat(join(dir, filepath));
 
     const H = treeOid !== null; // head
@@ -9404,12 +9482,9 @@ async function status ({
           // (like the Karma webserver) because BrowserFS HTTP Backend uses HTTP HEAD requests to do fs.stat
           if (stats.size !== -1) {
             // We don't await this so we can return faster for one-off cases.
-            GitIndexManager.acquire(
-              { fs, filepath: `${gitdir}/index` },
-              async function (index) {
-                index.insert({ filepath, stats, oid: workdirOid });
-              }
-            );
+            GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+              index.insert({ filepath, stats, oid: workdirOid });
+            });
           }
         }
         return workdirOid
@@ -9462,84 +9537,17 @@ async function status ({
   }
 }
 
-async function getOidAtPath ({ fs, gitdir, tree, path }) {
-  if (typeof path === 'string') path = path.split('/');
-  const dirname = path.shift();
-  for (const entry of tree) {
-    if (entry.path === dirname) {
-      if (path.length === 0) {
-        return entry.oid
-      }
-      const { type, object } = await readObject({
-        fs,
-        gitdir,
-        oid: entry.oid
-      });
-      if (type === 'tree') {
-        const tree = GitTree.from(object);
-        return getOidAtPath({ fs, gitdir, tree, path })
-      }
-      if (type === 'blob') {
-        throw new GitError(E.ObjectTypeAssertionInPathFail, {
-          oid: entry.oid,
-          path: path.join('/')
-        })
-      }
-    }
-  }
-  return null
-}
-
-async function getHeadTree ({ fs, gitdir }) {
-  // Get the tree from the HEAD commit.
-  let oid;
-  try {
-    oid = await GitRefManager.resolve({ fs, gitdir, ref: 'HEAD' });
-  } catch (e) {
-    // Handle fresh branches with no commits
-    if (e.code === E.ResolveRefError) {
-      return []
-    }
-  }
-  const { type, object } = await readObject({ fs, gitdir, oid });
-  if (type !== 'commit') {
-    throw new GitError(E.ResolveCommitError, { oid })
-  }
-  const commit = GitCommit.from(object);
-  oid = commit.parseHeaders().tree;
-  return getTree({ fs, gitdir, oid })
-}
-
-async function getTree ({ fs, gitdir, oid }) {
-  const { type, object } = await readObject({
-    fs,
-    gitdir,
-    oid
-  });
-  if (type !== 'tree') {
-    throw new GitError(E.ResolveTreeError, { oid })
-  }
-  const tree = GitTree.from(object).entries();
-  return tree
-}
-
 class GitWalkerIndex {
   constructor ({ fs, gitdir }) {
-    this.treePromise = (async () => {
-      let result;
-      await GitIndexManager.acquire(
-        { fs, filepath: `${gitdir}/index` },
-        async function (index) {
-          result = flatFileListToDirectoryStructure(index.entries);
-          const conflicts = index.conflictedPaths;
-          for (const path of conflicts) {
-            const inode = result.get(path);
-            if (inode) inode.conflict = true;
-          }
-        }
-      );
+    this.treePromise = GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+      const result = flatFileListToDirectoryStructure(index.entries);
+      const conflicts = index.conflictedPaths;
+      for (const path of conflicts) {
+        const inode = result.get(path);
+        if (inode) inode.conflict = true;
+      }
       return result
-    })();
+    });
     const walker = this;
     this.ConstructEntry = class IndexEntry {
       constructor (entry) {
@@ -10274,6 +10282,7 @@ exports.expandRef = expandRef;
 exports.fetch = fetch;
 exports.findMergeBase = findMergeBase;
 exports.findRoot = findRoot;
+exports.getOidAtPath = getOidAtPath;
 exports.getRemoteInfo = getRemoteInfo;
 exports.hashBlob = hashBlob;
 exports.indexPack = indexPack;

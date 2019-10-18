@@ -1779,16 +1779,23 @@ let shouldLog = null;
 
 function log (...args) {
   if (shouldLog === null) {
-    shouldLog =
-      (process &&
-        process.env &&
-        process.env.DEBUG &&
-        (process.env.DEBUG === '*' ||
-          process.env.DEBUG === 'isomorphic-git')) ||
-      (typeof window !== 'undefined' &&
-        typeof window.localStorage !== 'undefined' &&
-        (window.localStorage.debug === '*' ||
-          window.localStorage.debug === 'isomorphic-git'));
+    // Reading localStorage can throw a SECURITY_ERR in Chrome Mobile if "Block third-party cookies and site data" is enabled
+    // and maybe in other scenarios too. I started seeing this error doing Karma testing on my Android phone via local WLAN.
+    // Using the Object.getPropertyDescriptor(window, 'localStorage').enumerable trick didn't avoid the error so using try/catch.
+    try {
+      shouldLog =
+        (process &&
+          process.env &&
+          process.env.DEBUG &&
+          (process.env.DEBUG === '*' ||
+            process.env.DEBUG === 'isomorphic-git')) ||
+        (typeof window !== 'undefined' &&
+          typeof window.localStorage !== 'undefined' &&
+          (window.localStorage.debug === '*' ||
+            window.localStorage.debug === 'isomorphic-git'));
+    } catch (_) {
+      shouldLog = false;
+    }
   }
   if (shouldLog) {
     console.log(...args);
@@ -3548,8 +3555,10 @@ async function isIndexStale (fs, filepath) {
 }
 
 class GitIndexManager {
-  static async acquire ({ fs, filepath }, closure) {
+  static async acquire ({ fs, gitdir }, closure) {
+    const filepath = `${gitdir}/index`;
     if (lock$1 === null) lock$1 = new AsyncLock({ maxPending: Infinity });
+    let result;
     await lock$1.acquire(filepath, async function () {
       // Acquire a file lock while we're reading the index
       // to make sure other processes aren't writing to it
@@ -3559,7 +3568,7 @@ class GitIndexManager {
         await updateCachedIndexFile(fs, filepath);
       }
       const index = map.get([fs, filepath]);
-      await closure(index);
+      result = await closure(index);
       if (index._dirty) {
         // Acquire a file lock while we're writing the index file
         // let fileLock = await Lock(filepath)
@@ -3570,6 +3579,7 @@ class GitIndexManager {
         index._dirty = false;
       }
     });
+    return result
   }
 
   static async constructTree ({ fs, gitdir, dryRun, index }) {
@@ -4675,14 +4685,17 @@ class GitWalkerRepo {
     if (!obj) throw new Error(`No obj for ${filepath}`)
     const oid = obj.oid;
     if (!oid) throw new Error(`No oid for obj ${JSON.stringify(obj)}`)
-    if (obj.type === 'commit') {
-      // TODO: support submodules
+    if (obj.type !== 'tree') {
+      // TODO: support submodules (type === 'commit')
       return null
     }
     const { type, object } = await readObject({ fs, gitdir, oid });
-    if (type === 'blob') return null
-    if (type !== 'tree') {
-      throw new Error(`ENOTDIR: not a directory, scandir '${filepath}'`)
+    if (type !== obj.type) {
+      throw new GitError(E.ObjectTypeAssertionFail, {
+        oid,
+        expected: obj.type,
+        type
+      })
     }
     const tree = GitTree.from(object);
     // cache all entries
