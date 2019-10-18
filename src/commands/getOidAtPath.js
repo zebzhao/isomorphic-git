@@ -35,7 +35,7 @@ export async function getOidAtPath ({
   dir,
   gitdir = join(dir, '.git'),
   fs = cores.get(core).get('fs'),
-  tree,
+  tree = null,
   path
 }) {
   if (typeof path === 'string') path = path.split('/')

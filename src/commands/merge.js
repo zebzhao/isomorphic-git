@@ -181,42 +181,39 @@ export async function merge ({
       const total = mergeDiff.length
 
       let treeOid; let hasConflict = false
-      await GitIndexManager.acquire(
-        { fs, filepath: `${gitdir}/index` },
-        async function (index) {
-          let count = 0
-          for (const diff of mergeDiff) {
-            const { ours, theirs, base } = diff
-            // for simple cases of add, remove, or modify files
-            switch (diff.status) {
-              case 'added':
-                await processAdded({ ours, theirs, fs, index, dir })
-                break
-              case 'deleted':
-                index.delete({ filepath: base.fullpath })
-                await fs.rm(`${dir}/${base.fullpath}`)
-                break
-              case 'modified':
-                await processModified({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir })
-                break
-              case 'conflict':
-                const conflict = await processConflict({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir, gitdir })
-                hasConflict = hasConflict || conflict
-                break
-            }
-
-            if (emitter) {
-              emitter.emit(`${emitterPrefix}progress`, {
-                phase: 'Applying changes',
-                loaded: ++count,
-                total,
-                lengthComputable: true
-              })
-            }
+      await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+        let count = 0
+        for (const diff of mergeDiff) {
+          const { ours, theirs, base } = diff
+          // for simple cases of add, remove, or modify files
+          switch (diff.status) {
+            case 'added':
+              await processAdded({ ours, theirs, fs, index, dir })
+              break
+            case 'deleted':
+              index.delete({ filepath: base.fullpath })
+              await fs.rm(`${dir}/${base.fullpath}`)
+              break
+            case 'modified':
+              await processModified({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir })
+              break
+            case 'conflict':
+              const conflict = await processConflict({ ours, theirs, base, fs, emitter, emitterPrefix, index, dir, gitdir })
+              hasConflict = hasConflict || conflict
+              break
           }
-          treeOid = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index })
+
+          if (emitter) {
+            emitter.emit(`${emitterPrefix}progress`, {
+              phase: 'Applying changes',
+              loaded: ++count,
+              total,
+              lengthComputable: true
+            })
+          }
         }
-      )
+        treeOid = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index })
+      })
 
       if (!message) {
         message = `Merge branch '${abbreviateRef(theirRef)}' into ${abbreviateRef(ourRef)}`
@@ -260,9 +257,9 @@ async function processAdded ({ ours, theirs, fs, index, dir }) {
     !added.oid && added.populateHash(),
     !added.content && added.populateContent()
   ])
-  const { fullpath: filepath, contents, oid } = added
+  const { fullpath: filepath, content, oid } = added
   const workingPath = `${dir}/${filepath}`
-  await fs.write(workingPath, contents)
+  await fs.write(workingPath, content)
   const stats = await fs.lstat(workingPath)
   index.insert({ filepath, stats, oid })
 }

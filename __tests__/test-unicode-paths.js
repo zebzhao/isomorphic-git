@@ -64,7 +64,7 @@ describe('unicode filepath support', () => {
     const { core, dir, gitdir } = await makeFixture('test-unicode-paths')
     await init({ core, dir, gitdir })
     const oids = await add({ core, dir, gitdir, filepath: '日本語' })
-    expect(oids).toMatchObject([{
+    expect(oids).toEqual([{
       filepath: '日本語',
       oid: '56a6051ca2b02b04ef92d5150c9ef600403cb1de'
     }])

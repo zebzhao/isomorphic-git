@@ -62,19 +62,17 @@ export async function status ({
     }
     const treeOid = await getOidAtPath({
       fs,
+      dir,
       gitdir,
       path: filepath
     })
     // Acquire a lock on the index
-    const { indexEntry, conflictEntry } = await GitIndexManager.acquire(
-      { fs, gitdir },
-      async function (index) {
-        return {
-          indexEntry: index.entriesMap.get(GitIndex.key(filepath, 0)),
-          conflictEntry: index.entriesMap.get(GitIndex.key(filepath, 2))
-        }
+    const { indexEntry, conflictEntry } = await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+      return {
+        indexEntry: index.entriesMap.get(GitIndex.key(filepath, 0)),
+        conflictEntry: index.entriesMap.get(GitIndex.key(filepath, 2))
       }
-    )
+    })
     const stats = await fs.lstat(join(dir, filepath))
 
     const H = treeOid !== null // head
