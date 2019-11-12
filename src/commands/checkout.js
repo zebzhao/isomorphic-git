@@ -1,10 +1,10 @@
-// @ts-check
+// @ts-nocheck
+
 import globrex from 'globrex'
 
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
 
-import { GitIndex } from '../models/GitIndex'
 import { E, GitError } from '../models/GitError.js'
 import { join } from '../utils/join.js'
 import { patternRoot } from '../utils/patternRoot.js'
@@ -14,7 +14,8 @@ import { worthWalking } from '../utils/worthWalking.js'
 import { TREE } from './TREE.js'
 import { WORKDIR } from './WORKDIR'
 import { config } from './config'
-import { walkBeta1 } from './walkBeta1'
+import { walkBeta2 } from './walkBeta2.js'
+import { STAGE } from './STAGE.js'
 
 /**
  * Checkout a branch
@@ -126,21 +127,24 @@ export async function checkout ({
         // that are not present in the new branch, and only write files that
         // are not in the index or are in the index but have the wrong SHA.
         try {
-          await walkBeta1({
-            trees: [TREE({ fs, dir, gitdir, ref }), WORKDIR({ fs, dir, gitdir })],
-            filter: async function ([head, workdir]) {
+          await walkBeta2({
+            fs,
+            dir,
+            gitdir,
+            trees: [TREE({ ref }), WORKDIR(), STAGE()],
+            map: async function (fullpath, [head, workdir, stage]) {
               // match against base paths
-              return bases.some(base => worthWalking(head.fullpath, base))
-            },
-            map: async function ([head, workdir]) {
-              if (head.fullpath === '.') return
-              const workdirPath = workdir.fullpath
-              if (workdirPath === gitdirBasename) return
+              if (!bases.some(base => worthWalking(fullpath, base))) {
+                return null
+              }
+              if (fullpath === '.') return
+              if (!head) return
+              if (fullpath === gitdirBasename) return
               // Late filter against file names
               if (patternGlobrex) {
                 let match = false
                 for (const base of bases) {
-                  const partToMatch = head.fullpath.replace(base + '/', '')
+                  const partToMatch = fullpath.replace(base + '/', '')
                   if (patternGlobrex.regex.test(partToMatch)) {
                     match = true
                     break
@@ -148,13 +152,12 @@ export async function checkout ({
                 }
                 if (!match) return
               }
-              const stage = index.entriesMap.get(GitIndex.key(workdirPath, 0))
-              if (!head.exists) {
+              if (!head) {
                 // if file is not staged, ignore it
-                if (workdir.exists && stage) {
-                  await fs.rm(join(dir, workdirPath))
+                if (workdir && stage) {
+                  await fs.rm(join(dir, fullpath))
                   // remove from index
-                  index.delete(workdirPath)
+                  index.delete(fullpath)
                   if (emitter) {
                     emitter.emit(`${emitterPrefix}progress`, {
                       phase: 'Updating workdir',
@@ -165,12 +168,11 @@ export async function checkout ({
                 }
                 return
               }
-              await head.populateStat()
-              const filepath = `${dir}/${head.fullpath}`
-              switch (head.type) {
+              const filepath = `${dir}/${fullpath}`
+              switch (await head.type()) {
                 case 'tree': {
                   // ignore directories for now
-                  if (!workdir.exists) await fs.mkdir(filepath)
+                  if (!workdir) await fs.mkdir(filepath)
                   break
                 }
                 case 'commit': {
@@ -183,22 +185,22 @@ export async function checkout ({
                   break
                 }
                 case 'blob': {
-                  await head.populateHash()
-                  const { fullpath, oid, mode } = head
-                  if (!stage || stage.oid !== oid || !workdir.exists) {
-                    await head.populateContent()
+                  const oid = await head.oid()
+                  if (!stage || !workdir || (await stage.oid()) !== oid) {
+                    const content = await head.content()
+                    const mode = await head.mode()
                     switch (mode) {
-                      case '100644':
+                      case 0o100644:
                         // regular file
-                        await fs.write(filepath, head.content)
+                        await fs.write(filepath, content)
                         break
-                      case '100755':
+                      case 0o100755:
                         // executable file
-                        await fs.write(filepath, head.content, { mode: 0o777 })
+                        await fs.write(filepath, content, { mode: 0o777 })
                         break
-                      case '120000':
+                      case 0o120000:
                         // symlink
-                        await fs.writelink(filepath, head.content)
+                        await fs.writelink(filepath, content)
                         break
                       default:
                         throw new GitError(E.InternalFail, {
@@ -209,8 +211,8 @@ export async function checkout ({
                     // We can't trust the executable bit returned by lstat on Windows,
                     // so we need to preserve this value from the TREE.
                     // TODO: Figure out how git handles this internally.
-                    if (mode === '100755') {
-                      stats.mode = 0o755
+                    if (mode === 0o100755) {
+                      stats.mode = 0o100755
                     }
                     index.insert({
                       filepath: fullpath,
@@ -229,9 +231,9 @@ export async function checkout ({
                 }
                 default: {
                   throw new GitError(E.ObjectTypeAssertionInTreeFail, {
-                    type: head.type,
-                    oid: head.oid,
-                    entrypath: head.fullpath
+                    type: await head.type(),
+                    oid: await head.oid(),
+                    entrypath: fullpath
                   })
                 }
               }

@@ -1,4 +1,4 @@
-// @ts-check
+// @ts-nocheck
 
 import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
@@ -14,6 +14,7 @@ import { cores } from '../utils/plugins.js'
  * @param {boolean} [args.bare = false] - Initialize a bare repository
  * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
  * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
+ * @param {boolean} [args.noOverwrite = false] - Detect if this is already a git repo and do not re-write `.git/config`
  * @returns {Promise<void>}  Resolves successfully when filesystem operations are complete
  *
  * @example
@@ -28,10 +29,12 @@ export async function init ({
   gitdir = bare ? dir : join(dir, '.git'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
-  fs = cores.get(core).get('fs')
+  fs = cores.get(core).get('fs'),
+  noOverwrite = false
 }) {
   try {
     let count = 0
+    if (noOverwrite && (await fs.exists(gitdir + '/config'))) return
     let folders = [
       'hooks',
       'info',

@@ -204,7 +204,7 @@ export async function fetch ({
         emitter,
         emitterPrefix
       })
-      await fs.write(fullpath.replace(/\.pack$/, '.idx'), idx.toBuffer())
+      await fs.write(fullpath.replace(/\.pack$/, '.idx'), await idx.toBuffer())
     }
     return res
   } catch (err) {

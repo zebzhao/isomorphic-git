@@ -1,5 +1,5 @@
 import { BufferCursor } from '../utils/BufferCursor'
-import { compareStrings } from '../utils/compareStrings'
+import { comparePath } from '../utils/comparePath.js'
 import { normalizeStats } from '../utils/normalizeStats'
 import { shasum } from '../utils/shasum'
 
@@ -30,106 +30,101 @@ function renderCacheEntryFlags (entry) {
   )
 }
 
-function parseBuffer (buffer) {
-  // Verify shasum
-  const shaComputed = shasum(buffer.slice(0, -20))
-  const shaClaimed = buffer.slice(-20).toString('hex')
-  if (shaClaimed !== shaComputed) {
-    throw new GitError(E.InternalFail, {
-      message: `Invalid checksum in GitIndex buffer: expected ${shaClaimed} but saw ${shaComputed}`
-    })
-  }
-  const reader = new BufferCursor(buffer)
-  const _entries = new Map()
-  const magic = reader.toString('utf8', 4)
-  if (magic !== 'DIRC') {
-    throw new GitError(E.InternalFail, {
-      message: `Invalid dircache magic file number: ${magic}`
-    })
-  }
-  const version = reader.readUInt32BE()
-  if (version !== 2) {
-    throw new GitError(E.InternalFail, {
-      message: `Unsupported dircache version: ${version}`
-    })
-  }
-  const numEntries = reader.readUInt32BE()
-  let i = 0
-  while (!reader.eof() && i < numEntries) {
-    const entry = {}
-    entry.ctimeSeconds = reader.readUInt32BE()
-    entry.ctimeNanoseconds = reader.readUInt32BE()
-    entry.mtimeSeconds = reader.readUInt32BE()
-    entry.mtimeNanoseconds = reader.readUInt32BE()
-    entry.dev = reader.readUInt32BE()
-    entry.ino = reader.readUInt32BE()
-    entry.mode = reader.readUInt32BE()
-    entry.uid = reader.readUInt32BE()
-    entry.gid = reader.readUInt32BE()
-    entry.size = reader.readUInt32BE()
-    entry.oid = reader.slice(20).toString('hex')
-    const flags = reader.readUInt16BE()
-    entry.flags = parseCacheEntryFlags(flags)
-    // TODO: handle if (version === 3 && entry.flags.extended)
-    const pathlength = buffer.indexOf(0, reader.tell() + 1) - reader.tell()
-    if (pathlength < 1) {
-      throw new GitError(E.InternalFail, {
-        message: `Got a path length of: ${pathlength}`
-      })
-    }
-    // TODO: handle pathnames larger than 12 bits
-    entry.path = reader.toString('utf8', pathlength)
-    // TODO: is this a good way to store stage entries?
-    entry.key = GitIndex.key(entry.path, entry.flags.stage)
-    // The next bit is awkward. We expect 1 to 8 null characters
-    // such that the total size of the entry is a multiple of 8 bits.
-    // (Hence subtract 12 bytes for the header.)
-    let padding = 8 - ((reader.tell() - 12) % 8)
-    if (padding === 0) padding = 8
-    while (padding--) {
-      const tmp = reader.readUInt8()
-      if (tmp !== 0) {
-        throw new GitError(E.InternalFail, {
-          message: `Expected 1-8 null characters but got '${tmp}' after ${entry.path}`
-        })
-      } else if (reader.eof()) {
-        throw new GitError(E.InternalFail, {
-          message: 'Unexpected end of file'
-        })
-      }
-    }
-    // end of awkward part
-    _entries.set(entry.key, entry)
-    i++
-  }
-  return _entries
-}
-
-function compareKey (a, b) {
-  // https://stackoverflow.com/a/40355107/2168416
-  return compareStrings(a.path, b.path)
-}
-
 export class GitIndex {
   /*::
    _entries: Map<string, CacheEntry>
    _dirty: boolean // Used to determine if index needs to be saved to filesystem
    */
-  constructor (index) {
+  constructor (entries) {
     this._dirty = false
-    if (Buffer.isBuffer(index)) {
-      this._entries = parseBuffer(index)
-    } else if (index === null) {
-      this._entries = new Map()
+    this._entries = entries || new Map()
+  }
+
+  static async from (buffer) {
+    if (Buffer.isBuffer(buffer)) {
+      return GitIndex.fromBuffer(buffer)
+    } else if (buffer === null) {
+      return new GitIndex(null)
     } else {
       throw new GitError(E.InternalFail, {
-        message: 'invalid type passed to GitIndex constructor'
+        message: 'invalid type passed to GitIndex.from'
       })
     }
   }
 
-  static from (buffer) {
-    return new GitIndex(buffer)
+  static async fromBuffer (buffer) {
+    // Verify shasum
+    const shaComputed = await shasum(buffer.slice(0, -20))
+    const shaClaimed = buffer.slice(-20).toString('hex')
+    if (shaClaimed !== shaComputed) {
+      throw new GitError(E.InternalFail, {
+        message: `Invalid checksum in GitIndex buffer: expected ${shaClaimed} but saw ${shaComputed}`
+      })
+    }
+    const reader = new BufferCursor(buffer)
+    const _entries = new Map()
+    const magic = reader.toString('utf8', 4)
+    if (magic !== 'DIRC') {
+      throw new GitError(E.InternalFail, {
+        message: `Inavlid dircache magic file number: ${magic}`
+      })
+    }
+    const version = reader.readUInt32BE()
+    if (version !== 2) {
+      throw new GitError(E.InternalFail, {
+        message: `Unsupported dircache version: ${version}`
+      })
+    }
+    const numEntries = reader.readUInt32BE()
+    let i = 0
+    while (!reader.eof() && i < numEntries) {
+      const entry = {}
+      entry.ctimeSeconds = reader.readUInt32BE()
+      entry.ctimeNanoseconds = reader.readUInt32BE()
+      entry.mtimeSeconds = reader.readUInt32BE()
+      entry.mtimeNanoseconds = reader.readUInt32BE()
+      entry.dev = reader.readUInt32BE()
+      entry.ino = reader.readUInt32BE()
+      entry.mode = reader.readUInt32BE()
+      entry.uid = reader.readUInt32BE()
+      entry.gid = reader.readUInt32BE()
+      entry.size = reader.readUInt32BE()
+      entry.oid = reader.slice(20).toString('hex')
+      const flags = reader.readUInt16BE()
+      entry.flags = parseCacheEntryFlags(flags)
+      // TODO: handle if (version === 3 && entry.flags.extended)
+      const pathlength = buffer.indexOf(0, reader.tell() + 1) - reader.tell()
+      if (pathlength < 1) {
+        throw new GitError(E.InternalFail, {
+          message: `Got a path length of: ${pathlength}`
+        })
+      }
+      // TODO: handle pathnames larger than 12 bits
+      entry.path = reader.toString('utf8', pathlength)
+      // TODO: is this a good way to store stage entries?
+      entry.key = GitIndex.key(entry.path, entry.flags.stage)
+      // The next bit is awkward. We expect 1 to 8 null characters
+      // such that the total size of the entry is a multiple of 8 bits.
+      // (Hence subtract 12 bytes for the header.)
+      let padding = 8 - ((reader.tell() - 12) % 8)
+      if (padding === 0) padding = 8
+      while (padding--) {
+        const tmp = reader.readUInt8()
+        if (tmp !== 0) {
+          throw new GitError(E.InternalFail, {
+            message: `Expected 1-8 null characters but got '${tmp}' after ${entry.path}`
+          })
+        } else if (reader.eof()) {
+          throw new GitError(E.InternalFail, {
+            message: 'Unexpected end of file'
+          })
+        }
+      }
+      // end of awkward part
+      _entries.set(entry.key, entry)
+      i++
+    }
+    return new GitIndex(_entries)
   }
 
   static key (path, stage) {
@@ -138,7 +133,7 @@ export class GitIndex {
   }
 
   get entries () {
-    return [...this._entries.values()].sort(compareKey)
+    return [...this._entries.values()].sort(comparePath)
   }
 
   get entriesMap () {
@@ -215,7 +210,7 @@ export class GitIndex {
       .join('\n')
   }
 
-  toObject () {
+  async toObject () {
     const header = Buffer.alloc(12)
     const writer = new BufferCursor(header)
     writer.write('DIRC', 4, 'utf8')
@@ -246,7 +241,7 @@ export class GitIndex {
       })
     )
     const main = Buffer.concat([header, body])
-    const sum = shasum(main)
+    const sum = await shasum(main)
     return Buffer.concat([main, Buffer.from(sum, 'hex')])
   }
 }

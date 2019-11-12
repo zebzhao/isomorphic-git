@@ -16,7 +16,7 @@ import { merge } from './merge'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref] - Which branch to fetch. By default this is the currently checked out branch.
@@ -34,6 +34,7 @@ import { merge } from './merge'
  * @param {Object} [args.author] - passed to [commit](commit.md) when creating a merge commit
  * @param {Object} [args.committer] - passed to [commit](commit.md) when creating a merge commit
  * @param {string} [args.signingKey] - passed to [commit](commit.md) when creating a merge commit
+ * @param {boolean} [args.fast = false] - use fastCheckout instead of regular checkout
  *
  * @returns {Promise<void>} Resolves successfully when pull operation completes
  *
@@ -69,7 +70,8 @@ export async function pull ({
   headers = {},
   author,
   committer,
-  signingKey
+  signingKey,
+  fast = false
 }) {
   try {
     if (emitter) {
@@ -116,6 +118,7 @@ export async function pull ({
       emitter,
       emitterPrefix,
       fastForwardOnly,
+      fast,
       message: `Merge ${fetchHeadDescription}`,
       author,
       committer,
