@@ -175,7 +175,7 @@ describe('fetch', () => {
       dir,
       gitdir,
       depth: 1,
-      url: `http://${localhost}:8888/test-empty.git`
+      url: `http://${localhost}:8128/test-empty.git`
     })
     expect(await fs.exists(`${dir}`)).toBe(true)
     expect(await fs.exists(`${gitdir}/HEAD`)).toBe(true)
@@ -190,7 +190,7 @@ describe('fetch', () => {
     await config({
       gitdir,
       path: 'remote.origin.url',
-      value: `http://${localhost}:8888/test-fetch-server.git`
+      value: `http://${localhost}:8128/test-fetch-server.git`
     })
     expect(await fs.exists(`${gitdir}/refs/remotes/origin/test-prune`)).toBe(
       true
@@ -218,7 +218,7 @@ describe('fetch', () => {
     await config({
       gitdir,
       path: 'remote.origin.url',
-      value: `http://${localhost}:8888/test-fetch-server.git`
+      value: `http://${localhost}:8128/test-fetch-server.git`
     })
     expect(await fs.exists(`${gitdir}/refs/tags/v1.0.0-beta1`)).toBe(true)
     const oldValue = await fs.read(`${gitdir}/refs/tags/v1.0.0`, 'utf8')

@@ -22,6 +22,7 @@ Array [
   "deleteTag",
   "expandOid",
   "expandRef",
+  "fastCheckout",
   "fetch",
   "findMergeBase",
   "findRoot",
@@ -54,6 +55,7 @@ Array [
   "verify",
   "version",
   "walkBeta1",
+  "walkBeta2",
   "writeObject",
   "writeRef",
 ]

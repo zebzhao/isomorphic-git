@@ -21,7 +21,7 @@ describe('push', () => {
     await config({
       gitdir,
       path: 'remote.karma.url',
-      value: `http://${localhost}:8888/test-push-server.git`
+      value: `http://${localhost}:8128/test-push-server.git`
     })
     const output = []
     plugins.set(
@@ -47,7 +47,7 @@ describe('push', () => {
     await config({
       gitdir,
       path: 'remote.karma.url',
-      value: `http://${localhost}:8888/test-push-server.git`
+      value: `http://${localhost}:8128/test-push-server.git`
     })
     // Test
     const res = await push({
@@ -65,7 +65,7 @@ describe('push', () => {
     await config({
       gitdir,
       path: 'remote.karma.url',
-      value: `http://${localhost}:8888/test-push-server.git`
+      value: `http://${localhost}:8128/test-push-server.git`
     })
     // Test
     const res = await push({
@@ -85,7 +85,7 @@ describe('push', () => {
     await config({
       gitdir,
       path: 'remote.karma.url',
-      value: `http://${localhost}:8888/test-push-server.git`
+      value: `http://${localhost}:8128/test-push-server.git`
     })
     // Test
     const res = await push({
@@ -104,7 +104,7 @@ describe('push', () => {
     await config({
       gitdir,
       path: 'remote.karma.url',
-      value: `http://${localhost}:8888/test-push-server.git`
+      value: `http://${localhost}:8128/test-push-server.git`
     })
     // Test
     const res = await push({
@@ -124,7 +124,7 @@ describe('push', () => {
     await config({
       gitdir,
       path: 'remote.auth.url',
-      value: `http://${localhost}:8888/test-push-server-auth.git`
+      value: `http://${localhost}:8128/test-push-server-auth.git`
     })
     // Test
     const res = await push({
@@ -145,7 +145,7 @@ describe('push', () => {
     await config({
       gitdir,
       path: 'remote.url.url',
-      value: `http://testuser:testpassword@${localhost}:8888/test-push-server-auth.git`
+      value: `http://testuser:testpassword@${localhost}:8128/test-push-server-auth.git`
     })
     // Test
     const res = await push({
@@ -164,7 +164,7 @@ describe('push', () => {
     await config({
       gitdir,
       path: 'remote.auth.url',
-      value: `http://${localhost}:8888/test-push-server-auth.git`
+      value: `http://${localhost}:8128/test-push-server-auth.git`
     })
     // Test
     let error = null
@@ -185,7 +185,7 @@ describe('push', () => {
     await config({
       gitdir,
       path: 'remote.auth.url',
-      value: `http://${localhost}:8888/test-push-server-auth.git`
+      value: `http://${localhost}:8128/test-push-server-auth.git`
     })
     // Test
     let error = null

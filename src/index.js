@@ -56,5 +56,6 @@ export * from './commands/TREE.js'
 
 export const utils = { auth, oauth2 }
 export { E } from './models/GitError'
+export { FileSystem } from './models/FileSystem'
 
 export * from './utils/plugins.js'

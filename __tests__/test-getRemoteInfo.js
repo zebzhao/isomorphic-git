@@ -14,7 +14,7 @@ describe('getRemoteInfo', () => {
   })
   it('getRemoteInfo', async () => {
     const info = await getRemoteInfo({
-      url: `http://${localhost}:8888/test-dumb-http-server.git`
+      url: `http://${localhost}:8128/test-dumb-http-server.git`
     })
     expect(info).not.toBeNull()
     expect(info.capabilities).not.toBeNull()

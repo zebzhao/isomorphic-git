@@ -100,7 +100,7 @@ describe('clone', () => {
       gitdir,
       depth: 1,
       singleBranch: true,
-      url: `http://${localhost}:8888/test-status.git`
+      url: `http://${localhost}:8128/test-status.git`
     })
     expect(await fs.exists(`${dir}`)).toBe(true, `'dir' exists`)
     expect(await fs.exists(`${gitdir}/objects`)).toBe(
@@ -120,7 +120,7 @@ describe('clone', () => {
       dir,
       gitdir,
       depth: 1,
-      url: `http://${localhost}:8888/test-empty.git`
+      url: `http://${localhost}:8128/test-empty.git`
     })
     expect(await fs.exists(`${dir}`)).toBe(true, `'dir' exists`)
     expect(await fs.exists(`${gitdir}/HEAD`)).toBe(true, `'gitdir/HEAD' exists`)

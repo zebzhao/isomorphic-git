@@ -1,4 +1,4 @@
-// @ts-nocheck
+// @ts-check
 
 import globrex from 'globrex'
 
@@ -16,6 +16,7 @@ import { WORKDIR } from './WORKDIR'
 import { config } from './config'
 import { walkBeta2 } from './walkBeta2.js'
 import { STAGE } from './STAGE.js'
+import { GitIndex } from '../models/GitIndex.js'
 
 /**
  * Checkout a branch
@@ -24,7 +25,7 @@ import { STAGE } from './STAGE.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
@@ -116,48 +117,104 @@ export async function checkout ({
       // Create a new branch that points at that same commit
       await fs.write(`${gitdir}/refs/heads/${ref}`, oid + '\n')
     }
-    const fullRef = await GitRefManager.expand({ fs, gitdir, ref })
-
     if (!noCheckout) {
       let count = 0
+      const indexEntries = []
       const gitdirBasename = dir ? gitdir.replace(dir + '/', '') : gitdir
-      // Acquire a lock on the index
-      await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
-        // Instead of deleting and rewriting everything, only delete files
-        // that are not present in the new branch, and only write files that
-        // are not in the index or are in the index but have the wrong SHA.
-        try {
-          await walkBeta2({
-            fs,
-            dir,
-            gitdir,
-            trees: [TREE({ ref }), WORKDIR(), STAGE()],
-            map: async function (fullpath, [head, workdir, stage]) {
-              // match against base paths
-              if (!bases.some(base => worthWalking(fullpath, base))) {
-                return null
-              }
-              if (fullpath === '.') return
-              if (!head) return
-              if (fullpath === gitdirBasename) return
-              // Late filter against file names
-              if (patternGlobrex) {
-                let match = false
-                for (const base of bases) {
-                  const partToMatch = fullpath.replace(base + '/', '')
-                  if (patternGlobrex.regex.test(partToMatch)) {
-                    match = true
-                    break
-                  }
+      // Instead of deleting and rewriting everything, only delete files
+      // that are not present in the new branch, and only write files that
+      // are not in the index or are in the index but have the wrong SHA.
+      try {
+        await walkBeta2({
+          fs,
+          dir,
+          gitdir,
+          trees: [TREE({ ref }), WORKDIR(), STAGE()],
+          map: async function (fullpath, [head, workdir, stage]) {
+            // match against base paths
+            if (!bases.some(base => worthWalking(fullpath, base))) {
+              return null
+            }
+            if (fullpath === '.') return
+            if (!head) return
+            if (fullpath === gitdirBasename) return
+            // Late filter against file names
+            if (patternGlobrex) {
+              let match = false
+              for (const base of bases) {
+                const partToMatch = fullpath.replace(base + '/', '')
+                if (patternGlobrex.regex.test(partToMatch)) {
+                  match = true
+                  break
                 }
-                if (!match) return
               }
-              if (!head) {
-                // if file is not staged, ignore it
-                if (workdir && stage) {
-                  await fs.rm(join(dir, fullpath))
-                  // remove from index
-                  index.delete(fullpath)
+              if (!match) return
+            }
+            if (!head) {
+              // if file is not staged, ignore it
+              if (stage && workdir) {
+                await fs.rm(join(dir, fullpath))
+                if (emitter) {
+                  emitter.emit(`${emitterPrefix}progress`, {
+                    phase: 'Updating workdir',
+                    loaded: ++count,
+                    lengthComputable: false
+                  })
+                }
+              }
+              return
+            }
+            const filepath = `${dir}/${fullpath}`
+            switch (await head.type()) {
+              case 'tree': {
+                // ignore directories for now
+                if (!workdir) await fs.mkdir(filepath)
+                break
+              }
+              case 'commit': {
+                // gitlinks
+                console.log(
+                  new GitError(E.NotImplementedFail, {
+                    thing: 'submodule support'
+                  })
+                )
+                break
+              }
+              case 'blob': {
+                const oid = await head.oid()
+                if (!stage || !workdir || (await stage.oid()) !== oid) {
+                  const content = await head.content()
+                  const mode = await head.mode()
+                  switch (mode) {
+                    case 0o100644:
+                      // regular file
+                      await fs.write(filepath, content)
+                      break
+                    case 0o100755:
+                      // executable file
+                      await fs.write(filepath, content, { mode: 0o777 })
+                      break
+                    case 0o120000:
+                      // symlink
+                      await fs.writelink(filepath, content)
+                      break
+                    default:
+                      throw new GitError(E.InternalFail, {
+                        message: `Invalid mode "${mode}" detected in blob ${oid}`
+                      })
+                  }
+                  const stats = await fs.lstat(filepath)
+                  // We can't trust the executable bit returned by lstat on Windows,
+                  // so we need to preserve this value from the TREE.
+                  // TODO: Figure out how git handles this internally.
+                  if (mode === 0o100755) {
+                    stats.mode = 0o100755
+                  }
+                  indexEntries.push({
+                    filepath: fullpath,
+                    stats,
+                    oid
+                  })
                   if (emitter) {
                     emitter.emit(`${emitterPrefix}progress`, {
                       phase: 'Updating workdir',
@@ -166,90 +223,36 @@ export async function checkout ({
                     })
                   }
                 }
-                return
+                break
               }
-              const filepath = `${dir}/${fullpath}`
-              switch (await head.type()) {
-                case 'tree': {
-                  // ignore directories for now
-                  if (!workdir) await fs.mkdir(filepath)
-                  break
-                }
-                case 'commit': {
-                  // gitlinks
-                  console.log(
-                    new GitError(E.NotImplementedFail, {
-                      thing: 'submodule support'
-                    })
-                  )
-                  break
-                }
-                case 'blob': {
-                  const oid = await head.oid()
-                  if (!stage || !workdir || (await stage.oid()) !== oid) {
-                    const content = await head.content()
-                    const mode = await head.mode()
-                    switch (mode) {
-                      case 0o100644:
-                        // regular file
-                        await fs.write(filepath, content)
-                        break
-                      case 0o100755:
-                        // executable file
-                        await fs.write(filepath, content, { mode: 0o777 })
-                        break
-                      case 0o120000:
-                        // symlink
-                        await fs.writelink(filepath, content)
-                        break
-                      default:
-                        throw new GitError(E.InternalFail, {
-                          message: `Invalid mode "${mode}" detected in blob ${oid}`
-                        })
-                    }
-                    const stats = await fs.lstat(filepath)
-                    // We can't trust the executable bit returned by lstat on Windows,
-                    // so we need to preserve this value from the TREE.
-                    // TODO: Figure out how git handles this internally.
-                    if (mode === 0o100755) {
-                      stats.mode = 0o100755
-                    }
-                    index.insert({
-                      filepath: fullpath,
-                      stats,
-                      oid
-                    })
-                    if (emitter) {
-                      emitter.emit(`${emitterPrefix}progress`, {
-                        phase: 'Updating workdir',
-                        loaded: ++count,
-                        lengthComputable: false
-                      })
-                    }
-                  }
-                  break
-                }
-                default: {
-                  throw new GitError(E.ObjectTypeAssertionInTreeFail, {
-                    type: await head.type(),
-                    oid: await head.oid(),
-                    entrypath: fullpath
-                  })
-                }
+              default: {
+                throw new GitError(E.ObjectTypeAssertionInTreeFail, {
+                  type: await head.type(),
+                  oid: await head.oid(),
+                  entrypath: fullpath
+                })
               }
             }
-          })
-        } catch (err) {
-          // Throw a more helpful error message for this common mistake.
-          if (err.code === E.ReadObjectFail && err.data.oid === oid) {
-            throw new GitError(E.CommitNotFetchedError, { ref, oid })
-          } else {
-            throw err
           }
+        })
+        // Acquire a lock on the index
+        await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+          index.clear()
+          for (let entry of indexEntries) {
+            index.insert(entry)
+          }
+        })
+      } catch (err) {
+        // Throw a more helpful error message for this common mistake.
+        if (err.code === E.ReadObjectFail && err.data.oid === oid) {
+          throw new GitError(E.CommitNotFetchedError, { ref, oid })
+        } else {
+          throw err
         }
-      })
+      }
     }
     // Update HEAD
+    const fullRef = await GitRefManager.expand({ fs, gitdir, ref })
     const content = fullRef.startsWith('refs/heads') ? `ref: ${fullRef}` : oid
     await fs.write(`${gitdir}/HEAD`, `${content}\n`)
   } catch (err) {

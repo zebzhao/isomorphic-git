@@ -81,9 +81,9 @@ module.exports = {
       stop: `cors-proxy stop`
     },
     gitserver: {
-      default: `cross-env GIT_HTTP_MOCK_SERVER_PORT=8888 GIT_HTTP_MOCK_SERVER_ROOT=__tests__/__fixtures__ git-http-mock-server`,
-      start: `cross-env GIT_HTTP_MOCK_SERVER_PORT=8888 GIT_HTTP_MOCK_SERVER_ROOT=__tests__/__fixtures__ git-http-mock-server start`,
-      stop: `cross-env GIT_HTTP_MOCK_SERVER_PORT=8888 GIT_HTTP_MOCK_SERVER_ROOT=__tests__/__fixtures__ git-http-mock-server stop`
+      default: `cross-env GIT_HTTP_MOCK_SERVER_PORT=8128 GIT_HTTP_MOCK_SERVER_ROOT=__tests__/__fixtures__ git-http-mock-server`,
+      start: `cross-env GIT_HTTP_MOCK_SERVER_PORT=8128 GIT_HTTP_MOCK_SERVER_ROOT=__tests__/__fixtures__ git-http-mock-server start`,
+      stop: `cross-env GIT_HTTP_MOCK_SERVER_PORT=8128 GIT_HTTP_MOCK_SERVER_ROOT=__tests__/__fixtures__ git-http-mock-server stop`
     },
     test: {
       // We run jest in Travis so we get accurate code coverage that's mapped to the original source.
