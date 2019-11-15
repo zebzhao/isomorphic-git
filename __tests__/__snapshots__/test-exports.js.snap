@@ -3,6 +3,7 @@
 exports[`exports exposes only the intended API functions 1`] = `
 Array [
   "E",
+  "FileSystem",
   "STAGE",
   "TREE",
   "WORKDIR",

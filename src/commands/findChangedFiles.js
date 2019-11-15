@@ -3,7 +3,7 @@ import { join } from '../utils/join.js'
 import { cores } from '../utils/plugins.js'
 
 import { TREE } from './TREE.js'
-import { walkBeta1 } from './walkBeta1.js'
+import { walkBeta2 } from './walkBeta2.js'
 
 /**
  * Find diff of files between two trees with a common ancestor.
@@ -23,27 +23,21 @@ export async function findChangedFiles ({
   // Adapted from: http://gitlet.maryrosecook.com/docs/gitlet.html#section-220
   try {
     let count = 0
-    return await walkBeta1({
+    return await walkBeta2({
       fs,
       dir,
       gitdir,
       trees: [
-        TREE({ fs, gitdir, ref: ourOid }),
-        TREE({ fs, gitdir, ref: theirOid }),
-        TREE({ fs, gitdir, ref: baseOid })
+        TREE({ ref: ourOid }),
+        TREE({ ref: theirOid }),
+        TREE({ ref: baseOid })
       ],
-      map: async function ([ours, theirs, base]) {
-        if (ours.fullpath === '.') return
+      map: async function (filepath, [ours, theirs, base]) {
+        if (filepath === '.') return
 
-        await Promise.all([
-          base.exists && base.populateStat(),
-          theirs.exists && theirs.populateStat(),
-          ours.exists && ours.populateStat()
-        ])
-
-        if ((base.exists && base.type !== 'blob') ||
-            (ours.exists && ours.type !== 'blob') ||
-            (theirs.exists && theirs.type !== 'blob')) return
+        if ((base && (await base.type()) !== 'blob') ||
+            (ours && (await ours.type()) !== 'blob') ||
+            (theirs && (await theirs.type()) !== 'blob')) return
 
         if (emitter) {
           emitter.emit(`${emitterPrefix}progress`, {
@@ -55,9 +49,10 @@ export async function findChangedFiles ({
 
         return {
           status: await fileStatus(ours, theirs, base),
-          ours: ours,
-          theirs: theirs,
-          base: base
+          filepath,
+          ours,
+          theirs,
+          base
         }
       }
     })
@@ -68,31 +63,27 @@ export async function findChangedFiles ({
 }
 
 export async function fileStatus (receiver, giver, base) {
-  const receiverPresent = receiver.exists
-  const basePresent = base.exists
-  const giverPresent = giver.exists
-
-  if ((!receiverPresent && !basePresent && giverPresent) ||
-    (receiverPresent && !basePresent && !giverPresent)) {
+  if ((!receiver && !base && giver) ||
+    (receiver && !base && !giver)) {
     return 'added'
-  } else if ((receiverPresent && basePresent && !giverPresent) ||
-    (!receiverPresent && basePresent && giverPresent)) {
+  } else if ((receiver && base && !giver) ||
+    (!receiver && base && giver)) {
     return 'deleted'
   } else {
-    await Promise.all([
-      receiverPresent && receiver.populateHash(),
-      giverPresent && giver.populateHash()
+    const [receiverOid, giverOid, baseOid] = await Promise.all([
+      receiver && receiver.oid(),
+      giver && giver.oid(),
+      base && base.oid()
     ])
-    if (receiver.oid === giver.oid) {
-      if (receiver.mode === giver.mode) {
+    if (receiverOid === giverOid) {
+      if ((await receiver.mode()) === (await giver.mode())) {
         return 'unmodified'
       } else {
         return 'modified'
       }
     } else {
-      if (basePresent) await base.populateHash()
-      if (receiverPresent && giverPresent && receiver.oid !== giver.oid) {
-        if (receiver.oid !== base.oid && giver.oid !== base.oid) {
+      if (receiver && giver && receiverOid !== giverOid) {
+        if (receiverOid !== baseOid && giverOid !== baseOid) {
           return 'conflict'
         } else {
           return 'modified'

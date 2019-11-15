@@ -16,7 +16,6 @@ import { WORKDIR } from './WORKDIR'
 import { config } from './config'
 import { walkBeta2 } from './walkBeta2.js'
 import { STAGE } from './STAGE.js'
-import { GitIndex } from '../models/GitIndex.js'
 
 /**
  * Checkout a branch
@@ -136,7 +135,6 @@ export async function checkout ({
               return null
             }
             if (fullpath === '.') return
-            if (!head) return
             if (fullpath === gitdirBasename) return
             // Late filter against file names
             if (patternGlobrex) {
@@ -238,7 +236,7 @@ export async function checkout ({
         // Acquire a lock on the index
         await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
           index.clear()
-          for (let entry of indexEntries) {
+          for (const entry of indexEntries) {
             index.insert(entry)
           }
         })

@@ -106,6 +106,7 @@ export interface MergeReport {
   alreadyMerged?: boolean;
   fastForward?: boolean;
   mergeCommit?: boolean;
+  recursiveMerge?: boolean;
   tree?: string;
 }
 
