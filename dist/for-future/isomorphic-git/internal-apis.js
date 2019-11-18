@@ -84,7 +84,8 @@ const messages = {
   PluginSchemaViolation: `Schema check failed for "{ plugin }" plugin; missing { method } method.`,
   PluginUnrecognized: `Unrecognized plugin type "{ plugin }"`,
   AmbiguousShortOid: `Found multiple oids matching "{ short }" ({ matches }). Use a longer abbreviation length to disambiguate them.`,
-  ShortOidNotFound: `Could not find an object matching "{ short }".`
+  ShortOidNotFound: `Could not find an object matching "{ short }".`,
+  CheckoutConflictError: `Your local changes to the following files would be overwritten by checkout: { filepaths }`
 };
 
 const E = {
@@ -159,7 +160,8 @@ const E = {
   PluginSchemaViolation: `PluginSchemaViolation`,
   PluginUnrecognized: `PluginUnrecognized`,
   AmbiguousShortOid: `AmbiguousShortOid`,
-  ShortOidNotFound: `ShortOidNotFound`
+  ShortOidNotFound: `ShortOidNotFound`,
+  CheckoutConflictError: `CheckoutConflictError`
 };
 
 function renderTemplate (template, values) {
@@ -1666,9 +1668,7 @@ function lengthBuffers (buffers) {
 
 async function listpack (stream, onData) {
   const reader = new StreamReader(stream);
-  const hash = new Hash();
   let PACK = await reader.read(4);
-  hash.update(PACK);
   PACK = PACK.toString('utf8');
   if (PACK !== 'PACK') {
     throw new GitError(E.InternalFail, {
@@ -1677,7 +1677,6 @@ async function listpack (stream, onData) {
   }
 
   let version = await reader.read(4);
-  hash.update(version);
   version = version.readUInt32BE(0);
   if (version !== 2) {
     throw new GitError(E.InternalFail, {
@@ -1686,14 +1685,13 @@ async function listpack (stream, onData) {
   }
 
   let numObjects = await reader.read(4);
-  hash.update(numObjects);
   numObjects = numObjects.readUInt32BE(0);
   // If (for some godforsaken reason) this is an empty packfile, abort now.
   if (numObjects < 1) return
 
   while (!reader.eof() && numObjects--) {
     const offset = reader.tell();
-    const { type, length, ofs, reference } = await parseHeader(reader, hash);
+    const { type, length, ofs, reference } = await parseHeader(reader);
     const inflator = new pako.Inflate();
     while (!inflator.result) {
       const chunk = await reader.chunk();
@@ -1713,8 +1711,7 @@ async function listpack (stream, onData) {
 
         // Backtrack parser to where deflated data ends
         await reader.undo();
-        const buf = await reader.read(chunk.length - inflator.strm.avail_in);
-        hash.update(buf);
+        await reader.read(chunk.length - inflator.strm.avail_in);
         const end = reader.tell();
         onData({
           data: inflator.result,
@@ -1725,17 +1722,14 @@ async function listpack (stream, onData) {
           reference,
           ofs
         });
-      } else {
-        hash.update(chunk);
       }
     }
   }
 }
 
-async function parseHeader (reader, hash) {
+async function parseHeader (reader) {
   // Object type is encoded in bits 654
   let byte = await reader.byte();
-  hash.update(Buffer.from([byte]));
   const type = (byte >> 4) & 0b111;
   // The length encoding get complicated.
   // Last four bits of length is encoded in bits 3210
@@ -1746,7 +1740,6 @@ async function parseHeader (reader, hash) {
     let shift = 4;
     do {
       byte = await reader.byte();
-      hash.update(Buffer.from([byte]));
       length |= (byte & 0b01111111) << shift;
       shift += 7;
     } while (byte & 0b10000000)
@@ -1760,7 +1753,6 @@ async function parseHeader (reader, hash) {
     const bytes = [];
     do {
       byte = await reader.byte();
-      hash.update(Buffer.from([byte]));
       ofs |= (byte & 0b01111111) << shift;
       shift += 7;
       bytes.push(byte);
@@ -1769,7 +1761,6 @@ async function parseHeader (reader, hash) {
   }
   if (type === 7) {
     const buf = await reader.read(20);
-    hash.update(buf);
     reference = buf;
   }
   return { type, length, ofs, reference }
@@ -1779,27 +1770,71 @@ let shouldLog = null;
 
 function log (...args) {
   if (shouldLog === null) {
-    shouldLog =
-      (process &&
-        process.env &&
-        process.env.DEBUG &&
-        (process.env.DEBUG === '*' ||
-          process.env.DEBUG === 'isomorphic-git')) ||
-      (typeof window !== 'undefined' &&
-        typeof window.localStorage !== 'undefined' &&
-        (window.localStorage.debug === '*' ||
-          window.localStorage.debug === 'isomorphic-git'));
+    // Reading localStorage can throw a SECURITY_ERR in Chrome Mobile if "Block third-party cookies and site data" is enabled
+    // and maybe in other scenarios too. I started seeing this error doing Karma testing on my Android phone via local WLAN.
+    // Using the Object.getPropertyDescriptor(window, 'localStorage').enumerable trick didn't avoid the error so using try/catch.
+    try {
+      shouldLog =
+        (process &&
+          process.env &&
+          process.env.DEBUG &&
+          (process.env.DEBUG === '*' ||
+            process.env.DEBUG === 'isomorphic-git')) ||
+        (typeof window !== 'undefined' &&
+          typeof window.localStorage !== 'undefined' &&
+          (window.localStorage.debug === '*' ||
+            window.localStorage.debug === 'isomorphic-git'));
+    } catch (_) {
+      shouldLog = false;
+    }
   }
   if (shouldLog) {
     console.log(...args);
   }
 }
 
+function toHex (buffer) {
+  let hex = '';
+  for (const byte of new Uint8Array(buffer)) {
+    if (byte < 16) hex += '0';
+    hex += byte.toString(16);
+  }
+  return hex
+}
+
+/* eslint-env node, browser */
+
+let supportsSubtleSHA1 = null;
+
+async function shasum (buffer) {
+  if (supportsSubtleSHA1 === null) {
+    supportsSubtleSHA1 = await testSubtleSHA1();
+  }
+  return supportsSubtleSHA1 ? subtleSHA1(buffer) : shasumSync(buffer)
+}
+
 // This is modeled after @dominictarr's "shasum" module,
 // but without the 'json-stable-stringify' dependency and
 // extra type-casting features.
-function shasum (buffer) {
+function shasumSync (buffer) {
   return new Hash().update(buffer).digest('hex')
+}
+
+async function subtleSHA1 (buffer) {
+  const hash = await crypto.subtle.digest('SHA-1', buffer);
+  return toHex(hash)
+}
+
+async function testSubtleSHA1 () {
+  // I'm using a rather crude method of progressive enhancement, because
+  // some browsers that have crypto.subtle.digest don't actually implement SHA-1.
+  try {
+    const hash = await subtleSHA1(new Uint8Array([]));
+    if (hash === 'da39a3ee5e6b4b0d3255bfef95601890afd80709') return true
+  } catch (_) {
+    // no bother
+  }
+  return false
 }
 
 function decodeVarInt (reader) {
@@ -2068,7 +2103,7 @@ class GitPackIndex {
         timeByDepth[p.readDepth] += time;
         objectsByDepth[p.readDepth] += 1;
         mark('hash');
-        const oid = shasum(GitObject.wrap({ type, object }));
+        const oid = await shasum(GitObject.wrap({ type, object }));
         times.hash += stop('hash').duration;
         o.oid = oid;
         hashes.push(oid);
@@ -2103,7 +2138,7 @@ class GitPackIndex {
     return p
   }
 
-  toBuffer () {
+  async toBuffer () {
     const buffers = [];
     const write = (str, encoding) => {
       buffers.push(Buffer.from(str, encoding));
@@ -2142,7 +2177,7 @@ class GitPackIndex {
     write(this.packfileSha, 'hex');
     // Write out shasum
     const totalBuffer = Buffer.concat(buffers);
-    const sha = shasum(totalBuffer);
+    const sha = await shasum(totalBuffer);
     const shaBuffer = Buffer.alloc(20);
     shaBuffer.write(sha, 'hex');
     return Buffer.concat([totalBuffer, shaBuffer])
@@ -2355,7 +2390,7 @@ async function readObject ({ fs, gitdir, oid, format = 'content' }) {
       if (format === 'wrapped' && result.format === 'wrapped') {
         return result
       }
-      const sha = shasum(result.object);
+      const sha = await shasum(result.object);
       if (sha !== oid) {
         throw new GitError(E.InternalFail, {
           message: `SHA check failed! Expected ${oid}, computed ${sha}`
@@ -2611,9 +2646,6 @@ class GitTree {
   constructor (entries) {
     if (Buffer.isBuffer(entries)) {
       this._entries = parseBuffer(entries);
-      // There appears to be an edge case (in this repo no less) where
-      // the tree is NOT sorted as expected if some directories end with ".git"
-      this._entries.sort(comparePath);
     } else if (Array.isArray(entries)) {
       this._entries = entries.map(nudgeIntoShape);
     } else {
@@ -2621,6 +2653,9 @@ class GitTree {
         message: 'invalid type passed to GitTree constructor'
       })
     }
+    // There appears to be an edge case (in this repo no less) where
+    // the tree is NOT sorted as expected if some directories end with ".git"
+    this._entries.sort(comparePath);
   }
 
   static from (tree) {
@@ -3130,106 +3165,101 @@ function renderCacheEntryFlags (entry) {
   )
 }
 
-function parseBuffer$1 (buffer) {
-  // Verify shasum
-  const shaComputed = shasum(buffer.slice(0, -20));
-  const shaClaimed = buffer.slice(-20).toString('hex');
-  if (shaClaimed !== shaComputed) {
-    throw new GitError(E.InternalFail, {
-      message: `Invalid checksum in GitIndex buffer: expected ${shaClaimed} but saw ${shaComputed}`
-    })
-  }
-  const reader = new BufferCursor(buffer);
-  const _entries = new Map();
-  const magic = reader.toString('utf8', 4);
-  if (magic !== 'DIRC') {
-    throw new GitError(E.InternalFail, {
-      message: `Invalid dircache magic file number: ${magic}`
-    })
-  }
-  const version = reader.readUInt32BE();
-  if (version !== 2) {
-    throw new GitError(E.InternalFail, {
-      message: `Unsupported dircache version: ${version}`
-    })
-  }
-  const numEntries = reader.readUInt32BE();
-  let i = 0;
-  while (!reader.eof() && i < numEntries) {
-    const entry = {};
-    entry.ctimeSeconds = reader.readUInt32BE();
-    entry.ctimeNanoseconds = reader.readUInt32BE();
-    entry.mtimeSeconds = reader.readUInt32BE();
-    entry.mtimeNanoseconds = reader.readUInt32BE();
-    entry.dev = reader.readUInt32BE();
-    entry.ino = reader.readUInt32BE();
-    entry.mode = reader.readUInt32BE();
-    entry.uid = reader.readUInt32BE();
-    entry.gid = reader.readUInt32BE();
-    entry.size = reader.readUInt32BE();
-    entry.oid = reader.slice(20).toString('hex');
-    const flags = reader.readUInt16BE();
-    entry.flags = parseCacheEntryFlags(flags);
-    // TODO: handle if (version === 3 && entry.flags.extended)
-    const pathlength = buffer.indexOf(0, reader.tell() + 1) - reader.tell();
-    if (pathlength < 1) {
-      throw new GitError(E.InternalFail, {
-        message: `Got a path length of: ${pathlength}`
-      })
-    }
-    // TODO: handle pathnames larger than 12 bits
-    entry.path = reader.toString('utf8', pathlength);
-    // TODO: is this a good way to store stage entries?
-    entry.key = GitIndex.key(entry.path, entry.flags.stage);
-    // The next bit is awkward. We expect 1 to 8 null characters
-    // such that the total size of the entry is a multiple of 8 bits.
-    // (Hence subtract 12 bytes for the header.)
-    let padding = 8 - ((reader.tell() - 12) % 8);
-    if (padding === 0) padding = 8;
-    while (padding--) {
-      const tmp = reader.readUInt8();
-      if (tmp !== 0) {
-        throw new GitError(E.InternalFail, {
-          message: `Expected 1-8 null characters but got '${tmp}' after ${entry.path}`
-        })
-      } else if (reader.eof()) {
-        throw new GitError(E.InternalFail, {
-          message: 'Unexpected end of file'
-        })
-      }
-    }
-    // end of awkward part
-    _entries.set(entry.key, entry);
-    i++;
-  }
-  return _entries
-}
-
-function compareKey (a, b) {
-  // https://stackoverflow.com/a/40355107/2168416
-  return compareStrings(a.path, b.path)
-}
-
 class GitIndex {
   /*::
    _entries: Map<string, CacheEntry>
    _dirty: boolean // Used to determine if index needs to be saved to filesystem
    */
-  constructor (index) {
+  constructor (entries) {
     this._dirty = false;
-    if (Buffer.isBuffer(index)) {
-      this._entries = parseBuffer$1(index);
-    } else if (index === null) {
-      this._entries = new Map();
+    this._entries = entries || new Map();
+  }
+
+  static async from (buffer) {
+    if (Buffer.isBuffer(buffer)) {
+      return GitIndex.fromBuffer(buffer)
+    } else if (buffer === null) {
+      return new GitIndex(null)
     } else {
       throw new GitError(E.InternalFail, {
-        message: 'invalid type passed to GitIndex constructor'
+        message: 'invalid type passed to GitIndex.from'
       })
     }
   }
 
-  static from (buffer) {
-    return new GitIndex(buffer)
+  static async fromBuffer (buffer) {
+    // Verify shasum
+    const shaComputed = await shasum(buffer.slice(0, -20));
+    const shaClaimed = buffer.slice(-20).toString('hex');
+    if (shaClaimed !== shaComputed) {
+      throw new GitError(E.InternalFail, {
+        message: `Invalid checksum in GitIndex buffer: expected ${shaClaimed} but saw ${shaComputed}`
+      })
+    }
+    const reader = new BufferCursor(buffer);
+    const _entries = new Map();
+    const magic = reader.toString('utf8', 4);
+    if (magic !== 'DIRC') {
+      throw new GitError(E.InternalFail, {
+        message: `Inavlid dircache magic file number: ${magic}`
+      })
+    }
+    const version = reader.readUInt32BE();
+    if (version !== 2) {
+      throw new GitError(E.InternalFail, {
+        message: `Unsupported dircache version: ${version}`
+      })
+    }
+    const numEntries = reader.readUInt32BE();
+    let i = 0;
+    while (!reader.eof() && i < numEntries) {
+      const entry = {};
+      entry.ctimeSeconds = reader.readUInt32BE();
+      entry.ctimeNanoseconds = reader.readUInt32BE();
+      entry.mtimeSeconds = reader.readUInt32BE();
+      entry.mtimeNanoseconds = reader.readUInt32BE();
+      entry.dev = reader.readUInt32BE();
+      entry.ino = reader.readUInt32BE();
+      entry.mode = reader.readUInt32BE();
+      entry.uid = reader.readUInt32BE();
+      entry.gid = reader.readUInt32BE();
+      entry.size = reader.readUInt32BE();
+      entry.oid = reader.slice(20).toString('hex');
+      const flags = reader.readUInt16BE();
+      entry.flags = parseCacheEntryFlags(flags);
+      // TODO: handle if (version === 3 && entry.flags.extended)
+      const pathlength = buffer.indexOf(0, reader.tell() + 1) - reader.tell();
+      if (pathlength < 1) {
+        throw new GitError(E.InternalFail, {
+          message: `Got a path length of: ${pathlength}`
+        })
+      }
+      // TODO: handle pathnames larger than 12 bits
+      entry.path = reader.toString('utf8', pathlength);
+      // TODO: is this a good way to store stage entries?
+      entry.key = GitIndex.key(entry.path, entry.flags.stage);
+      // The next bit is awkward. We expect 1 to 8 null characters
+      // such that the total size of the entry is a multiple of 8 bits.
+      // (Hence subtract 12 bytes for the header.)
+      let padding = 8 - ((reader.tell() - 12) % 8);
+      if (padding === 0) padding = 8;
+      while (padding--) {
+        const tmp = reader.readUInt8();
+        if (tmp !== 0) {
+          throw new GitError(E.InternalFail, {
+            message: `Expected 1-8 null characters but got '${tmp}' after ${entry.path}`
+          })
+        } else if (reader.eof()) {
+          throw new GitError(E.InternalFail, {
+            message: 'Unexpected end of file'
+          })
+        }
+      }
+      // end of awkward part
+      _entries.set(entry.key, entry);
+      i++;
+    }
+    return new GitIndex(_entries)
   }
 
   static key (path, stage) {
@@ -3238,7 +3268,7 @@ class GitIndex {
   }
 
   get entries () {
-    return [...this._entries.values()].sort(compareKey)
+    return [...this._entries.values()].sort(comparePath)
   }
 
   get entriesMap () {
@@ -3315,7 +3345,7 @@ class GitIndex {
       .join('\n')
   }
 
-  toObject () {
+  async toObject () {
     const header = Buffer.alloc(12);
     const writer = new BufferCursor(header);
     writer.write('DIRC', 4, 'utf8');
@@ -3346,7 +3376,7 @@ class GitIndex {
       })
     );
     const main = Buffer.concat([header, body]);
-    const sum = shasum(main);
+    const sum = await shasum(main);
     return Buffer.concat([main, Buffer.from(sum, 'hex')])
   }
 }
@@ -3506,7 +3536,7 @@ async function writeObject ({
     if (format !== 'wrapped') {
       object = GitObject.wrap({ type, object });
     }
-    oid = shasum(object);
+    oid = await shasum(object);
     object = Buffer.from(pako.deflate(object));
   }
   if (!dryRun) {
@@ -3528,7 +3558,7 @@ let lock$1 = null;
 async function updateCachedIndexFile (fs, filepath) {
   const stat = await fs.lstat(filepath);
   const rawIndexFile = await fs.read(filepath);
-  const index = GitIndex.from(rawIndexFile);
+  const index = await GitIndex.from(rawIndexFile);
   // cache the GitIndex object so we don't need to re-read it
   // every time.
   map.set([fs, filepath], index);
@@ -3548,8 +3578,15 @@ async function isIndexStale (fs, filepath) {
 }
 
 class GitIndexManager {
-  static async acquire ({ fs, filepath }, closure) {
+  /**
+   *
+   * @param {object} opts
+   * @param {function(GitIndex): any} closure
+   */
+  static async acquire ({ fs, gitdir }, closure) {
+    const filepath = `${gitdir}/index`;
     if (lock$1 === null) lock$1 = new AsyncLock({ maxPending: Infinity });
+    let result;
     await lock$1.acquire(filepath, async function () {
       // Acquire a file lock while we're reading the index
       // to make sure other processes aren't writing to it
@@ -3559,17 +3596,18 @@ class GitIndexManager {
         await updateCachedIndexFile(fs, filepath);
       }
       const index = map.get([fs, filepath]);
-      await closure(index);
+      result = await closure(index);
       if (index._dirty) {
         // Acquire a file lock while we're writing the index file
         // let fileLock = await Lock(filepath)
-        const buffer = index.toObject();
+        const buffer = await index.toObject();
         await fs.write(filepath, buffer);
         // Update cached stat value
         stats.set([fs, filepath], await fs.lstat(filepath));
         index._dirty = false;
       }
     });
+    return result
   }
 
   static async constructTree ({ fs, gitdir, dryRun, index }) {
@@ -3766,21 +3804,19 @@ async function parseRefsAdResponse (stream, { service }) {
   // In the edge case of a brand new repo, zero refs (and zero capabilities)
   // are returned.
   if (lineTwo === true) return { capabilities, refs, symrefs }
-  const [firstRef, capabilitiesLine] = lineTwo
-    .toString('utf8')
-    .trim()
-    .split('\x00');
+  const [firstRef, capabilitiesLine] = splitAndAssert(
+    lineTwo.toString('utf8'),
+    '\x00',
+    '\\x00'
+  );
   capabilitiesLine.split(' ').map(x => capabilities.add(x));
-  const [ref, name] = firstRef.split(' ');
+  const [ref, name] = splitAndAssert(firstRef, ' ', ' ');
   refs.set(name, ref);
   while (true) {
     const line = await read();
     if (line === true) break
     if (line !== null) {
-      const [ref, name] = line
-        .toString('utf8')
-        .trim()
-        .split(' ');
+      const [ref, name] = splitAndAssert(line.toString('utf8'), ' ', ' ');
       refs.set(name, ref);
     }
   }
@@ -3794,6 +3830,17 @@ async function parseRefsAdResponse (stream, { service }) {
     }
   }
   return { capabilities, refs, symrefs }
+}
+
+function splitAndAssert (line, sep, expected) {
+  const split = line.trim().split(sep);
+  if (split.length !== 2) {
+    throw new GitError(E.AssertServerResponseFail, {
+      expected: `Two strings separated by '${expected}'`,
+      actual: line.toString('utf8')
+    })
+  }
+  return split
 }
 
 // Try to accomodate known CORS proxy implementations:
@@ -3827,8 +3874,13 @@ class GitRemoteHTTP {
       // To try to be backwards compatible with simple-get's behavior, which uses Node's http.request
       // setting an Authorization header will override what is in the URL.
       // Ergo manually specified auth parameters will override those in the URL.
-      auth.username = auth.username || urlAuth.username;
-      auth.password = auth.password || urlAuth.password;
+      // However, since the oauth2 option is incompatible with usernames and passwords, rather than throw an
+      // E.MixUsernamePasswordOauth2formatTokenError error, we'll avoid that situation by ignoring the username
+      // and/or password in the url.
+      if (!auth.oauth2format) {
+        auth.username = auth.username || urlAuth.username;
+        auth.password = auth.password || urlAuth.password;
+      }
     }
     if (corsProxy) {
       url = corsProxify(corsProxy, url);
@@ -4101,6 +4153,11 @@ class FileSystem {
 
   /**
    * Return the contents of a file if it exists, otherwise returns null.
+   *
+   * @param {string} filepath
+   * @param {object} [options]
+   *
+   * @returns {Buffer|null}
    */
   async read (filepath, options = {}) {
     try {
@@ -4117,6 +4174,10 @@ class FileSystem {
 
   /**
    * Write a file (creating missing directories if need be) without throwing errors.
+   *
+   * @param {string} filepath
+   * @param {Buffer|Uint8Array|string} contents
+   * @param {object|string} [options]
    */
   async write (filepath, contents, options = {}) {
     try {
@@ -4161,6 +4222,17 @@ class FileSystem {
   async rm (filepath) {
     try {
       await this._unlink(filepath);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err
+    }
+  }
+
+  /**
+   * Delete a directory without throwing an error if it is already deleted.
+   */
+  async rmdir (filepath) {
+    try {
+      await this._rmdir(filepath);
     } catch (err) {
       if (err.code !== 'ENOENT') throw err
     }
@@ -4675,14 +4747,17 @@ class GitWalkerRepo {
     if (!obj) throw new Error(`No obj for ${filepath}`)
     const oid = obj.oid;
     if (!oid) throw new Error(`No oid for obj ${JSON.stringify(obj)}`)
-    if (obj.type === 'commit') {
-      // TODO: support submodules
+    if (obj.type !== 'tree') {
+      // TODO: support submodules (type === 'commit')
       return null
     }
     const { type, object } = await readObject({ fs, gitdir, oid });
-    if (type === 'blob') return null
-    if (type !== 'tree') {
-      throw new Error(`ENOTDIR: not a directory, scandir '${filepath}'`)
+    if (type !== obj.type) {
+      throw new GitError(E.ObjectTypeAssertionFail, {
+        oid,
+        expected: obj.type,
+        type
+      })
     }
     const tree = GitTree.from(object);
     // cache all entries
@@ -4736,12 +4811,146 @@ class GitWalkerRepo {
   }
 }
 
+class GitWalkerRepo2 {
+  constructor ({ fs: _fs, gitdir, ref }) {
+    const fs = new FileSystem(_fs);
+    this.fs = fs;
+    this.gitdir = gitdir;
+    this.mapPromise = (async () => {
+      const map = new Map();
+      let oid;
+      try {
+        oid = await GitRefManager.resolve({ fs, gitdir, ref });
+      } catch (e) {
+        // Handle fresh branches with no commits
+        if (e.code === E.ResolveRefError) {
+          oid = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+        }
+      }
+      const tree = await resolveTree({ fs, gitdir, oid });
+      tree.type = 'tree';
+      tree.mode = '40000';
+      map.set('.', tree);
+      return map
+    })();
+    const walker = this;
+    this.ConstructEntry = class TreeEntry {
+      constructor (fullpath) {
+        this._fullpath = fullpath;
+        this._type = false;
+        this._mode = false;
+        this._stat = false;
+        this._content = false;
+        this._oid = false;
+      }
+
+      async conflict () {
+        return false
+      }
+
+      async type () {
+        return walker.type(this)
+      }
+
+      async mode () {
+        return walker.mode(this)
+      }
+
+      async stat () {
+        return walker.stat(this)
+      }
+
+      async content () {
+        return walker.content(this)
+      }
+
+      async oid () {
+        return walker.oid(this)
+      }
+    };
+  }
+
+  async readdir (entry) {
+    const filepath = entry._fullpath;
+    const { fs, gitdir } = this;
+    const map = await this.mapPromise;
+    const obj = map.get(filepath);
+    if (!obj) throw new Error(`No obj for ${filepath}`)
+    const oid = obj.oid;
+    if (!oid) throw new Error(`No oid for obj ${JSON.stringify(obj)}`)
+    if (obj.type !== 'tree') {
+      // TODO: support submodules (type === 'commit')
+      return null
+    }
+    const { type, object } = await readObject({ fs, gitdir, oid });
+    if (type !== obj.type) {
+      throw new GitError(E.ObjectTypeAssertionFail, {
+        oid,
+        expected: obj.type,
+        type
+      })
+    }
+    const tree = GitTree.from(object);
+    // cache all entries
+    for (const entry of tree) {
+      map.set(join(filepath, entry.path), entry);
+    }
+    return tree.entries().map(entry => join(filepath, entry.path))
+  }
+
+  async type (entry) {
+    if (entry._type === false) {
+      const map = await this.mapPromise;
+      const { type } = map.get(entry._fullpath);
+      entry._type = type;
+    }
+    return entry._type
+  }
+
+  async mode (entry) {
+    if (entry._mode === false) {
+      const map = await this.mapPromise;
+      const { mode } = map.get(entry._fullpath);
+      entry._mode = normalizeMode(parseInt(mode, 8));
+    }
+    return entry._mode
+  }
+
+  async stat (_entry) {}
+
+  async content (entry) {
+    if (entry._content === false) {
+      const map = await this.mapPromise;
+      const { fs, gitdir } = this;
+      const obj = map.get(entry._fullpath);
+      const oid = obj.oid;
+      const { type, object } = await readObject({ fs, gitdir, oid });
+      if (type !== 'blob') {
+        entry._content = void 0;
+      } else {
+        entry._content = object;
+      }
+    }
+    return entry._content
+  }
+
+  async oid (entry) {
+    if (entry._oid === false) {
+      const map = await this.mapPromise;
+      const obj = map.get(entry._fullpath);
+      entry._oid = obj.oid;
+    }
+    return entry._oid
+  }
+}
+
 // This is part of an elaborate system to facilitate code-splitting / tree-shaking.
 // commands/walk.js can depend on only this, and the actual Walker classes exported
 // can be opaque - only having a single property (this symbol) that is not enumerable,
 // and thus the constructor can be passed as an argument to walk while being "unusable"
 // outside of it.
-const GitWalkerSymbol = Symbol('GitWalkerSymbol');
+const GitWalkBeta1Symbol = Symbol('GitWalkBeta1Symbol');
+const GitWalkBeta2Symbol = Symbol('GitWalkBeta2Symbol');
 
 // @ts-check
 
@@ -4752,31 +4961,38 @@ const GitWalkerSymbol = Symbol('GitWalkerSymbol');
  */
 
 /**
- * Get a git commit Walker
+ * Get a git commit `Walker`
  *
- * See [walkBeta1](./walkBeta1.md)
+ * See [walkBeta2](./walkBeta2.md)
  *
  * @param {object} args
- * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {string} [args.ref='HEAD'] - The commit to walk
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
- * @param {string} [args.ref='HEAD'] - [required] The commit to walk
  *
  * @returns {Walker} Returns a git commit Walker
  *
  */
 function TREE ({
+  ref = 'HEAD',
+  // @ts-ignore
   core = 'default',
+  // @ts-ignore
   dir,
-  gitdir = join(dir, '.git'),
-  fs = cores.get(core).get('fs'),
-  ref = 'HEAD'
+  gitdir,
+  fs = cores.get(core).get('fs')
 }) {
   const o = Object.create(null);
-  Object.defineProperty(o, GitWalkerSymbol, {
+  Object.defineProperty(o, GitWalkBeta1Symbol, {
     value: function () {
+      gitdir = gitdir || join(dir, '.git');
       return new GitWalkerRepo({ fs, gitdir, ref })
+    }
+  });
+  Object.defineProperty(o, GitWalkBeta2Symbol, {
+    value: function ({ fs, gitdir }) {
+      return new GitWalkerRepo2({ fs, gitdir, ref })
     }
   });
   Object.freeze(o);
@@ -4819,11 +5035,11 @@ class RunningMinimum {
 
 // Take an array of length N of
 //   iterators of length Q_n
-//     of objects with a property 'fullname'
+//     of strings
 // and return an iterator of length max(Q_n) for all n
 //   of arrays of length N
-//     of objects who all have the same value for 'fullname'
-function * unionOfIterators (sets) {
+//     of string|null who all have the same string value
+function * unionOfIterators2 (sets) {
   /* NOTE: We can assume all arrays are sorted.
    * Indexes are sorted because they are defined that way:
    *
@@ -4850,7 +5066,7 @@ function * unionOfIterators (sets) {
     // once they are done
     heads[i] = sets[i].next().value;
     if (heads[i] !== undefined) {
-      min.consider(heads[i].fullpath);
+      min.consider(heads[i]);
     }
   }
   if (min.value === null) return
@@ -4860,24 +5076,17 @@ function * unionOfIterators (sets) {
     minimum = min.value;
     min.reset();
     for (let i = 0; i < numsets; i++) {
-      if (heads[i] !== undefined && heads[i].fullpath === minimum) {
+      if (heads[i] !== undefined && heads[i] === minimum) {
         result[i] = heads[i];
         heads[i] = sets[i].next().value;
       } else {
         // A little hacky, but eh
-        result[i] = {
-          fullpath: minimum,
-          basename: basename(minimum),
-          exists: false
-        };
+        result[i] = null;
       }
       if (heads[i] !== undefined) {
-        min.consider(heads[i].fullpath);
+        min.consider(heads[i]);
       }
     }
-    // if (result.reduce((y, a) => y && (a === null), true)) {
-    //   return
-    // }
     yield result;
     if (min.value === null) return
   }
@@ -4888,142 +5097,157 @@ function * unionOfIterators (sets) {
 /**
  *
  * @typedef {Object} Walker
- * @property {Symbol} Symbol('GitWalkerSymbol')
+ * @property {Symbol} Symbol('GitWalkBeta2Symbol')
+ */
+
+/**
+ *
+ * @typedef {Object} Stat Normalized subset of filesystem `stat` data:
+ * @property {number} ctimeSeconds
+ * @property {number} ctimeNanoseconds
+ * @property {number} mtimeSeconds
+ * @property {number} mtimeNanoseconds
+ * @property {number} dev
+ * @property {number} ino
+ * @property {number} mode
+ * @property {number} uid
+ * @property {number} gid
+ * @property {number} size
  */
 
 /**
  *
  * @typedef {Object} WalkerEntry The `WalkerEntry` is an interface that abstracts computing many common tree / blob stats.
- * @property {string} fullpath
- * @property {string} basename
- * @property {boolean} exists
- * @property {Function} populateStat
- * @property {'tree'|'blob'|'special'|'commit'} [type]
- * @property {number} [ctimeSeconds]
- * @property {number} [ctimeNanoseconds]
- * @property {number} [mtimeSeconds]
- * @property {number} [mtimeNanoseconds]
- * @property {number} [dev]
- * @property {number} [ino]
- * @property {number|string} [mode] WORKDIR and STAGE return numbers, TREE returns a string... I'll fix this in walkBeta2
- * @property {number} [uid]
- * @property {number} [gid]
- * @property {number} [size]
- * @property {Function} populateContent
- * @property {Buffer} [content]
- * @property {Function} populateHash
- * @property {string} [oid]
+ * @property {function(): Promise<'tree'|'blob'|'special'|'commit'>} type
+ * @property {function(): Promise<number>} mode
+ * @property {function(): Promise<string>} oid
+ * @property {function(): Promise<Buffer>} content
+ * @property {function(): Promise<Stat>} stat
+ * @property {function(): Promise<boolean>} conflict
  */
 
 /**
  * A powerful recursive tree-walking utility.
  *
- * The `walk` API (tentatively named `walkBeta1`) simplifies gathering detailed information about a tree or comparing all the filepaths in two or more trees.
- * Trees can be file directories, git commits, or git indexes (aka staging areas).
- * So you can compare two file directories, or 10 commits, or the stage of one repo with the working directory of another repo... etc.
+ * The `walk` API (tentatively named `walkBeta2`) simplifies gathering detailed information about a tree or comparing all the filepaths in two or more trees.
+ * Trees can be git commits, the working directory, or the or git index (staging area).
  * As long as a file or directory is present in at least one of the trees, it will be traversed.
  * Entries are traversed in alphabetical order.
  *
- * The arguments to `walk` are the `trees` you want to traverse, and 4 optional transform functions:
- *  `filter`, `map`, `reduce`, and `iterate`.
+ * The arguments to `walk` are the `trees` you want to traverse, and 3 optional transform functions:
+ *  `map`, `reduce`, and `iterate`.
  *
- * The trees are represented by three magic functions that can be imported:
+ * ## `TREE`, `WORKDIR`, and `STAGE`
+ *
+ * Tree walkers are represented by three separate functions that can be imported:
+ *
  * ```js
  * import { TREE, WORKDIR, STAGE } from 'isomorphic-git'
  * ```
  *
- * These functions return objects that implement the `Walker` interface.
- * The only thing they are good for is passing into `walkBeta1`'s `trees` argument.
- * Here are the three `Walker`s passed into `walkBeta1` by the `statusMatrix` command for example:
+ * These functions return opaque handles called `Walker`s.
+ * The only thing that `Walker` objects are good for is passing into `walkBeta2`.
+ * Here are the three `Walker`s passed into `walkBeta2` by the `statusMatrix` command for example:
  *
  * ```js
- * let gitdir = '.git'
- * let dir = '.'
  * let ref = 'HEAD'
  *
- * let trees = [
- *   TREE({fs, gitdir, ref}),
- *   WORKDIR({fs, dir, gitdir}),
- *   STAGE({fs, gitdir})
- * ]
+ * let trees = [TREE({ ref }), WORKDIR(), STAGE()]
  * ```
  *
- * See the doc pages for [TREE](./TREE.md), [WORKDIR](./WORKDIR.md), and [STAGE](./STAGE.md).
+ * For the arguments, see the doc pages for [TREE](./TREE.md), [WORKDIR](./WORKDIR.md), and [STAGE](./STAGE.md).
  *
- * `filter`, `map`, `reduce`, and `iterate` allow you control the recursive walk by pruning and transforming `WalkerTree`s into the desired result.
+ * `map`, `reduce`, and `iterate` allow you control the recursive walk by pruning and transforming `WalkerEntry`s into the desired result.
  *
  * ## WalkerEntry
- * The `WalkerEntry` is an interface that abstracts computing many common tree / blob stats.
- * `filter` and `map` each receive an array of `WalkerEntry[]` as their main argument, one `WalkerEntry` for each `Walker` in the `trees` argument.
  *
- * By default, `WalkerEntry`s only have three properties:
- * ```js
- * {
- *   fullpath: string;
- *   basename: string;
- *   exists: boolean;
- * }
- * ```
+ * {@link WalkerEntry typedef}
  *
- * Additional properties can be computed only when needed. This lets you build lean, mean, efficient walking machines.
- * ```js
- * await entry.populateStat()
- * // populates
- * entry.type // 'tree', 'blob'
- * // and where applicable, these properties:
- * entry.ctimeSeconds // number;
- * entry.ctimeNanoseconds // number;
- * entry.mtimeSeconds // number;
- * entry.mtimeNanoseconds // number;
- * entry.dev // number;
- * entry.ino // number;
- * entry.mode // number;
- * entry.uid // number;
- * entry.gid // number;
- * entry.size // number;
- * ```
+ * `map` receives an array of `WalkerEntry[]` as its main argument, one `WalkerEntry` for each `Walker` in the `trees` argument.
+ * The methods are memoized per `WalkerEntry` so calling them multiple times in a `map` function does not adversely impact performance.
+ * By only computing these values if needed, you build can build lean, mean, efficient walking machines.
+ *
+ * ### WalkerEntry#type()
+ *
+ * Returns the kind as a string. This is normally either `tree` or `blob`.
+ *
+ * `TREE`, `STAGE`, and `WORKDIR` walkers all return a string.
+ *
+ * Possible values:
+ *
+ * - `'tree'` directory
+ * - `'blob'` file
+ * - `'special'` used by `WORKDIR` to represent irregular files like sockets and FIFOs
+ * - `'commit'` used by `TREE` to represent submodules
  *
  * ```js
- * await entry.populateContent()
- * // populates
- * entry.content // Buffer
- * // except for STAGE which does not currently provide content
+ * await entry.type()
  * ```
+ *
+ * ### WalkerEntry#mode()
+ *
+ * Returns the file mode as a number. Use this to distinguish between regular files, symlinks, and executable files.
+ *
+ * `TREE`, `STAGE`, and `WORKDIR` walkers all return a number for all `type`s of entries.
+ *
+ * It has been normalized to one of the 4 values that are allowed in git commits:
+ *
+ * - `0o40000` directory
+ * - `0o100644` file
+ * - `0o100755` file (executable)
+ * - `0o120000` symlink
+ *
+ * Tip: to make modes more readable, you can print them to octal using `.toString(8)`.
  *
  * ```js
- * await entry.populateHash()
- * // populates
- * entry.oid // SHA1 string
+ * await entry.mode()
  * ```
  *
- * ## filter(WalkerEntry[]) => boolean
+ * ### WalkerEntry#oid()
  *
- * Default: `async () => true`.
+ * Returns the SHA-1 object id for blobs and trees.
  *
- * This is a good place to put limiting logic such as skipping entries with certain filenames.
- * If you return false for directories, then none of the children of that directory will be walked.
+ * `TREE` walkers return a string for `blob` and `tree` entries.
  *
- * Example:
+ * `STAGE` and `WORKDIR` walkers return a string for `blob` entries and `undefined` for `tree` entries.
+ *
  * ```js
- * let path = require('path')
- * let cwd = 'src/app'
- * // Only examine files in the directory `cwd`
- * async function filter ([head, workdir, stage]) {
- *   // It doesn't matter which tree (head, workdir, or stage) you use here.
- *   return (
- *     // return true for the root directory
- *     head.fullpath === '.' ||
- *     // return true for 'src' and 'src/app'
- *     cwd.startsWith(head.fullpath) ||
- *     // return true for 'src/app/*'
- *     path.dirname(head.fullpath) === cwd
- *   )
- * }
+ * await entry.oid()
  * ```
  *
- * ## map(WalkerEntry[]) => any
+ * ### WalkerEntry#content()
  *
- * Default: `async entry => entry`
+ * Returns the file contents as a Buffer.
+ *
+ * `TREE` and `WORKDIR` walkers return a Buffer for `blob` entries and `undefined` for `tree` entries.
+ *
+ * `STAGE` walkers always return `undefined` since the file contents are never stored in the stage.
+ *
+ * ```js
+ * await entry.content()
+ * ```
+ *
+ * ### WalkerEntry#stat()
+ *
+ * Returns a normalized subset of filesystem Stat data.
+ *
+ * `WORKDIR` walkers return a `Stat` for `blob` and `tree` entries.
+ *
+ * `STAGE` walkers return a `Stat` for `blob` entries and `undefined` for `tree` entries.
+ *
+ * `TREE` walkers return `undefined` for all entry types.
+ *
+ * ```js
+ * await entry.stat()
+ * ```
+ *
+ * {@link Stat typedef}
+ *
+ * ## map(string, Array<WalkerEntry|null>) => Promise<any>
+ *
+ * This is the function that is called once per entry BEFORE visiting the children of that node.
+ *
+ * If you return `null` for a `tree` entry, then none of the children of that `tree` entry will be walked.
  *
  * This is a good place for query logic, such as examining the contents of a file.
  * Ultimately, compare all the entries and return any values you are interested in.
@@ -5031,35 +5255,53 @@ function * unionOfIterators (sets) {
  *
  * Example 1: Find all the files containing the word 'foo'.
  * ```js
- * async function map([head, workdir]) {
- *   await workdir.populateContent()
- *   let content = workdir.content.toString('utf8')
+ * async function map(filepath, [head, workdir]) {
+ *   let content = (await workdir.content()).toString('utf8')
  *   if (content.contains('foo')) {
  *     return {
- *       fullpath: workdir.fullpath,
+ *       filepath,
  *       content
  *     }
  *   }
  * }
- *
  * ```
  *
  * Example 2: Return the difference between the working directory and the HEAD commit
  * ```js
  * const diff = require('diff-lines')
- * async function map([head, workdir]) {
- *   await head.populateContent()
- *   await head.populateHash()
- *   await workdir.populateContent()
+ * async function map(filepath, [head, workdir]) {
  *   return {
- *     filename: head.fullpath,
- *     oid: head.oid,
- *     diff: diff(head.content.toString('utf8'), workdir.content.toString('utf8'))
+ *     filepath,
+ *     oid: await head.oid(),
+ *     diff: diff((await head.content()).toString('utf8'), (await workdir.content()).toString('utf8'))
+ *   }
+ * }
+ * ```
+ *
+ * Example 3:
+ * ```js
+ * let path = require('path')
+ * // Only examine files in the directory `cwd`
+ * let cwd = 'src/app'
+ * async function map (filepath, [head, workdir, stage]) {
+ *   if (
+ *     // don't skip the root directory
+ *     head.fullpath !== '.' &&
+ *     // return true for 'src' and 'src/app'
+ *     !cwd.startsWith(filepath) &&
+ *     // return true for 'src/app/*'
+ *     path.dirname(filepath) !== cwd
+ *   ) {
+ *     return null
+ *   } else {
+ *     return filepath
  *   }
  * }
  * ```
  *
  * ## reduce(parent, children)
+ *
+ * This is the function that is called once per entry AFTER visiting the children of that node.
  *
  * Default: `async (parent, children) => parent === undefined ? children.flat() : [parent, children].flat()`
  *
@@ -5080,25 +5322,28 @@ function * unionOfIterators (sets) {
  * The default implementation recurses all children concurrently using Promise.all.
  * However you could use a custom function to traverse children serially or use a global queue to throttle recursion.
  *
- * > Note: For a complete example, look at the implementation of `statusMatrix`.
- *
  * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {Walker[]} args.trees - The trees you want to traverse
- * @param {function(WalkerEntry[]): Promise<boolean>} [args.filter] - Filter which `WalkerEntry`s to process
- * @param {function(WalkerEntry[]): Promise<any>} [args.map] - Transform `WalkerEntry`s into a result form
+ * @param {function(string, ?WalkerEntry[]): Promise<any>} [args.map] - Transform `WalkerEntry`s into a result form
  * @param {function(any, any[]): Promise<any>} [args.reduce] - Control how mapped entries are combined with their parent result
  * @param {function(function(WalkerEntry[]): Promise<any[]>, IterableIterator<WalkerEntry[]>): Promise<any[]>} [args.iterate] - Fine-tune how entries within a tree are iterated over
  *
  * @returns {Promise<any>} The finished tree-walking result
  *
- * @see WalkerEntry
  *
  */
-async function walkBeta1 ({
+async function walkBeta2 ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs = cores.get(core).get('fs'),
   trees,
-  filter = async () => true,
   // @ts-ignore
-  map = async entry => entry,
+  map = async (_, entry) => entry,
   // The default reducer is a flatmap that filters out undefineds.
   reduce = async (parent, children) => {
     const flatten = flat(children);
@@ -5109,35 +5354,34 @@ async function walkBeta1 ({
   iterate = (walk, children) => Promise.all([...children].map(walk))
 }) {
   try {
-    const walkers = trees.map(proxy => proxy[GitWalkerSymbol]());
+    const walkers = trees.map(proxy =>
+      proxy[GitWalkBeta2Symbol]({ fs, dir, gitdir })
+    );
 
-    const root = new Array(walkers.length).fill({
-      fullpath: '.',
-      basename: '.',
-      exists: true
-    });
+    const root = new Array(walkers.length).fill('.');
     const range = arrayRange(0, walkers.length);
-    const unionWalkerFromReaddir = async entry => {
-      const subdirs = await Promise.all(
-        range.map(i => walkers[i].readdir(entry[i]))
-      );
+    const unionWalkerFromReaddir = async entries => {
       range.map(i => {
-        entry[i] = new walkers[i].ConstructEntry(entry[i]);
+        entries[i] = entries[i] && new walkers[i].ConstructEntry(entries[i]);
       });
+      const subdirs = await Promise.all(
+        range.map(i => (entries[i] ? walkers[i].readdir(entries[i]) : []))
+      );
       // Now process child directories
       const iterators = subdirs
         .map(array => (array === null ? [] : array))
         .map(array => array[Symbol.iterator]());
       return {
-        entry,
-        children: unionOfIterators(iterators)
+        entries,
+        children: unionOfIterators2(iterators)
       }
     };
 
     const walk = async root => {
-      const { children, entry } = await unionWalkerFromReaddir(root);
-      if (await filter(entry)) {
-        const parent = await map(entry);
+      const { entries, children } = await unionWalkerFromReaddir(root);
+      const fullpath = entries.find(entry => entry && entry._fullpath)._fullpath;
+      const parent = await map(fullpath, entries);
+      if (parent !== null) {
         let walkedChildren = await iterate(walk, children);
         walkedChildren = walkedChildren.filter(x => x !== undefined);
         return reduce(parent, walkedChildren)
@@ -5162,7 +5406,7 @@ async function walkBeta1 ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.ourOid - The SHA-1 object id of our tree
@@ -5189,63 +5433,64 @@ async function mergeTree ({
   theirName = 'theirs',
   dryRun = false
 }) {
-  const ourTree = TREE({ core, dir, gitdir, fs, ref: ourOid });
-  const baseTree = TREE({ core, dir, gitdir, fs, ref: baseOid });
-  const theirTree = TREE({ core, dir, gitdir, fs, ref: theirOid });
+  const ourTree = TREE({ ref: ourOid });
+  const baseTree = TREE({ ref: baseOid });
+  const theirTree = TREE({ ref: theirOid });
 
-  const results = await walkBeta1({
+  const results = await walkBeta2({
+    core,
+    fs,
+    dir,
+    gitdir,
     trees: [ourTree, baseTree, theirTree],
-    map: async function ([ours, base, theirs]) {
-      await Promise.all([
-        ours.populateStat(),
-        base.populateStat(),
-        theirs.populateStat(),
-        ours.populateHash(),
-        base.populateHash(),
-        theirs.populateHash()
-      ]);
+    map: async function (filepath, [ours, base, theirs]) {
+      const path = basename(filepath);
       // What we did, what they did
-      const ourChange = modified(ours, base);
-      const theirChange = modified(theirs, base);
+      const ourChange = await modified(ours, base);
+      const theirChange = await modified(theirs, base);
       switch (`${ourChange}-${theirChange}`) {
         case 'false-false': {
           return {
-            mode: base.mode,
-            path: base.basename,
-            oid: base.oid,
-            type: base.type
+            mode: await base.mode(),
+            path,
+            oid: await base.oid(),
+            type: await base.type()
           }
         }
         case 'false-true': {
-          return theirs.exists
+          return theirs
             ? {
-              mode: theirs.mode,
-              path: theirs.basename,
-              oid: theirs.oid,
-              type: theirs.type
+              mode: await theirs.mode(),
+              path,
+              oid: await theirs.oid(),
+              type: await theirs.type()
             }
             : void 0
         }
         case 'true-false': {
-          return ours.exists
+          return ours
             ? {
-              mode: ours.mode,
-              path: ours.basename,
-              oid: ours.oid,
-              type: ours.type
+              mode: await ours.mode(),
+              path,
+              oid: await ours.oid(),
+              type: await ours.type()
             }
             : void 0
         }
         case 'true-true': {
           // Modifications
           if (
-            ours.type === 'blob' &&
-            base.type === 'blob' &&
-            theirs.type === 'blob'
+            ours &&
+            base &&
+            theirs &&
+            (await ours.type()) === 'blob' &&
+            (await base.type()) === 'blob' &&
+            (await theirs.type()) === 'blob'
           ) {
             return mergeBlobs({
               fs,
               gitdir,
+              path,
               ours,
               base,
               theirs,
@@ -5289,18 +5534,21 @@ async function mergeTree ({
 
 /**
  *
- * @param {import('../commands/walkBeta1.js').WalkerEntry} entry
- * @param {import('../commands/walkBeta1.js').WalkerEntry} base
+ * @param {import('../commands/walkBeta2.js').WalkerEntry} entry
+ * @param {import('../commands/walkBeta2.js').WalkerEntry} base
  *
  */
-function modified (entry, base) {
-  if (entry.exists && !base.exists) return true
-  if (!entry.exists && base.exists) return true
-  if (entry.type === 'tree' && base.type === 'tree') return false
+async function modified (entry, base) {
+  if (!entry && !base) return false
+  if (entry && !base) return true
+  if (!entry && base) return true
+  if ((await entry.type()) === 'tree' && (await base.type()) === 'tree') {
+    return false
+  }
   if (
-    entry.type === base.type &&
-    entry.mode === base.mode &&
-    entry.oid === base.oid
+    (await entry.type()) === (await base.type()) &&
+    (await entry.mode()) === (await base.mode()) &&
+    (await entry.oid()) === (await base.oid())
   ) {
     return false
   }
@@ -5310,11 +5558,12 @@ function modified (entry, base) {
 /**
  *
  * @param {Object} args
- * @param {FileSystem} args.fs
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} args.gitdir
- * @param {import('../commands/walkBeta1.js').WalkerEntry} args.ours
- * @param {import('../commands/walkBeta1.js').WalkerEntry} args.base
- * @param {import('../commands/walkBeta1.js').WalkerEntry} args.theirs
+ * @param {string} args.path
+ * @param {import('../commands/walkBeta2.js').WalkerEntry} args.ours
+ * @param {import('../commands/walkBeta2.js').WalkerEntry} args.base
+ * @param {import('../commands/walkBeta2.js').WalkerEntry} args.theirs
  * @param {string} [args.ourName]
  * @param {string} [args.baseName]
  * @param {string} [args.theirName]
@@ -5326,6 +5575,7 @@ function modified (entry, base) {
 async function mergeBlobs ({
   fs,
   gitdir,
+  path,
   ours,
   base,
   theirs,
@@ -5337,26 +5587,28 @@ async function mergeBlobs ({
   dryRun
 }) {
   const type = 'blob';
-  // this might change if we figure out rename detection
-  const path = base.basename;
   // Compute the new mode.
   // Since there are ONLY two valid blob modes ('100755' and '100644') it boils down to this
-  const mode = base.mode === ours.mode ? theirs.mode : ours.mode;
+  const mode =
+    (await base.mode()) === (await ours.mode())
+      ? await theirs.mode()
+      : await ours.mode();
   // The trivial case: nothing to merge except maybe mode
-  if (ours.oid === theirs.oid) return { mode, path, oid: ours.oid, type }
+  if ((await ours.oid()) === (await theirs.oid())) {
+    return { mode, path, oid: await ours.oid(), type }
+  }
   // if only one side made oid changes, return that side's oid
-  if (ours.oid === base.oid) return { mode, path, oid: theirs.oid, type }
-  if (theirs.oid === base.oid) return { mode, path, oid: ours.oid, type }
+  if ((await ours.oid()) === (await base.oid())) {
+    return { mode, path, oid: await theirs.oid(), type }
+  }
+  if ((await theirs.oid()) === (await base.oid())) {
+    return { mode, path, oid: await ours.oid(), type }
+  }
   // if both sides made changes do a merge
-  await Promise.all([
-    ours.populateContent(),
-    base.populateContent(),
-    theirs.populateContent()
-  ]);
   const { mergedText, cleanMerge } = mergeFile({
-    ourContent: ours.content.toString('utf8'),
-    baseContent: base.content.toString('utf8'),
-    theirContent: theirs.content.toString('utf8'),
+    ourContent: (await ours.content()).toString('utf8'),
+    baseContent: (await base.content()).toString('utf8'),
+    theirContent: (await theirs.content()).toString('utf8'),
     ourName,
     theirName,
     baseName,
@@ -5570,4 +5822,4 @@ function writeUploadPackRequest ({
   return packstream
 }
 
-export { E, FileSystem, GitAnnotatedTag, GitCommit, GitConfig, GitConfigManager, GitError, GitIgnoreManager, GitIndex, GitIndexManager, GitObject, GitPackIndex, GitPktLine, GitRefManager, GitRefSpec, GitRefSpecSet, GitRemoteHTTP, GitRemoteManager, GitShallowManager, GitSideBand, GitTree, GitWalkerSymbol, SignedGitCommit, auth, calculateBasicAuthHeader, calculateBasicAuthUsernamePasswordPair, collect, comparePath, cores, flatFileListToDirectoryStructure, http, isBinary, join, listCommitsAndTags, listObjects, log, mergeFile, mergeTree, oauth2, pack, padHex, parseReceivePackResponse, parseRefsAdResponse, parseUploadPackRequest, parseUploadPackResponse, path, pkg, plugins, readObject, resolveTree, shasum, sleep, uploadPack, writeObject, writeReceivePackRequest, writeRefsAdResponse, writeUploadPackRequest };
+export { E, FileSystem, GitAnnotatedTag, GitCommit, GitConfig, GitConfigManager, GitError, GitIgnoreManager, GitIndex, GitIndexManager, GitObject, GitPackIndex, GitPktLine, GitRefManager, GitRefSpec, GitRefSpecSet, GitRemoteHTTP, GitRemoteManager, GitShallowManager, GitSideBand, GitTree, GitWalkBeta1Symbol, GitWalkBeta2Symbol, SignedGitCommit, auth, calculateBasicAuthHeader, calculateBasicAuthUsernamePasswordPair, collect, comparePath, cores, flatFileListToDirectoryStructure, http, isBinary, join, listCommitsAndTags, listObjects, log, mergeFile, mergeTree, oauth2, pack, padHex, parseReceivePackResponse, parseRefsAdResponse, parseUploadPackRequest, parseUploadPackResponse, path, pkg, plugins, readObject, resolveTree, shasum, sleep, uploadPack, writeObject, writeReceivePackRequest, writeRefsAdResponse, writeUploadPackRequest };
