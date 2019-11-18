@@ -165,8 +165,7 @@ export async function merge ({
           fs,
           ref: ourRef,
           emitter,
-          emitterPrefix,
-          dryRun
+          emitterPrefix
         })
       }
 
@@ -207,7 +206,7 @@ export async function merge ({
             break
           }
           case 'conflict': {
-            const { conflict, added } = await processConflict({ ours, theirs, base, fs, filepath, dir, gitdir })
+            const { conflict, add } = await processConflict({ ours, theirs, base, fs, filepath, dir, gitdir })
             if (conflict) {
               conflicts.push(conflict)
               if (emitter) {
@@ -219,7 +218,7 @@ export async function merge ({
                 })
               }
             } else if (added) {
-              added.push(added)
+              added.push(add)
             }
             break
           }
@@ -236,7 +235,7 @@ export async function merge ({
       }
 
       let tree
-      await GitIndexManager.acquire({ fs, filepath: `${gitdir}/index` },
+      await GitIndexManager.acquire({ fs, gitdir },
         async function (index) {
           for (const obj of added) {
             index.insert(obj)
@@ -248,7 +247,6 @@ export async function merge ({
             index.writeConflict(obj)
           }
           tree = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index })
-          console.log({tree, added, deleted, conflicts: conflicts.map(c => c.filepath), entries: index.entriesMap.keys() })
         }
       )
 
@@ -346,6 +344,6 @@ async function processConflict ({ ours, theirs, base, fs, dir, gitdir, filepath 
       type: 'blob',
       object: merged.mergedText
     })
-    return { added: { filepath, stats, oid } }
+    return { add: { filepath, stats, oid } }
   }
 }
