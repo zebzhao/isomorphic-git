@@ -5,12 +5,10 @@ import { log } from '../utils/log.js'
 import { normalizeStats } from '../utils/normalizeStats.js'
 import { shasum } from '../utils/shasum.js'
 
-import { FileSystem } from './FileSystem.js'
 import { GitObject } from './GitObject.js'
 
 export class GitWalkerFs2 {
-  constructor ({ fs: _fs, dir, gitdir }) {
-    const fs = new FileSystem(_fs)
+  constructor ({ fs, dir, gitdir }) {
     this.fs = fs
     this.dir = dir
     this.gitdir = gitdir

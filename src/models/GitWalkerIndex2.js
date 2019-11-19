@@ -3,11 +3,8 @@ import { compareStrings } from '../utils/compareStrings.js'
 import { flatFileListToDirectoryStructure } from '../utils/flatFileListToDirectoryStructure.js'
 import { normalizeStats } from '../utils/normalizeStats'
 
-import { FileSystem } from './FileSystem.js'
-
 export class GitWalkerIndex2 {
-  constructor ({ fs: _fs, gitdir }) {
-    const fs = new FileSystem(_fs)
+  constructor ({ fs, gitdir }) {
     this.treePromise = GitIndexManager.acquire({ fs, gitdir }, async function (
       index
     ) {

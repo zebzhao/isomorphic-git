@@ -1,7 +1,6 @@
 // @ts-check
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
-import { FileSystem } from '../models/FileSystem.js'
 import { E, GitError } from '../models/GitError.js'
 import { readObject } from '../storage/readObject.js'
 import { flat } from '../utils/flat.js'
@@ -26,7 +25,7 @@ import { walkBeta2 } from './walkBeta2.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
@@ -60,7 +59,7 @@ export async function fastCheckout ({
   core = 'default',
   dir,
   gitdir = join(dir, '.git'),
-  fs: _fs = cores.get(core).get('fs'),
+  fs = cores.get(core).get('fs'),
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   remote = 'origin',
@@ -75,7 +74,6 @@ export async function fastCheckout ({
 }) {
   try {
     const ref = _ref || 'HEAD'
-    const fs = new FileSystem(_fs)
     // Get tree oid
     let oid
     try {
