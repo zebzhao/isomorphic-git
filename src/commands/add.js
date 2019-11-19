@@ -13,7 +13,9 @@ import { cores } from '../utils/plugins.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
+ * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.filepath - The path to the file to add to the index
@@ -45,7 +47,7 @@ export async function add ({
       await addToIndex({ dir, gitdir, fs, filepath, index, added })
     })
     if (emitter) {
-      emitter.emit(`${emitterPrefix}add`, {
+      await emitter.emit(`${emitterPrefix}add`, {
         filepath,
         added
       })

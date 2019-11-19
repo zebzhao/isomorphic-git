@@ -40,7 +40,7 @@ export async function findChangedFiles ({
             (theirs && (await theirs.type()) !== 'blob')) return
 
         if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Counting changes',
             loaded: ++count,
             lengthComputable: false

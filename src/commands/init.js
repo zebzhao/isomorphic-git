@@ -46,7 +46,7 @@ export async function init ({
     const total = folders.length
     folders = folders.map(dir => gitdir + '/' + dir)
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Initializing repo',
         loaded: 0,
         total,
@@ -56,7 +56,7 @@ export async function init ({
     for (const folder of folders) {
       await fs.mkdir(folder)
       if (emitter) {
-        emitter.emit(`${emitterPrefix}progress`, {
+        await emitter.emit(`${emitterPrefix}progress`, {
           phase: 'Initializing repo',
           loaded: ++count,
           total,

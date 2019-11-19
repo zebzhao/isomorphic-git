@@ -42,7 +42,7 @@ import { config } from './config'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.url] - The URL of the remote repository. Will be gotten from gitconfig if absent.
@@ -157,15 +157,13 @@ export async function fetch ({
     }
     if (emitter) {
       const lines = splitLines(response.progress)
-      forAwait(lines, line => {
+      forAwait(lines, async line => {
         // As a historical accident, 'message' events were trimmed removing valuable information,
         // such as \r by itself which was a single to update the existing line instead of appending a new one.
-        // TODO NEXT BREAKING RELEASE: make 'message' behave like 'rawmessage' and remove 'rawmessage'.
-        emitter.emit(`${emitterPrefix}message`, line.trim())
-        emitter.emit(`${emitterPrefix}rawmessage`, line)
+        emitter.emit(`${emitterPrefix}message`, line)
         const matches = line.match(/([^:]*).*\((\d+?)\/(\d+?)\)/)
         if (matches) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: matches[1].trim(),
             loaded: parseInt(matches[2], 10),
             total: parseInt(matches[3], 10),

@@ -46,7 +46,7 @@ import { pack } from './pack.js'
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref] - Which branch to push. By default this is the currently checked out branch.
@@ -103,7 +103,7 @@ export async function push ({
 }) {
   try {
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Pushing repo',
         loaded: 0,
         lengthComputable: false

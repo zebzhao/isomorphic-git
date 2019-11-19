@@ -69,7 +69,7 @@ export async function checkout ({
       })
     }
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: `Checking out ${remote}/${ref}`,
         loaded: 0,
         lengthComputable: false
@@ -153,7 +153,7 @@ export async function checkout ({
               if (stage && workdir) {
                 await fs.rm(join(dir, fullpath))
                 if (emitter) {
-                  emitter.emit(`${emitterPrefix}progress`, {
+                  await emitter.emit(`${emitterPrefix}progress`, {
                     phase: 'Updating workdir',
                     loaded: ++count,
                     lengthComputable: false
@@ -214,7 +214,7 @@ export async function checkout ({
                     oid
                   })
                   if (emitter) {
-                    emitter.emit(`${emitterPrefix}progress`, {
+                    await emitter.emit(`${emitterPrefix}progress`, {
                       phase: 'Updating workdir',
                       loaded: ++count,
                       lengthComputable: false

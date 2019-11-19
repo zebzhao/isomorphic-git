@@ -14,7 +14,7 @@ import { cores } from '../utils/plugins.js'
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.message - The commit message to use.
@@ -67,7 +67,7 @@ export async function commit ({
 }) {
   try {
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Creating commit',
         loaded: 0,
         lengthComputable: false
@@ -104,7 +104,7 @@ export async function commit ({
     }
 
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Creating commit tree',
         loaded: 0,
         lengthComputable: false
@@ -151,7 +151,7 @@ export async function commit ({
       }
 
       if (emitter) {
-        emitter.emit(`${emitterPrefix}progress`, {
+        await emitter.emit(`${emitterPrefix}progress`, {
           phase: 'Writing commit',
           loaded: 0,
           lengthComputable: false

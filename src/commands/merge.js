@@ -85,7 +85,7 @@ export async function merge ({
 }) {
   try {
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Merging repo',
         loaded: 0,
         lengthComputable: false
@@ -225,7 +225,7 @@ export async function merge ({
         }
 
         if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Applying changes',
             loaded: ++count,
             total,

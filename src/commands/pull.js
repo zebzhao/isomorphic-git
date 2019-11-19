@@ -75,7 +75,7 @@ export async function pull ({
 }) {
   try {
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Pulling repo',
         loaded: 0,
         lengthComputable: false

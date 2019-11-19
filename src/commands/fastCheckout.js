@@ -175,7 +175,7 @@ export async function fastCheckout ({
               }
               index.delete({ filepath: fullpath })
               if (emitter) {
-                emitter.emit(`${emitterPrefix}progress`, {
+                await emitter.emit(`${emitterPrefix}progress`, {
                   phase: 'Updating workdir',
                   loaded: ++count,
                   total
@@ -192,7 +192,7 @@ export async function fastCheckout ({
           try {
             await fs.rmdir(filepath)
             if (emitter) {
-              emitter.emit(`${emitterPrefix}progress`, {
+              await emitter.emit(`${emitterPrefix}progress`, {
                 phase: 'Updating workdir',
                 loaded: ++count,
                 total
@@ -217,7 +217,7 @@ export async function fastCheckout ({
             const filepath = `${dir}/${fullpath}`
             await fs.mkdir(filepath)
             if (emitter) {
-              emitter.emit(`${emitterPrefix}progress`, {
+              await emitter.emit(`${emitterPrefix}progress`, {
                 phase: 'Updating workdir',
                 loaded: ++count,
                 total
@@ -277,7 +277,7 @@ export async function fastCheckout ({
                   oid
                 })
                 if (emitter) {
-                  emitter.emit(`${emitterPrefix}progress`, {
+                  await emitter.emit(`${emitterPrefix}progress`, {
                     phase: 'Updating workdir',
                     loaded: ++count,
                     total
@@ -336,7 +336,7 @@ async function analyze ({
       }
       // Emit progress event
       if (emitter) {
-        emitter.emit(`${emitterPrefix}progress`, {
+        await emitter.emit(`${emitterPrefix}progress`, {
           phase: 'Analyzing workdir',
           loaded: ++count,
           lengthComputable: false

@@ -225,7 +225,7 @@ export async function statusMatrix ({
         const result = entry.map(value => entry.indexOf(value))
         result.shift() // remove leading undefined entry
         if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Calculating status',
             loaded: ++count,
             lengthComputable: false

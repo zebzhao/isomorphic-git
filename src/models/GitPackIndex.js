@@ -145,14 +145,14 @@ export class GitPackIndex {
     marky.mark('total')
     marky.mark('offsets')
     marky.mark('percent')
-    await listpack([pack], ({ data, type, reference, offset, num }) => {
+    await listpack([pack], async ({ data, type, reference, offset, num }) => {
       if (totalObjectCount === null) totalObjectCount = num
       const percent = Math.floor(
         ((totalObjectCount - num) * 100) / totalObjectCount
       )
       if (percent !== lastPercent) {
         if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Receiving objects',
             loaded: totalObjectCount - num,
             total: totalObjectCount,
@@ -250,7 +250,7 @@ export class GitPackIndex {
           )}\t${callsToReadSlice}\t${callsToGetExternal}`
         )
         if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Resolving deltas',
             loaded: count,
             total: totalObjectCount,
