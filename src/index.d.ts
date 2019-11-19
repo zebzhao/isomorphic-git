@@ -480,7 +480,7 @@ export function isDescendent(args: GitDir & {
   fs?: any;
   oid: string;
   ancestor: string;
-  depth?: string;
+  depth?: number;
 }): Promise<boolean>;
 
 export function listBranches(args: GitDir & {
