@@ -38,7 +38,7 @@ const messages = {
   RemoteDoesNotSupportDeepenSinceFail: `Remote does not support shallow fetches by date.`,
   RemoteDoesNotSupportDeepenNotFail: `Remote does not support shallow fetches excluding commits reachable by refs.`,
   RemoteDoesNotSupportDeepenRelativeFail: `Remote does not support shallow fetches relative to the current shallow depth.`,
-  RemoteDoesNotSupportSmartHTTP: `Remote does not support the "smart" HTTP protocol, and isomorphic-git does not support the "dumb" HTTP protocol, so they are incompatible.`,
+  RemoteDoesNotSupportSmartHTTP: `Remote did not reply using the "smart" HTTP protocol. Expected "001e# service=git-upload-pack" but received: { preview }`,
   CorruptShallowOidFail: `non-40 character shallow oid: { oid }`,
   FastForwardFail: `A simple fast-forward merge was not possible.`,
   DirectorySeparatorsError: `"filepath" parameter should not include leading or trailing directory separators because these can cause problems on some platforms`,
@@ -3714,20 +3714,6 @@ function calculateBasicAuthUsernamePasswordPair (
   }
 }
 
-function extractAuthFromUrl (url) {
-  // For whatever reason, the `fetch` API does not convert credentials embedded in the URL
-  // into Basic Authentication headers automatically. Instead it throws an error!
-  // So we must manually parse the URL, rip out the user:password portion if it is present
-  // and compute the Authorization header.
-  // Note: I tried using new URL(url) but that throws a security exception in Edge. :rolleyes:
-  let userpass = url.match(/^https?:\/\/([^/]+)@/);
-  if (userpass == null) return null
-  userpass = userpass[1];
-  const [username, password] = userpass.split(':');
-  url = url.replace(`${userpass}@`, '');
-  return { url, username, password }
-}
-
 // Currently 'for await' upsets my linters.
 async function forAwait (iterable, cb) {
   const iter = getIterator(iterable);
@@ -3744,6 +3730,20 @@ async function collect (iterable) {
   // This will be easier once `for await ... of` loops are available.
   await forAwait(iterable, value => buffers.push(Buffer.from(value)));
   return Buffer.concat(buffers)
+}
+
+function extractAuthFromUrl (url) {
+  // For whatever reason, the `fetch` API does not convert credentials embedded in the URL
+  // into Basic Authentication headers automatically. Instead it throws an error!
+  // So we must manually parse the URL, rip out the user:password portion if it is present
+  // and compute the Authorization header.
+  // Note: I tried using new URL(url) but that throws a security exception in Edge. :rolleyes:
+  let userpass = url.match(/^https?:\/\/([^/]+)@/);
+  if (userpass == null) return null
+  userpass = userpass[1];
+  const [username, password] = userpass.split(':');
+  url = url.replace(`${userpass}@`, '');
+  return { url, username, password }
 }
 
 async function http ({
@@ -3938,24 +3938,32 @@ class GitRemoteHTTP {
         statusMessage: res.statusMessage
       })
     }
-    // I'm going to be nice and ignore the content-type requirement unless there is a problem.
-    try {
-      const remoteHTTP = await parseRefsAdResponse(res.body, {
-        service
-      });
+    // Git "smart" HTTP servers should respond with the correct Content-Type header.
+    if (
+      res.headers['content-type'] === `application/x-${service}-advertisement`
+    ) {
+      const remoteHTTP = await parseRefsAdResponse(res.body, { service });
       remoteHTTP.auth = auth;
       return remoteHTTP
-    } catch (err) {
-      // Detect "dumb" HTTP protocol responses and throw more specific error message
-      if (
-        err.code === E.AssertServerResponseFail &&
-        err.data.expected === `# service=${service}\\n` &&
-        res.headers['content-type'] !== `application/x-${service}-advertisement`
-      ) {
-        // Ooooooh that's why it failed.
-        throw new GitError(E.RemoteDoesNotSupportSmartHTTP, {})
+    } else {
+      // If they don't send the correct content-type header, that's a good indicator it is either a "dumb" HTTP
+      // server, or the user specified an incorrect remote URL and the response is actually an HTML page.
+      // In this case, we save the response as plain text so we can generate a better error message if needed.
+      const data = await collect(res.body);
+      const response = data.toString('utf8');
+      const preview =
+        response.length < 256 ? response : response.slice(0, 256) + '...';
+      // For backwards compatibility, try to parse it anyway.
+      try {
+        const remoteHTTP = await parseRefsAdResponse([data], { service });
+        remoteHTTP.auth = auth;
+        return remoteHTTP
+      } catch (e) {
+        throw new GitError(E.RemoteDoesNotSupportSmartHTTP, {
+          preview,
+          response
+        })
       }
-      throw err
     }
   }
 
@@ -4812,8 +4820,7 @@ class GitWalkerRepo {
 }
 
 class GitWalkerRepo2 {
-  constructor ({ fs: _fs, gitdir, ref }) {
-    const fs = new FileSystem(_fs);
+  constructor ({ fs, gitdir, ref }) {
     this.fs = fs;
     this.gitdir = gitdir;
     this.mapPromise = (async () => {
