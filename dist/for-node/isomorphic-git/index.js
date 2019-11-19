@@ -1351,7 +1351,9 @@ const cores = {
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
+ * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.filepath - The path to the file to add to the index
@@ -1383,7 +1385,7 @@ async function add ({
       await addToIndex({ dir, gitdir, fs, filepath, index, added });
     });
     if (emitter) {
-      emitter.emit(`${emitterPrefix}add`, {
+      await emitter.emit(`${emitterPrefix}add`, {
         filepath,
         added
       });
@@ -2720,7 +2722,7 @@ async function listpack (stream, onData) {
         await reader.undo();
         await reader.read(chunk.length - inflator.strm.avail_in);
         const end = reader.tell();
-        onData({
+        await onData({
           data: inflator.result,
           type,
           num: numObjects,
@@ -2907,14 +2909,14 @@ class GitPackIndex {
     marky.mark('total');
     marky.mark('offsets');
     marky.mark('percent');
-    await listpack([pack], ({ data, type, reference, offset, num }) => {
+    await listpack([pack], async ({ data, type, reference, offset, num }) => {
       if (totalObjectCount === null) totalObjectCount = num;
       const percent = Math.floor(
         ((totalObjectCount - num) * 100) / totalObjectCount
       );
       if (percent !== lastPercent) {
         if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Receiving objects',
             loaded: totalObjectCount - num,
             total: totalObjectCount,
@@ -3012,7 +3014,7 @@ class GitPackIndex {
           )}\t${callsToReadSlice}\t${callsToGetExternal}`
         );
         if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Resolving deltas',
             loaded: count,
             total: totalObjectCount,
@@ -5145,7 +5147,7 @@ async function checkout ({
       })
     }
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: `Checking out ${remote}/${ref}`,
         loaded: 0,
         lengthComputable: false
@@ -5229,7 +5231,7 @@ async function checkout ({
               if (stage && workdir) {
                 await fs.rm(join(dir, fullpath));
                 if (emitter) {
-                  emitter.emit(`${emitterPrefix}progress`, {
+                  await emitter.emit(`${emitterPrefix}progress`, {
                     phase: 'Updating workdir',
                     loaded: ++count,
                     lengthComputable: false
@@ -5290,7 +5292,7 @@ async function checkout ({
                     oid
                   });
                   if (emitter) {
-                    emitter.emit(`${emitterPrefix}progress`, {
+                    await emitter.emit(`${emitterPrefix}progress`, {
                       phase: 'Updating workdir',
                       loaded: ++count,
                       lengthComputable: false
@@ -5498,7 +5500,7 @@ async function fastCheckout ({
               }
               index.delete({ filepath: fullpath });
               if (emitter) {
-                emitter.emit(`${emitterPrefix}progress`, {
+                await emitter.emit(`${emitterPrefix}progress`, {
                   phase: 'Updating workdir',
                   loaded: ++count,
                   total
@@ -5515,7 +5517,7 @@ async function fastCheckout ({
           try {
             await fs.rmdir(filepath);
             if (emitter) {
-              emitter.emit(`${emitterPrefix}progress`, {
+              await emitter.emit(`${emitterPrefix}progress`, {
                 phase: 'Updating workdir',
                 loaded: ++count,
                 total
@@ -5540,7 +5542,7 @@ async function fastCheckout ({
             const filepath = `${dir}/${fullpath}`;
             await fs.mkdir(filepath);
             if (emitter) {
-              emitter.emit(`${emitterPrefix}progress`, {
+              await emitter.emit(`${emitterPrefix}progress`, {
                 phase: 'Updating workdir',
                 loaded: ++count,
                 total
@@ -5600,7 +5602,7 @@ async function fastCheckout ({
                   oid
                 });
                 if (emitter) {
-                  emitter.emit(`${emitterPrefix}progress`, {
+                  await emitter.emit(`${emitterPrefix}progress`, {
                     phase: 'Updating workdir',
                     loaded: ++count,
                     total
@@ -5659,7 +5661,7 @@ async function analyze ({
       }
       // Emit progress event
       if (emitter) {
-        emitter.emit(`${emitterPrefix}progress`, {
+        await emitter.emit(`${emitterPrefix}progress`, {
           phase: 'Analyzing workdir',
           loaded: ++count,
           lengthComputable: false
@@ -6872,7 +6874,7 @@ function writeUploadPackRequest ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.url] - The URL of the remote repository. Will be gotten from gitconfig if absent.
@@ -6987,15 +6989,13 @@ async function fetch ({
     }
     if (emitter) {
       const lines = splitLines(response.progress);
-      forAwait(lines, line => {
+      forAwait(lines, async line => {
         // As a historical accident, 'message' events were trimmed removing valuable information,
         // such as \r by itself which was a single to update the existing line instead of appending a new one.
-        // TODO NEXT BREAKING RELEASE: make 'message' behave like 'rawmessage' and remove 'rawmessage'.
-        emitter.emit(`${emitterPrefix}message`, line.trim());
-        emitter.emit(`${emitterPrefix}rawmessage`, line);
+        emitter.emit(`${emitterPrefix}message`, line);
         const matches = line.match(/([^:]*).*\((\d+?)\/(\d+?)\)/);
         if (matches) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: matches[1].trim(),
             loaded: parseInt(matches[2], 10),
             total: parseInt(matches[3], 10),
@@ -7343,7 +7343,7 @@ async function init ({
     const total = folders.length;
     folders = folders.map(dir => gitdir + '/' + dir);
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Initializing repo',
         loaded: 0,
         total,
@@ -7353,7 +7353,7 @@ async function init ({
     for (const folder of folders) {
       await fs.mkdir(folder);
       if (emitter) {
-        emitter.emit(`${emitterPrefix}progress`, {
+        await emitter.emit(`${emitterPrefix}progress`, {
           phase: 'Initializing repo',
           loaded: ++count,
           total,
@@ -7533,7 +7533,7 @@ async function clone ({
  *
  * @param {Object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} args.message - The commit message to use.
@@ -7586,7 +7586,7 @@ async function commit ({
 }) {
   try {
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Creating commit',
         loaded: 0,
         lengthComputable: false
@@ -7623,7 +7623,7 @@ async function commit ({
     }
 
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Creating commit tree',
         loaded: 0,
         lengthComputable: false
@@ -7670,7 +7670,7 @@ async function commit ({
       }
 
       if (emitter) {
-        emitter.emit(`${emitterPrefix}progress`, {
+        await emitter.emit(`${emitterPrefix}progress`, {
           phase: 'Writing commit',
           loaded: 0,
           lengthComputable: false
@@ -9255,7 +9255,7 @@ async function findChangedFiles ({
             (theirs && (await theirs.type()) !== 'blob')) return
 
         if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Counting changes',
             loaded: ++count,
             lengthComputable: false
@@ -9423,7 +9423,7 @@ async function merge ({
 }) {
   try {
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Merging repo',
         loaded: 0,
         lengthComputable: false
@@ -9563,7 +9563,7 @@ async function merge ({
         }
 
         if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Applying changes',
             loaded: ++count,
             total,
@@ -9884,7 +9884,7 @@ async function pull ({
 }) {
   try {
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Pulling repo',
         loaded: 0,
         lengthComputable: false
@@ -10064,7 +10064,7 @@ async function listObjects ({
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref] - Which branch to push. By default this is the currently checked out branch.
@@ -10121,7 +10121,7 @@ async function push ({
 }) {
   try {
     if (emitter) {
-      emitter.emit(`${emitterPrefix}progress`, {
+      await emitter.emit(`${emitterPrefix}progress`, {
         phase: 'Pushing repo',
         loaded: 0,
         lengthComputable: false
@@ -10951,7 +10951,7 @@ async function statusMatrix ({
         const result = entry.map(value => entry.indexOf(value));
         result.shift(); // remove leading undefined entry
         if (emitter) {
-          emitter.emit(`${emitterPrefix}progress`, {
+          await emitter.emit(`${emitterPrefix}progress`, {
             phase: 'Calculating status',
             loaded: ++count,
             lengthComputable: false
