@@ -3,6 +3,9 @@ import { arrayRange } from '../utils/arrayRange.js'
 import { flat } from '../utils/flat.js'
 import { GitWalkBeta1Symbol } from '../utils/symbols.js'
 import { unionOfIterators } from '../utils/unionOfIterators.js'
+import { cores } from '../utils/plugins.js'
+
+const defaultIterate = (walk, children) => Promise.all([...children].map(walk))
 
 /**
  *
@@ -202,6 +205,7 @@ import { unionOfIterators } from '../utils/unionOfIterators.js'
  * > Note: For a complete example, look at the implementation of `statusMatrix`.
  *
  * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
  * @param {Walker[]} args.trees - The trees you want to traverse
  * @param {function(WalkerEntry[]): Promise<boolean>} [args.filter] - Filter which `WalkerEntry`s to process
  * @param {function(WalkerEntry[]): Promise<any>} [args.map] - Transform `WalkerEntry`s into a result form
@@ -214,6 +218,7 @@ import { unionOfIterators } from '../utils/unionOfIterators.js'
  *
  */
 export async function walkBeta1 ({
+  core = 'default',
   trees,
   filter = async () => true,
   // @ts-ignore
@@ -225,8 +230,9 @@ export async function walkBeta1 ({
     return flatten
   },
   // The default iterate function walks all children concurrently
-  iterate = (walk, children) => Promise.all([...children].map(walk))
+  iterate: _iterate = cores.get(core).get('iterate')
 }) {
+  const iterate = _iterate || defaultIterate
   try {
     const walkers = trees.map(proxy => proxy[GitWalkBeta1Symbol]())
 

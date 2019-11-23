@@ -33,7 +33,8 @@ class PluginCore extends Map {
           'write'
         ],
         pgp: ['sign', 'verify'],
-        http: []
+        http: [],
+        iterate: []
       }
       if (!Object.prototype.hasOwnProperty.call(pluginSchemas, key)) {
         throw new GitError(E.PluginUnrecognized, { plugin: key })

@@ -6,6 +6,8 @@ import { cores } from '../utils/plugins.js'
 import { GitWalkBeta2Symbol } from '../utils/symbols.js'
 import { unionOfIterators2 } from '../utils/unionOfIterators2.js'
 
+const defaultIterate = (walk, children) => Promise.all([...children].map(walk))
+
 /**
  *
  * @typedef {Object} Walker
@@ -263,8 +265,9 @@ export async function walkBeta2 ({
     return flatten
   },
   // The default iterate function walks all children concurrently
-  iterate = (walk, children) => Promise.all([...children].map(walk))
+  iterate: _iterate = cores.get(core).get('iterate')
 }) {
+  const iterate = _iterate || defaultIterate
   try {
     const walkers = trees.map(proxy =>
       proxy[GitWalkBeta2Symbol]({ fs, dir, gitdir })
