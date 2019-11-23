@@ -1293,7 +1293,8 @@ class PluginCore extends Map {
           'write'
         ],
         pgp: ['sign', 'verify'],
-        http: []
+        http: [],
+        iterate: []
       };
       if (!Object.prototype.hasOwnProperty.call(pluginSchemas, key)) {
         throw new GitError(E.PluginUnrecognized, { plugin: key })
@@ -4547,6 +4548,8 @@ function * unionOfIterators2 (sets) {
 
 // @ts-check
 
+const defaultIterate = (walk, children) => Promise.all([...children].map(walk));
+
 /**
  *
  * @typedef {Object} Walker
@@ -4804,8 +4807,9 @@ async function walkBeta2 ({
     return flatten
   },
   // The default iterate function walks all children concurrently
-  iterate = (walk, children) => Promise.all([...children].map(walk))
+  iterate: _iterate = cores.get(core).get('iterate')
 }) {
+  const iterate = _iterate || defaultIterate;
   try {
     const walkers = trees.map(proxy =>
       proxy[GitWalkBeta2Symbol]({ fs, dir, gitdir })
@@ -11212,6 +11216,8 @@ function * unionOfIterators (sets) {
 
 // @ts-check
 
+const defaultIterate$1 = (walk, children) => Promise.all([...children].map(walk));
+
 /**
  *
  * @typedef {Object} Walker
@@ -11410,6 +11416,7 @@ function * unionOfIterators (sets) {
  * > Note: For a complete example, look at the implementation of `statusMatrix`.
  *
  * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
  * @param {Walker[]} args.trees - The trees you want to traverse
  * @param {function(WalkerEntry[]): Promise<boolean>} [args.filter] - Filter which `WalkerEntry`s to process
  * @param {function(WalkerEntry[]): Promise<any>} [args.map] - Transform `WalkerEntry`s into a result form
@@ -11422,6 +11429,7 @@ function * unionOfIterators (sets) {
  *
  */
 async function walkBeta1 ({
+  core = 'default',
   trees,
   filter = async () => true,
   // @ts-ignore
@@ -11433,8 +11441,9 @@ async function walkBeta1 ({
     return flatten
   },
   // The default iterate function walks all children concurrently
-  iterate = (walk, children) => Promise.all([...children].map(walk))
+  iterate: _iterate = cores.get(core).get('iterate')
 }) {
+  const iterate = _iterate || defaultIterate$1;
   try {
     const walkers = trees.map(proxy => proxy[GitWalkBeta1Symbol]());
 

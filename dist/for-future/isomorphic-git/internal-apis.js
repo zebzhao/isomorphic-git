@@ -2444,7 +2444,8 @@ class PluginCore extends Map {
           'write'
         ],
         pgp: ['sign', 'verify'],
-        http: []
+        http: [],
+        iterate: []
       };
       if (!Object.prototype.hasOwnProperty.call(pluginSchemas, key)) {
         throw new GitError(E.PluginUnrecognized, { plugin: key })
@@ -5101,6 +5102,8 @@ function * unionOfIterators2 (sets) {
 
 // @ts-check
 
+const defaultIterate = (walk, children) => Promise.all([...children].map(walk));
+
 /**
  *
  * @typedef {Object} Walker
@@ -5358,8 +5361,9 @@ async function walkBeta2 ({
     return flatten
   },
   // The default iterate function walks all children concurrently
-  iterate = (walk, children) => Promise.all([...children].map(walk))
+  iterate: _iterate = cores.get(core).get('iterate')
 }) {
+  const iterate = _iterate || defaultIterate;
   try {
     const walkers = trees.map(proxy =>
       proxy[GitWalkBeta2Symbol]({ fs, dir, gitdir })
