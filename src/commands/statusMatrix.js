@@ -13,6 +13,8 @@ import { TREE } from './TREE.js'
 import { WORKDIR } from './WORKDIR.js'
 import { walkBeta2 } from './walkBeta2.js'
 
+const ALLOW_ALL = ['.']
+
 /**
  * Efficiently get the status of multiple files at once.
  *
@@ -154,7 +156,7 @@ export async function statusMatrix ({
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   ref = 'HEAD',
-  filepaths = ['.'],
+  filepaths = ALLOW_ALL,
   pattern = null
 }) {
   try {
@@ -169,6 +171,7 @@ export async function statusMatrix ({
       patternGlobrex = globrex(pattern, { globstar: true, extended: true })
     }
     const bases = filepaths.map(filepath => join(filepath, patternPart))
+    const allowAll = filepaths === ALLOW_ALL
     const results = await walkBeta2({
       fs,
       dir,
@@ -188,7 +191,7 @@ export async function statusMatrix ({
           }
         }
         // match against base paths
-        if (!bases.some(base => worthWalking(filepath, base))) {
+        if (!allowAll && !bases.some(base => worthWalking(filepath, base))) {
           return null
         }
         // Late filter against file names

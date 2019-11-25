@@ -4,6 +4,7 @@ import globrex from 'globrex'
 
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
+import { GitIgnoreManager } from '../managers/GitIgnoreManager.js'
 
 import { E, GitError } from '../models/GitError.js'
 import { join } from '../utils/join.js'
@@ -16,6 +17,8 @@ import { WORKDIR } from './WORKDIR'
 import { config } from './config'
 import { walkBeta2 } from './walkBeta2.js'
 import { STAGE } from './STAGE.js'
+
+const ALLOW_ALL = ['.']
 
 /**
  * Checkout a branch
@@ -57,7 +60,7 @@ export async function checkout ({
   emitterPrefix = '',
   remote = 'origin',
   ref,
-  filepaths = ['.'],
+  filepaths = ALLOW_ALL,
   pattern = null,
   noCheckout = false
 }) {
@@ -85,6 +88,7 @@ export async function checkout ({
       patternGlobrex = globrex(pattern, { globstar: true, extended: true })
     }
     const bases = filepaths.map(filepath => join(filepath, patternPart))
+    const allowAll = filepaths === ALLOW_ALL
     // Get tree oid
     let oid
     try {
@@ -119,7 +123,6 @@ export async function checkout ({
     if (!noCheckout) {
       let count = 0
       const indexEntries = []
-      const gitdirBasename = dir ? gitdir.replace(dir + '/', '') : gitdir
       // Instead of deleting and rewriting everything, only delete files
       // that are not present in the new branch, and only write files that
       // are not in the index or are in the index but have the wrong SHA.
@@ -130,12 +133,21 @@ export async function checkout ({
           gitdir,
           trees: [TREE({ ref }), WORKDIR(), STAGE()],
           map: async function (fullpath, [head, workdir, stage]) {
-            // match against base paths
-            if (!bases.some(base => worthWalking(fullpath, base))) {
+            if (fullpath === '.') return
+            if (!head && !stage && workdir) {
+              if (
+                await GitIgnoreManager.isIgnored({
+                  fs,
+                  dir,
+                  filepath: fullpath
+                })
+              ) {
+                return null
+              }
+            }
+            if (!allowAll && !bases.some(base => worthWalking(fullpath, base))) { // match against base paths
               return null
             }
-            if (fullpath === '.') return
-            if (fullpath === gitdirBasename) return
             // Late filter against file names
             if (patternGlobrex) {
               let match = false
@@ -160,7 +172,7 @@ export async function checkout ({
                   })
                 }
               }
-              return
+              return null
             }
             const filepath = `${dir}/${fullpath}`
             switch (await head.type()) {

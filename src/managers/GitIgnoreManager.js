@@ -16,10 +16,10 @@ export class GitIgnoreManager {
     gitdir = join(dir, '.git'),
     filepath
   }) {
-    // ALWAYS ignore ".git" folders.
-    if (basename(filepath) === '.git') return true
     // '.' is not a valid gitignore entry, so '.' is never ignored
     if (filepath === '.') return false
+    // ALWAYS ignore ".git" folders.
+    if (basename(filepath) === '.git') return true
     // Find all the .gitignore files that could affect this file
     const pairs = [
       {

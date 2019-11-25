@@ -1,6 +1,7 @@
 // @ts-check
 import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitRefManager } from '../managers/GitRefManager.js'
+import { GitIgnoreManager } from '../managers/GitIgnoreManager.js'
 import { E, GitError } from '../models/GitError.js'
 import { readObject } from '../storage/readObject.js'
 import { flat } from '../utils/flat.js'
@@ -13,6 +14,8 @@ import { TREE } from './TREE.js'
 import { WORKDIR } from './WORKDIR.js'
 import { config } from './config.js'
 import { walkBeta2 } from './walkBeta2.js'
+
+const ALLOW_ALL = ['.']
 
 /**
  * Checkout a branch
@@ -64,7 +67,7 @@ export async function fastCheckout ({
   emitterPrefix = '',
   remote = 'origin',
   ref: _ref,
-  filepaths = ['.'],
+  filepaths = ALLOW_ALL,
   noCheckout = false,
   noUpdateHead = _ref === void 0,
   dryRun = false,
@@ -330,8 +333,19 @@ async function analyze ({
     trees: [TREE({ ref }), WORKDIR(), STAGE()],
     map: async function (fullpath, [commit, workdir, stage]) {
       if (fullpath === '.') return
+      if (!commit && !stage && workdir) {
+        if (
+          await GitIgnoreManager.isIgnored({
+            fs,
+            dir,
+            filepath: fullpath
+          })
+        ) {
+          return null
+        }
+      }
       // match against base paths
-      if (!filepaths.some(base => worthWalking(fullpath, base))) {
+      if (filepaths !== ALLOW_ALL && !filepaths.some(base => worthWalking(fullpath, base))) {
         return null
       }
       // Emit progress event

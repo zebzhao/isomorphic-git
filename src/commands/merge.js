@@ -311,13 +311,11 @@ async function processConflict ({ ours, theirs, base, fs, dir, gitdir, filepath 
     theirs.content(),
     base.content()
   ])
-
   const merged = await mergeFile({
     ourContent: ourContent.toString('utf8'),
     baseContent: baseContent.toString('utf8'),
     theirContent: theirContent.toString('utf8')
   })
-
   const modified = (await base.oid()) === (await ours.oid()) ? theirs : ours
   const workingPath = `${dir}/${filepath}`
   await fs.write(
@@ -329,13 +327,18 @@ async function processConflict ({ ours, theirs, base, fs, dir, gitdir, filepath 
   const stats = await fs.lstat(workingPath)
 
   if (!merged.cleanMerge) {
+    const [ourOid, theirOid, baseOid] = await Promise.all([
+      ours.oid(),
+      theirs.oid(),
+      base.oid()
+    ])
     return {
       conflict: {
         filepath,
         stats,
-        ourOid: await ours.oid(),
-        theirOid: await theirs.oid(),
-        baseOid: await base.oid()
+        ourOid,
+        theirOid,
+        baseOid
       }
     }
   } else {
