@@ -192,9 +192,9 @@ export async function checkout ({
               }
               case 'blob': {
                 const oid = await head.oid()
+                const mode = await head.mode()
                 if (!stage || !workdir || (await stage.oid()) !== oid) {
                   const content = await head.content()
-                  const mode = await head.mode()
                   switch (mode) {
                     case 0o100644:
                       // regular file
@@ -213,18 +213,6 @@ export async function checkout ({
                         message: `Invalid mode "${mode}" detected in blob ${oid}`
                       })
                   }
-                  const stats = await fs.lstat(filepath)
-                  // We can't trust the executable bit returned by lstat on Windows,
-                  // so we need to preserve this value from the TREE.
-                  // TODO: Figure out how git handles this internally.
-                  if (mode === 0o100755) {
-                    stats.mode = 0o100755
-                  }
-                  indexEntries.push({
-                    filepath: fullpath,
-                    stats,
-                    oid
-                  })
                   if (emitter) {
                     await emitter.emit(`${emitterPrefix}progress`, {
                       phase: 'Updating workdir',
@@ -233,6 +221,18 @@ export async function checkout ({
                     })
                   }
                 }
+                const stats = await fs.lstat(filepath)
+                // We can't trust the executable bit returned by lstat on Windows,
+                // so we need to preserve this value from the TREE.
+                // TODO: Figure out how git handles this internally.
+                if (mode === 0o100755) {
+                  stats.mode = 0o100755
+                }
+                indexEntries.push({
+                  filepath: fullpath,
+                  stats,
+                  oid
+                })
                 break
               }
               default: {
