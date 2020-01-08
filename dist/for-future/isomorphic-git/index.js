@@ -300,10 +300,10 @@ class GitIgnoreManager {
     gitdir = join(dir, '.git'),
     filepath
   }) {
-    // ALWAYS ignore ".git" folders.
-    if (basename(filepath) === '.git') return true
     // '.' is not a valid gitignore entry, so '.' is never ignored
     if (filepath === '.') return false
+    // ALWAYS ignore ".git" folders.
+    if (basename(filepath) === '.git') return true
     // Find all the .gitignore files that could affect this file
     const pairs = [
       {
@@ -954,6 +954,15 @@ function flatFileListToDirectoryStructure (files) {
   return inodes
 }
 
+function compareTreeEntryPath (a, b) {
+  // Git sorts tree entries as if there is a trailing slash on directory names.
+  return compareStrings(appendSlashIfDir(a), appendSlashIfDir(b))
+}
+
+function appendSlashIfDir (entry) {
+  return entry.mode === '040000' ? entry.path + '/' : entry.path
+}
+
 /*::
 type TreeEntry = {
   mode: string,
@@ -1044,8 +1053,8 @@ class GitTree {
         message: 'invalid type passed to GitTree constructor'
       })
     }
-    // There appears to be an edge case (in this repo no less) where
-    // the tree is NOT sorted as expected if some directories end with ".git"
+    // Tree entries are not sorted alphabetically in the usual sense (see `compareTreeEntryPath`)
+    // but it is important later on that these be sorted in the same order as they would be returned from readdir.
     this._entries.sort(comparePath);
   }
 
@@ -1060,8 +1069,11 @@ class GitTree {
   }
 
   toObject () {
+    // Adjust the sort order to match git's
+    const entries = [...this._entries];
+    entries.sort(compareTreeEntryPath);
     return Buffer.concat(
-      this._entries.map(entry => {
+      entries.map(entry => {
         const mode = Buffer.from(entry.mode.replace(/^0/, ''));
         const space = Buffer.from(' ');
         const path = Buffer.from(entry.path, 'utf8');
@@ -5050,6 +5062,8 @@ function STAGE ({
 
 // @ts-check
 
+const ALLOW_ALL = ['.'];
+
 /**
  * Checkout a branch
  *
@@ -5090,7 +5104,7 @@ async function checkout ({
   emitterPrefix = '',
   remote = 'origin',
   ref,
-  filepaths = ['.'],
+  filepaths = ALLOW_ALL,
   pattern = null,
   noCheckout = false
 }) {
@@ -5118,6 +5132,7 @@ async function checkout ({
       patternGlobrex = globrex(pattern, { globstar: true, extended: true });
     }
     const bases = filepaths.map(filepath => join(filepath, patternPart));
+    const allowAll = filepaths === ALLOW_ALL;
     // Get tree oid
     let oid;
     try {
@@ -5152,7 +5167,6 @@ async function checkout ({
     if (!noCheckout) {
       let count = 0;
       const indexEntries = [];
-      const gitdirBasename = dir ? gitdir.replace(dir + '/', '') : gitdir;
       // Instead of deleting and rewriting everything, only delete files
       // that are not present in the new branch, and only write files that
       // are not in the index or are in the index but have the wrong SHA.
@@ -5163,12 +5177,21 @@ async function checkout ({
           gitdir,
           trees: [TREE({ ref }), WORKDIR(), STAGE()],
           map: async function (fullpath, [head, workdir, stage]) {
-            // match against base paths
-            if (!bases.some(base => worthWalking(fullpath, base))) {
+            if (fullpath === '.') return
+            if (!head && !stage && workdir) {
+              if (
+                await GitIgnoreManager.isIgnored({
+                  fs,
+                  dir,
+                  filepath: fullpath
+                })
+              ) {
+                return null
+              }
+            }
+            if (!allowAll && !bases.some(base => worthWalking(fullpath, base))) { // match against base paths
               return null
             }
-            if (fullpath === '.') return
-            if (fullpath === gitdirBasename) return
             // Late filter against file names
             if (patternGlobrex) {
               let match = false;
@@ -5193,7 +5216,7 @@ async function checkout ({
                   });
                 }
               }
-              return
+              return null
             }
             const filepath = `${dir}/${fullpath}`;
             switch (await head.type()) {
@@ -5213,9 +5236,9 @@ async function checkout ({
               }
               case 'blob': {
                 const oid = await head.oid();
+                const mode = await head.mode();
                 if (!stage || !workdir || (await stage.oid()) !== oid) {
                   const content = await head.content();
-                  const mode = await head.mode();
                   switch (mode) {
                     case 0o100644:
                       // regular file
@@ -5234,18 +5257,6 @@ async function checkout ({
                         message: `Invalid mode "${mode}" detected in blob ${oid}`
                       })
                   }
-                  const stats = await fs.lstat(filepath);
-                  // We can't trust the executable bit returned by lstat on Windows,
-                  // so we need to preserve this value from the TREE.
-                  // TODO: Figure out how git handles this internally.
-                  if (mode === 0o100755) {
-                    stats.mode = 0o100755;
-                  }
-                  indexEntries.push({
-                    filepath: fullpath,
-                    stats,
-                    oid
-                  });
                   if (emitter) {
                     await emitter.emit(`${emitterPrefix}progress`, {
                       phase: 'Updating workdir',
@@ -5254,6 +5265,18 @@ async function checkout ({
                     });
                   }
                 }
+                const stats = await fs.lstat(filepath);
+                // We can't trust the executable bit returned by lstat on Windows,
+                // so we need to preserve this value from the TREE.
+                // TODO: Figure out how git handles this internally.
+                if (mode === 0o100755) {
+                  stats.mode = 0o100755;
+                }
+                indexEntries.push({
+                  filepath: fullpath,
+                  stats,
+                  oid
+                });
                 break
               }
               default: {
@@ -5293,6 +5316,8 @@ async function checkout ({
 }
 
 // @ts-check
+
+const ALLOW_ALL$1 = ['.'];
 
 /**
  * Checkout a branch
@@ -5344,7 +5369,7 @@ async function fastCheckout ({
   emitterPrefix = '',
   remote = 'origin',
   ref: _ref,
-  filepaths = ['.'],
+  filepaths = ALLOW_ALL$1,
   noCheckout = false,
   noUpdateHead = _ref === void 0,
   dryRun = false,
@@ -5610,8 +5635,19 @@ async function analyze ({
     trees: [TREE({ ref }), WORKDIR(), STAGE()],
     map: async function (fullpath, [commit, workdir, stage]) {
       if (fullpath === '.') return
+      if (!commit && !stage && workdir) {
+        if (
+          await GitIgnoreManager.isIgnored({
+            fs,
+            dir,
+            filepath: fullpath
+          })
+        ) {
+          return null
+        }
+      }
       // match against base paths
-      if (!filepaths.some(base => worthWalking(fullpath, base))) {
+      if (filepaths !== ALLOW_ALL$1 && !filepaths.some(base => worthWalking(fullpath, base))) {
         return null
       }
       // Emit progress event
@@ -9587,13 +9623,11 @@ async function processConflict ({ ours, theirs, base, fs, dir, gitdir, filepath 
     theirs.content(),
     base.content()
   ]);
-
   const merged = await mergeFile({
     ourContent: ourContent.toString('utf8'),
     baseContent: baseContent.toString('utf8'),
     theirContent: theirContent.toString('utf8')
   });
-
   const modified = (await base.oid()) === (await ours.oid()) ? theirs : ours;
   const workingPath = `${dir}/${filepath}`;
   await fs.write(
@@ -9605,13 +9639,18 @@ async function processConflict ({ ours, theirs, base, fs, dir, gitdir, filepath 
   const stats = await fs.lstat(workingPath);
 
   if (!merged.cleanMerge) {
+    const [ourOid, theirOid, baseOid] = await Promise.all([
+      ours.oid(),
+      theirs.oid(),
+      base.oid()
+    ]);
     return {
       conflict: {
         filepath,
         stats,
-        ourOid: await ours.oid(),
-        theirOid: await theirs.oid(),
-        baseOid: await base.oid()
+        ourOid,
+        theirOid,
+        baseOid
       }
     }
   } else {
@@ -10677,6 +10716,8 @@ async function status ({
 
 // @ts-check
 
+const ALLOW_ALL$2 = ['.'];
+
 /**
  * Efficiently get the status of multiple files at once.
  *
@@ -10818,7 +10859,7 @@ async function statusMatrix ({
   emitter = cores.get(core).get('emitter'),
   emitterPrefix = '',
   ref = 'HEAD',
-  filepaths = ['.'],
+  filepaths = ALLOW_ALL$2,
   pattern = null
 }) {
   try {
@@ -10833,6 +10874,7 @@ async function statusMatrix ({
       patternGlobrex = globrex(pattern, { globstar: true, extended: true });
     }
     const bases = filepaths.map(filepath => join(filepath, patternPart));
+    const allowAll = filepaths === ALLOW_ALL$2;
     const results = await walkBeta2({
       fs,
       dir,
@@ -10852,7 +10894,7 @@ async function statusMatrix ({
           }
         }
         // match against base paths
-        if (!bases.some(base => worthWalking(filepath, base))) {
+        if (!allowAll && !bases.some(base => worthWalking(filepath, base))) {
           return null
         }
         // Late filter against file names

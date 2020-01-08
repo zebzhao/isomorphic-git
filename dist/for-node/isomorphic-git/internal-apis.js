@@ -2613,6 +2613,15 @@ function comparePath (a, b) {
   return compareStrings(a.path, b.path)
 }
 
+function compareTreeEntryPath (a, b) {
+  // Git sorts tree entries as if there is a trailing slash on directory names.
+  return compareStrings(appendSlashIfDir(a), appendSlashIfDir(b))
+}
+
+function appendSlashIfDir (entry) {
+  return entry.mode === '040000' ? entry.path + '/' : entry.path
+}
+
 /*::
 type TreeEntry = {
   mode: string,
@@ -2703,8 +2712,8 @@ class GitTree {
         message: 'invalid type passed to GitTree constructor'
       })
     }
-    // There appears to be an edge case (in this repo no less) where
-    // the tree is NOT sorted as expected if some directories end with ".git"
+    // Tree entries are not sorted alphabetically in the usual sense (see `compareTreeEntryPath`)
+    // but it is important later on that these be sorted in the same order as they would be returned from readdir.
     this._entries.sort(comparePath);
   }
 
@@ -2719,8 +2728,11 @@ class GitTree {
   }
 
   toObject () {
+    // Adjust the sort order to match git's
+    const entries = [...this._entries];
+    entries.sort(compareTreeEntryPath);
     return Buffer.concat(
-      this._entries.map(entry => {
+      entries.map(entry => {
         const mode = Buffer.from(entry.mode.replace(/^0/, ''));
         const space = Buffer.from(' ');
         const path = Buffer.from(entry.path, 'utf8');
@@ -3053,10 +3065,10 @@ class GitIgnoreManager {
     gitdir = join(dir, '.git'),
     filepath
   }) {
-    // ALWAYS ignore ".git" folders.
-    if (basename(filepath) === '.git') return true
     // '.' is not a valid gitignore entry, so '.' is never ignored
     if (filepath === '.') return false
+    // ALWAYS ignore ".git" folders.
+    if (basename(filepath) === '.git') return true
     // Find all the .gitignore files that could affect this file
     const pairs = [
       {
