@@ -2,14 +2,14 @@ import ignore from 'ignore';
 import AsyncLock from 'async-lock';
 import Hash from 'sha.js/sha1';
 import pako from 'pako';
-import cleanGitRef from 'clean-git-ref';
+import pify from 'pify';
 import crc32 from 'crc-32';
 import applyDelta from 'git-apply-delta';
 import { mark, stop } from 'marky';
+import cleanGitRef from 'clean-git-ref';
 import globrex from 'globrex';
 import globalyzer from 'globalyzer';
 import diff3Merge from 'diff3';
-import pify from 'pify';
 
 /**
  * Use with push and fetch to set Basic Authentication headers.
@@ -106,7 +106,8 @@ const messages = {
   PluginUnrecognized: `Unrecognized plugin type "{ plugin }"`,
   AmbiguousShortOid: `Found multiple oids matching "{ short }" ({ matches }). Use a longer abbreviation length to disambiguate them.`,
   ShortOidNotFound: `Could not find an object matching "{ short }".`,
-  CheckoutConflictError: `Your local changes to the following files would be overwritten by checkout: { filepaths }`
+  CheckoutConflictError: `Your local changes to the following files would be overwritten by checkout: { filepaths }`,
+  NoteAlreadyExistsError: `A note object { note } already exists on object { oid }. Use 'force: true' parameter to overwrite existing notes.`
 };
 
 const E = {
@@ -182,7 +183,8 @@ const E = {
   PluginUnrecognized: `PluginUnrecognized`,
   AmbiguousShortOid: `AmbiguousShortOid`,
   ShortOidNotFound: `ShortOidNotFound`,
-  CheckoutConflictError: `CheckoutConflictError`
+  CheckoutConflictError: `CheckoutConflictError`,
+  NoteAlreadyExistsError: `NoteAlreadyExistsError`
 };
 
 function renderTemplate (template, values) {
@@ -963,14 +965,14 @@ function appendSlashIfDir (entry) {
   return entry.mode === '040000' ? entry.path + '/' : entry.path
 }
 
-/*::
-type TreeEntry = {
-  mode: string,
-  path: string,
-  oid: string,
-  type?: string
-}
-*/
+/**
+ *
+ * @typedef {Object} TreeEntry
+ * @property {string} mode - the 6 digit hexadecimal mode
+ * @property {string} path - the name of the file or directory
+ * @property {string} oid - the SHA-1 object id of the blob or tree
+ * @property {'commit'|'blob'|'tree'} type - the type of object
+ */
 
 function mode2type (mode) {
   // prettier-ignore
@@ -1034,15 +1036,12 @@ function nudgeIntoShape (entry) {
   }
   entry.mode = limitModeToAllowed(entry.mode); // index
   if (!entry.type) {
-    entry.type = 'blob'; // index
+    entry.type = mode2type(entry.mode); // index
   }
   return entry
 }
 
 class GitTree {
-  /*::
-  _entries: Array<TreeEntry>
-  */
   constructor (entries) {
     if (Buffer.isBuffer(entries)) {
       this._entries = parseBuffer(entries);
@@ -1084,6 +1083,9 @@ class GitTree {
     )
   }
 
+  /**
+   * @returns {TreeEntry[]}
+   */
   entries () {
     return this._entries
   }
@@ -1145,6 +1147,35 @@ async function writeObjectLoose ({
   if (!(await fs.exists(filepath))) await fs.write(filepath, object);
 }
 
+/* eslint-env node, browser */
+
+let supportsCompressionStream = null;
+
+async function deflate (buffer) {
+  if (supportsCompressionStream === null) {
+    supportsCompressionStream = testCompressionStream();
+  }
+  return supportsCompressionStream
+    ? browserDeflate(buffer)
+    : pako.deflate(buffer)
+}
+
+async function browserDeflate (buffer) {
+  const cs = new CompressionStream('deflate');
+  const c = new Blob([buffer]).stream().pipeThrough(cs);
+  return new Uint8Array(await new Response(c).arrayBuffer())
+}
+
+function testCompressionStream () {
+  try {
+    const cs = new CompressionStream('deflate');
+    if (cs) return true
+  } catch (_) {
+    // no bother
+  }
+  return false
+}
+
 async function writeObject ({
   fs,
   gitdir,
@@ -1159,7 +1190,7 @@ async function writeObject ({
       object = GitObject.wrap({ type, object });
     }
     oid = await shasum(object);
-    object = Buffer.from(pako.deflate(object));
+    object = Buffer.from(await deflate(object));
   }
   if (!dryRun) {
     await writeObjectLoose({ fs, gitdir, object, format: 'deflated', oid });
@@ -1437,6 +1468,171 @@ async function addToIndex ({ dir, gitdir, fs, filepath, index, added }) {
   }
 }
 
+class GitPackedRefs {
+  constructor (text) {
+    this.refs = new Map();
+    this.parsedConfig = [];
+    if (text) {
+      let key = null;
+      this.parsedConfig = text
+        .trim()
+        .split('\n')
+        .map(line => {
+          if (/^\s*#/.test(line)) {
+            return { line, comment: true }
+          }
+          const i = line.indexOf(' ');
+          if (line.startsWith('^')) {
+            // This is a oid for the commit associated with the annotated tag immediately preceding this line.
+            // Trim off the '^'
+            const value = line.slice(1);
+            // The tagname^{} syntax is based on the output of `git show-ref --tags -d`
+            this.refs.set(key + '^{}', value);
+            return { line, ref: key, peeled: value }
+          } else {
+            // This is an oid followed by the ref name
+            const value = line.slice(0, i);
+            key = line.slice(i + 1);
+            this.refs.set(key, value);
+            return { line, ref: key, oid: value }
+          }
+        });
+    }
+    return this
+  }
+
+  static from (text) {
+    return new GitPackedRefs(text)
+  }
+
+  delete (ref) {
+    this.parsedConfig = this.parsedConfig.filter(entry => entry.ref !== ref);
+    this.refs.delete(ref);
+  }
+
+  toString () {
+    return this.parsedConfig.map(({ line }) => line).join('\n') + '\n'
+  }
+}
+
+class GitRefSpec {
+  constructor ({ remotePath, localPath, force, matchPrefix }) {
+    Object.assign(this, {
+      remotePath,
+      localPath,
+      force,
+      matchPrefix
+    });
+  }
+
+  static from (refspec) {
+    const [
+      forceMatch,
+      remotePath,
+      remoteGlobMatch,
+      localPath,
+      localGlobMatch
+    ] = refspec.match(/^(\+?)(.*?)(\*?):(.*?)(\*?)$/).slice(1);
+    const force = forceMatch === '+';
+    const remoteIsGlob = remoteGlobMatch === '*';
+    const localIsGlob = localGlobMatch === '*';
+    // validate
+    // TODO: Make this check more nuanced, and depend on whether this is a fetch refspec or a push refspec
+    if (remoteIsGlob !== localIsGlob) {
+      throw new GitError(E.InternalFail, { message: 'Invalid refspec' })
+    }
+    return new GitRefSpec({
+      remotePath,
+      localPath,
+      force,
+      matchPrefix: remoteIsGlob
+    })
+    // TODO: We need to run resolveRef on both paths to expand them to their full name.
+  }
+
+  translate (remoteBranch) {
+    if (this.matchPrefix) {
+      if (remoteBranch.startsWith(this.remotePath)) {
+        return this.localPath + remoteBranch.replace(this.remotePath, '')
+      }
+    } else {
+      if (remoteBranch === this.remotePath) return this.localPath
+    }
+    return null
+  }
+
+  reverseTranslate (localBranch) {
+    if (this.matchPrefix) {
+      if (localBranch.startsWith(this.localPath)) {
+        return this.remotePath + localBranch.replace(this.localPath, '')
+      }
+    } else {
+      if (localBranch === this.localPath) return this.remotePath
+    }
+    return null
+  }
+}
+
+class GitRefSpecSet {
+  constructor (rules = []) {
+    this.rules = rules;
+  }
+
+  static from (refspecs) {
+    const rules = [];
+    for (const refspec of refspecs) {
+      rules.push(GitRefSpec.from(refspec)); // might throw
+    }
+    return new GitRefSpecSet(rules)
+  }
+
+  add (refspec) {
+    const rule = GitRefSpec.from(refspec); // might throw
+    this.rules.push(rule);
+  }
+
+  translate (remoteRefs) {
+    const result = [];
+    for (const rule of this.rules) {
+      for (const remoteRef of remoteRefs) {
+        const localRef = rule.translate(remoteRef);
+        if (localRef) {
+          result.push([remoteRef, localRef]);
+        }
+      }
+    }
+    return result
+  }
+
+  translateOne (remoteRef) {
+    let result = null;
+    for (const rule of this.rules) {
+      const localRef = rule.translate(remoteRef);
+      if (localRef) {
+        result = localRef;
+      }
+    }
+    return result
+  }
+
+  localNamespaces () {
+    return this.rules
+      .filter(rule => rule.matchPrefix)
+      .map(rule => rule.localPath.replace(/\/$/, ''))
+  }
+}
+
+function compareRefNames (a, b) {
+  // https://stackoverflow.com/a/40355107/2168416
+  const _a = a.replace(/\^\{\}$/, '');
+  const _b = b.replace(/\^\{\}$/, '');
+  const tmp = -(_a < _b) || +(_a > _b);
+  if (tmp === 0) {
+    return a.endsWith('^{}') ? 1 : -1
+  }
+  return tmp
+}
+
 // This is straight from parse_unit_factor in config.c of canonical git
 const num = val => {
   val = val.toLowerCase();
@@ -1465,27 +1661,30 @@ const schema = {
     symlinks: bool,
     ignorecase: bool,
     bigFileThreshold: num
+  },
+  'isomorphic-git': {
+    autoTranslateSSH: bool
   }
 };
 
-// https://git-scm.com/docs/git-config
+// https://git-scm.com/docs/git-config#_syntax
 
 // section starts with [ and ends with ]
-// section is alphanumeric (ASCII) with _ and .
+// section is alphanumeric (ASCII) with - and .
 // section is case insensitive
 // subsection is optionnal
 // subsection is specified after section and one or more spaces
 // subsection is specified between double quotes
-const SECTION_LINE_REGEX = /^\[([A-Za-z0-9_.]+)(?: "(.*)")?\]$/;
-const SECTION_REGEX = /^[A-Za-z0-9_.]+$/;
+const SECTION_LINE_REGEX = /^\[([A-Za-z0-9-.]+)(?: "(.*)")?\]$/;
+const SECTION_REGEX = /^[A-Za-z0-9-.]+$/;
 
 // variable lines contain a name, and equal sign and then a value
 // variable lines can also only contain a name (the implicit value is a boolean true)
-// variable name is alphanumeric (ASCII) with _
+// variable name is alphanumeric (ASCII) with -
 // variable name starts with an alphabetic character
 // variable name is case insensitive
-const VARIABLE_LINE_REGEX = /^([A-Za-z]\w*)(?: *= *(.*))?$/;
-const VARIABLE_NAME_REGEX = /^[A-Za-z]\w*$/;
+const VARIABLE_LINE_REGEX = /^([A-Za-z][A-Za-z-]*)(?: *= *(.*))?$/;
+const VARIABLE_NAME_REGEX = /^[A-Za-z][A-Za-z-]*$/;
 
 const VARIABLE_VALUE_COMMENT_REGEX = /^(.*?)( *[#;].*)$/;
 
@@ -1712,246 +1911,6 @@ class GitConfigManager {
       encoding: 'utf8'
     });
   }
-}
-
-// @ts-check
-
-/**
- * Add or update a remote
- *
- * @param {object} args
- * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
- * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
- * @param {string} [args.gitdir] - [required] The [git directory](dir-vs-gitdir.md) path
- * @param {string} args.remote - The name of the remote
- * @param {string} args.url - The URL of the remote
- * @param {boolean} [args.force = false] - Instead of throwing an error if a remote named `remote` already exists, overwrite the existing remote.
- *
- * @returns {Promise<void>} Resolves successfully when filesystem operations are complete
- *
- * @example
- * await git.addRemote({ dir: '$input((/))', remote: '$input((upstream))', url: '$input((https://github.com/isomorphic-git/isomorphic-git))' })
- * console.log('done')
- *
- */
-async function addRemote ({
-  core = 'default',
-  dir,
-  gitdir = join(dir, '.git'),
-  fs = cores.get(core).get('fs'),
-  remote,
-  url,
-  force = false
-}) {
-  try {
-    if (remote === undefined) {
-      throw new GitError(E.MissingRequiredParameterError, {
-        function: 'addRemote',
-        parameter: 'remote'
-      })
-    }
-    if (url === undefined) {
-      throw new GitError(E.MissingRequiredParameterError, {
-        function: 'addRemote',
-        parameter: 'url'
-      })
-    }
-    if (remote !== cleanGitRef.clean(remote)) {
-      throw new GitError(E.InvalidRefNameError, {
-        verb: 'add',
-        noun: 'remote',
-        ref: remote,
-        suggestion: cleanGitRef.clean(remote)
-      })
-    }
-    const config = await GitConfigManager.get({ fs, gitdir });
-    if (!force) {
-      // Check that setting it wouldn't overwrite.
-      const remoteNames = await config.getSubsections('remote');
-      if (remoteNames.includes(remote)) {
-        // Throw an error if it would overwrite an existing remote,
-        // but not if it's simply setting the same value again.
-        if (url !== (await config.get(`remote.${remote}.url`))) {
-          throw new GitError(E.AddingRemoteWouldOverwrite, { remote })
-        }
-      }
-    }
-    await config.set(`remote.${remote}.url`, url);
-    await config.set(
-      `remote.${remote}.fetch`,
-      `+refs/heads/*:refs/remotes/${remote}/*`
-    );
-    await GitConfigManager.save({ fs, gitdir, config });
-  } catch (err) {
-    err.caller = 'git.addRemote';
-    throw err
-  }
-}
-
-class GitPackedRefs {
-  constructor (text) {
-    this.refs = new Map();
-    this.parsedConfig = [];
-    if (text) {
-      let key = null;
-      this.parsedConfig = text
-        .trim()
-        .split('\n')
-        .map(line => {
-          if (/^\s*#/.test(line)) {
-            return { line, comment: true }
-          }
-          const i = line.indexOf(' ');
-          if (line.startsWith('^')) {
-            // This is a oid for the commit associated with the annotated tag immediately preceding this line.
-            // Trim off the '^'
-            const value = line.slice(1);
-            // The tagname^{} syntax is based on the output of `git show-ref --tags -d`
-            this.refs.set(key + '^{}', value);
-            return { line, ref: key, peeled: value }
-          } else {
-            // This is an oid followed by the ref name
-            const value = line.slice(0, i);
-            key = line.slice(i + 1);
-            this.refs.set(key, value);
-            return { line, ref: key, oid: value }
-          }
-        });
-    }
-    return this
-  }
-
-  static from (text) {
-    return new GitPackedRefs(text)
-  }
-
-  delete (ref) {
-    this.parsedConfig = this.parsedConfig.filter(entry => entry.ref !== ref);
-    this.refs.delete(ref);
-  }
-
-  toString () {
-    return this.parsedConfig.map(({ line }) => line).join('\n') + '\n'
-  }
-}
-
-class GitRefSpec {
-  constructor ({ remotePath, localPath, force, matchPrefix }) {
-    Object.assign(this, {
-      remotePath,
-      localPath,
-      force,
-      matchPrefix
-    });
-  }
-
-  static from (refspec) {
-    const [
-      forceMatch,
-      remotePath,
-      remoteGlobMatch,
-      localPath,
-      localGlobMatch
-    ] = refspec.match(/^(\+?)(.*?)(\*?):(.*?)(\*?)$/).slice(1);
-    const force = forceMatch === '+';
-    const remoteIsGlob = remoteGlobMatch === '*';
-    const localIsGlob = localGlobMatch === '*';
-    // validate
-    // TODO: Make this check more nuanced, and depend on whether this is a fetch refspec or a push refspec
-    if (remoteIsGlob !== localIsGlob) {
-      throw new GitError(E.InternalFail, { message: 'Invalid refspec' })
-    }
-    return new GitRefSpec({
-      remotePath,
-      localPath,
-      force,
-      matchPrefix: remoteIsGlob
-    })
-    // TODO: We need to run resolveRef on both paths to expand them to their full name.
-  }
-
-  translate (remoteBranch) {
-    if (this.matchPrefix) {
-      if (remoteBranch.startsWith(this.remotePath)) {
-        return this.localPath + remoteBranch.replace(this.remotePath, '')
-      }
-    } else {
-      if (remoteBranch === this.remotePath) return this.localPath
-    }
-    return null
-  }
-
-  reverseTranslate (localBranch) {
-    if (this.matchPrefix) {
-      if (localBranch.startsWith(this.localPath)) {
-        return this.remotePath + localBranch.replace(this.localPath, '')
-      }
-    } else {
-      if (localBranch === this.localPath) return this.remotePath
-    }
-    return null
-  }
-}
-
-class GitRefSpecSet {
-  constructor (rules = []) {
-    this.rules = rules;
-  }
-
-  static from (refspecs) {
-    const rules = [];
-    for (const refspec of refspecs) {
-      rules.push(GitRefSpec.from(refspec)); // might throw
-    }
-    return new GitRefSpecSet(rules)
-  }
-
-  add (refspec) {
-    const rule = GitRefSpec.from(refspec); // might throw
-    this.rules.push(rule);
-  }
-
-  translate (remoteRefs) {
-    const result = [];
-    for (const rule of this.rules) {
-      for (const remoteRef of remoteRefs) {
-        const localRef = rule.translate(remoteRef);
-        if (localRef) {
-          result.push([remoteRef, localRef]);
-        }
-      }
-    }
-    return result
-  }
-
-  translateOne (remoteRef) {
-    let result = null;
-    for (const rule of this.rules) {
-      const localRef = rule.translate(remoteRef);
-      if (localRef) {
-        result = localRef;
-      }
-    }
-    return result
-  }
-
-  localNamespaces () {
-    return this.rules
-      .filter(rule => rule.matchPrefix)
-      .map(rule => rule.localPath.replace(/\/$/, ''))
-  }
-}
-
-function compareRefNames (a, b) {
-  // https://stackoverflow.com/a/40355107/2168416
-  const _a = a.replace(/\^\{\}$/, '');
-  const _b = b.replace(/\^\{\}$/, '');
-  const tmp = -(_a < _b) || +(_a > _b);
-  if (tmp === 0) {
-    return a.endsWith('^{}') ? 1 : -1
-  }
-  return tmp
 }
 
 // This is a convenience wrapper for reading and writing files in the 'refs' directory.
@@ -2271,6 +2230,279 @@ class GitRefManager {
   }
 }
 
+async function sleep (ms) {
+  return new Promise((resolve, reject) => setTimeout(resolve, ms))
+}
+
+const delayedReleases = new Map();
+const fsmap = new WeakMap();
+/**
+ * This is just a collection of helper functions really. At least that's how it started.
+ */
+class FileSystem {
+  constructor (fs) {
+    // This is not actually the most logical place to put this, but in practice
+    // putting the check here should work great.
+    if (fs === undefined) {
+      throw new GitError(E.PluginUndefined, { plugin: 'fs' })
+    }
+    // This is sad... but preserving reference equality is now necessary
+    // to deal with cache invalidation in GitIndexManager.
+    if (fsmap.has(fs)) {
+      return fsmap.get(fs)
+    }
+    if (fsmap.has(fs._original_unwrapped_fs)) {
+      return fsmap.get(fs._original_unwrapped_fs)
+    }
+
+    if (typeof fs._original_unwrapped_fs !== 'undefined') return fs
+
+    if (
+      Object.getOwnPropertyDescriptor(fs, 'promises') &&
+      Object.getOwnPropertyDescriptor(fs, 'promises').enumerable
+    ) {
+      this._readFile = fs.promises.readFile.bind(fs.promises);
+      this._writeFile = fs.promises.writeFile.bind(fs.promises);
+      this._mkdir = fs.promises.mkdir.bind(fs.promises);
+      this._rmdir = fs.promises.rmdir.bind(fs.promises);
+      this._unlink = fs.promises.unlink.bind(fs.promises);
+      this._stat = fs.promises.stat.bind(fs.promises);
+      this._lstat = fs.promises.lstat.bind(fs.promises);
+      this._readdir = fs.promises.readdir.bind(fs.promises);
+      this._readlink = fs.promises.readlink.bind(fs.promises);
+      this._symlink = fs.promises.symlink.bind(fs.promises);
+    } else {
+      this._readFile = pify(fs.readFile.bind(fs));
+      this._writeFile = pify(fs.writeFile.bind(fs));
+      this._mkdir = pify(fs.mkdir.bind(fs));
+      this._rmdir = pify(fs.rmdir.bind(fs));
+      this._unlink = pify(fs.unlink.bind(fs));
+      this._stat = pify(fs.stat.bind(fs));
+      this._lstat = pify(fs.lstat.bind(fs));
+      this._readdir = pify(fs.readdir.bind(fs));
+      this._readlink = pify(fs.readlink.bind(fs));
+      this._symlink = pify(fs.symlink.bind(fs));
+    }
+    this._original_unwrapped_fs = fs;
+    fsmap.set(fs, this);
+  }
+
+  /**
+   * Return true if a file exists, false if it doesn't exist.
+   * Rethrows errors that aren't related to file existance.
+   */
+  async exists (filepath, options = {}) {
+    try {
+      await this._stat(filepath);
+      return true
+    } catch (err) {
+      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
+        return false
+      } else {
+        console.log('Unhandled error in "FileSystem.exists()" function', err);
+        throw err
+      }
+    }
+  }
+
+  /**
+   * Return the contents of a file if it exists, otherwise returns null.
+   *
+   * @param {string} filepath
+   * @param {object} [options]
+   *
+   * @returns {Buffer|null}
+   */
+  async read (filepath, options = {}) {
+    try {
+      let buffer = await this._readFile(filepath, options);
+      // Convert plain ArrayBuffers to Buffers
+      if (typeof buffer !== 'string') {
+        buffer = Buffer.from(buffer);
+      }
+      return buffer
+    } catch (err) {
+      return null
+    }
+  }
+
+  /**
+   * Write a file (creating missing directories if need be) without throwing errors.
+   *
+   * @param {string} filepath
+   * @param {Buffer|Uint8Array|string} contents
+   * @param {object|string} [options]
+   */
+  async write (filepath, contents, options = {}) {
+    try {
+      await this._writeFile(filepath, contents, options);
+      return
+    } catch (err) {
+      // Hmm. Let's try mkdirp and try again.
+      await this.mkdir(dirname(filepath));
+      await this._writeFile(filepath, contents, options);
+    }
+  }
+
+  /**
+   * Make a directory (or series of nested directories) without throwing an error if it already exists.
+   */
+  async mkdir (filepath, _selfCall = false) {
+    try {
+      await this._mkdir(filepath);
+      return
+    } catch (err) {
+      // If err is null then operation succeeded!
+      if (err === null) return
+      // If the directory already exists, that's OK!
+      if (err.code === 'EEXIST') return
+      // Avoid infinite loops of failure
+      if (_selfCall) throw err
+      // If we got a "no such file or directory error" backup and try again.
+      if (err.code === 'ENOENT') {
+        const parent = dirname(filepath);
+        // Check to see if we've gone too far
+        if (parent === '.' || parent === '/' || parent === filepath) throw err
+        // Infinite recursion, what could go wrong?
+        await this.mkdir(parent);
+        await this.mkdir(filepath, true);
+      }
+    }
+  }
+
+  /**
+   * Delete a file without throwing an error if it is already deleted.
+   */
+  async rm (filepath) {
+    try {
+      await this._unlink(filepath);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err
+    }
+  }
+
+  /**
+   * Delete a directory without throwing an error if it is already deleted.
+   */
+  async rmdir (filepath) {
+    try {
+      await this._rmdir(filepath);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err
+    }
+  }
+
+  /**
+   * Read a directory without throwing an error is the directory doesn't exist
+   */
+  async readdir (filepath) {
+    try {
+      const names = await this._readdir(filepath);
+      // Ordering is not guaranteed, and system specific (Windows vs Unix)
+      // so we must sort them ourselves.
+      names.sort(compareStrings);
+      return names
+    } catch (err) {
+      if (err.code === 'ENOTDIR') return null
+      return []
+    }
+  }
+
+  /**
+   * Return a flast list of all the files nested inside a directory
+   *
+   * Based on an elegant concurrent recursive solution from SO
+   * https://stackoverflow.com/a/45130990/2168416
+   */
+  async readdirDeep (dir) {
+    const subdirs = await this._readdir(dir);
+    const files = await Promise.all(
+      subdirs.map(async subdir => {
+        const res = dir + '/' + subdir;
+        return (await this._stat(res)).isDirectory()
+          ? this.readdirDeep(res)
+          : res
+      })
+    );
+    return files.reduce((a, f) => a.concat(f), [])
+  }
+
+  /**
+   * Return the Stats of a file/symlink if it exists, otherwise returns null.
+   * Rethrows errors that aren't related to file existance.
+   */
+  async lstat (filename) {
+    try {
+      const stats = await this._lstat(filename);
+      return stats
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        return null
+      }
+      throw err
+    }
+  }
+
+  /**
+   * Reads the contents of a symlink if it exists, otherwise returns null.
+   * Rethrows errors that aren't related to file existance.
+   */
+  async readlink (filename, opts = { encoding: 'buffer' }) {
+    // Note: FileSystem.readlink returns a buffer by default
+    // so we can dump it into GitObject.write just like any other file.
+    try {
+      return this._readlink(filename, opts)
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        return null
+      }
+      throw err
+    }
+  }
+
+  /**
+   * Write the contents of buffer to a symlink.
+   */
+  async writelink (filename, buffer) {
+    return this._symlink(buffer.toString('utf8'), filename)
+  }
+
+  async lock (filename, triesLeft = 3) {
+    // check to see if we still have it
+    if (delayedReleases.has(filename)) {
+      clearTimeout(delayedReleases.get(filename));
+      delayedReleases.delete(filename);
+      return
+    }
+    if (triesLeft === 0) {
+      throw new GitError(E.AcquireLockFileFail, { filename })
+    }
+    try {
+      await this._mkdir(`${filename}.lock`);
+    } catch (err) {
+      if (err.code === 'EEXIST') {
+        await sleep(100);
+        await this.lock(filename, triesLeft - 1);
+      }
+    }
+  }
+
+  async unlock (filename, delayRelease = 50) {
+    if (delayedReleases.has(filename)) {
+      throw new GitError(E.DoubleReleaseLockFileFail, { filename })
+    }
+    // Basically, we lie and say it was deleted ASAP.
+    // But really we wait a bit to see if you want to acquire it again.
+    delayedReleases.set(
+      filename,
+      setTimeout(async () => {
+        delayedReleases.delete(filename);
+        await this._rmdir(`${filename}.lock`);
+      }, delayRelease)
+    );
+  }
+}
+
 function formatAuthor ({ name, email, timestamp, timezoneOffset }) {
   timezoneOffset = formatTimezoneOffset(timezoneOffset);
   return `${name} <${email}> ${timestamp} ${timezoneOffset}`
@@ -2300,6 +2532,16 @@ function negateExceptForZero (n) {
   return n === 0 ? n : -n
 }
 
+function indent (str) {
+  return (
+    str
+      .trim()
+      .split('\n')
+      .map(x => ' ' + x)
+      .join('\n') + '\n'
+  )
+}
+
 function normalizeNewlines (str) {
   // remove all <CR>
   str = str.replace(/\r/g, '');
@@ -2308,6 +2550,13 @@ function normalizeNewlines (str) {
   // and a single newline at the end
   str = str.replace(/\n+$/, '') + '\n';
   return str
+}
+
+function outdent (str) {
+  return str
+    .split('\n')
+    .map(x => x.replace(/^ /, ''))
+    .join('\n')
 }
 
 function parseAuthor (author) {
@@ -2336,57 +2585,62 @@ function negateExceptForZero$1 (n) {
   return n === 0 ? n : -n
 }
 
-class GitAnnotatedTag {
-  constructor (tag) {
-    if (typeof tag === 'string') {
-      this._tag = tag;
-    } else if (Buffer.isBuffer(tag)) {
-      this._tag = tag.toString('utf8');
-    } else if (typeof tag === 'object') {
-      this._tag = GitAnnotatedTag.render(tag);
+class GitCommit {
+  constructor (commit) {
+    if (typeof commit === 'string') {
+      this._commit = commit;
+    } else if (Buffer.isBuffer(commit)) {
+      this._commit = commit.toString('utf8');
+    } else if (typeof commit === 'object') {
+      this._commit = GitCommit.render(commit);
     } else {
       throw new GitError(E.InternalFail, {
-        message: 'invalid type passed to GitAnnotatedTag constructor'
+        message: 'invalid type passed to GitCommit constructor'
       })
     }
   }
 
-  static from (tag) {
-    return new GitAnnotatedTag(tag)
+  static fromPayloadSignature ({ payload, signature }) {
+    const headers = GitCommit.justHeaders(payload);
+    const message = GitCommit.justMessage(payload);
+    const commit = normalizeNewlines(
+      headers + '\ngpgsig' + indent(signature) + '\n' + message
+    );
+    return new GitCommit(commit)
   }
 
-  static render (obj) {
-    return `object ${obj.object}
-type ${obj.type}
-tag ${obj.tag}
-tagger ${formatAuthor(obj.tagger)}
-
-${obj.message}
-${obj.signature ? obj.signature : ''}`
+  static from (commit) {
+    return new GitCommit(commit)
   }
 
-  justHeaders () {
-    return this._tag.slice(0, this._tag.indexOf('\n\n'))
+  toObject () {
+    return Buffer.from(this._commit, 'utf8')
   }
 
+  // Todo: allow setting the headers and message
+  headers () {
+    return this.parseHeaders()
+  }
+
+  // Todo: allow setting the headers and message
   message () {
-    const tag = this.withoutSignature();
-    return tag.slice(tag.indexOf('\n\n') + 2)
+    return GitCommit.justMessage(this._commit)
   }
 
   parse () {
-    return Object.assign(this.headers(), {
-      message: this.message(),
-      signature: this.signature()
-    })
+    return Object.assign({ message: this.message() }, this.headers())
   }
 
-  render () {
-    return this._tag
+  static justMessage (commit) {
+    return normalizeNewlines(commit.slice(commit.indexOf('\n\n') + 2))
   }
 
-  headers () {
-    const headers = this.justHeaders().split('\n');
+  static justHeaders (commit) {
+    return commit.slice(0, commit.indexOf('\n\n'))
+  }
+
+  parseHeaders () {
+    const headers = GitCommit.justHeaders(this._commit).split('\n');
     const hs = [];
     for (const h of headers) {
       if (h[0] === ' ') {
@@ -2396,7 +2650,9 @@ ${obj.signature ? obj.signature : ''}`
         hs.push(h);
       }
     }
-    const obj = {};
+    const obj = {
+      parent: []
+    };
     for (const h of hs) {
       const key = h.slice(0, h.indexOf(' '));
       const value = h.slice(h.indexOf(' ') + 1);
@@ -2406,8 +2662,8 @@ ${obj.signature ? obj.signature : ''}`
         obj[key] = value;
       }
     }
-    if (obj.tagger) {
-      obj.tagger = parseAuthor(obj.tagger);
+    if (obj.author) {
+      obj.author = parseAuthor(obj.author);
     }
     if (obj.committer) {
       obj.committer = parseAuthor(obj.committer);
@@ -2415,39 +2671,365 @@ ${obj.signature ? obj.signature : ''}`
     return obj
   }
 
-  withoutSignature () {
-    const tag = normalizeNewlines(this._tag);
-    if (tag.indexOf('\n-----BEGIN PGP SIGNATURE-----') === -1) return tag
-    return tag.slice(0, tag.lastIndexOf('\n-----BEGIN PGP SIGNATURE-----'))
+  static renderHeaders (obj) {
+    let headers = '';
+    if (obj.tree) {
+      headers += `tree ${obj.tree}\n`;
+    } else {
+      headers += `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n`; // the null tree
+    }
+    if (obj.parent) {
+      if (obj.parent.length === undefined) {
+        throw new GitError(E.InternalFail, {
+          message: `commit 'parent' property should be an array`
+        })
+      }
+      for (const p of obj.parent) {
+        headers += `parent ${p}\n`;
+      }
+    }
+    const author = obj.author;
+    headers += `author ${formatAuthor(author)}\n`;
+    const committer = obj.committer || obj.author;
+    headers += `committer ${formatAuthor(committer)}\n`;
+    if (obj.gpgsig) {
+      headers += 'gpgsig' + indent(obj.gpgsig);
+    }
+    return headers
   }
 
-  signature () {
-    const signature = this._tag.slice(
-      this._tag.indexOf('-----BEGIN PGP SIGNATURE-----'),
-      this._tag.indexOf('-----END PGP SIGNATURE-----') +
+  static render (obj) {
+    return GitCommit.renderHeaders(obj) + '\n' + normalizeNewlines(obj.message)
+  }
+
+  render () {
+    return this._commit
+  }
+
+  withoutSignature () {
+    const commit = normalizeNewlines(this._commit);
+    if (commit.indexOf('\ngpgsig') === -1) return commit
+    const headers = commit.slice(0, commit.indexOf('\ngpgsig'));
+    const message = commit.slice(
+      commit.indexOf('-----END PGP SIGNATURE-----\n') +
+        '-----END PGP SIGNATURE-----\n'.length
+    );
+    return normalizeNewlines(headers + '\n' + message)
+  }
+
+  isolateSignature () {
+    const signature = this._commit.slice(
+      this._commit.indexOf('-----BEGIN PGP SIGNATURE-----'),
+      this._commit.indexOf('-----END PGP SIGNATURE-----') +
         '-----END PGP SIGNATURE-----'.length
     );
-    return normalizeNewlines(signature)
+    return outdent(signature)
   }
 
-  toObject () {
-    return Buffer.from(this._tag, 'utf8')
-  }
-
-  static async sign (tag, pgp, secretKey) {
-    const payload = tag.withoutSignature() + '\n';
+  static async sign (commit, pgp, secretKey) {
+    const payload = commit.withoutSignature();
+    const message = GitCommit.justMessage(commit._commit);
     let { signature } = await pgp.sign({ payload, secretKey });
     // renormalize the line endings to the one true line-ending
     signature = normalizeNewlines(signature);
-    const signedTag = payload + signature;
-    // return a new tag object
-    return GitAnnotatedTag.from(signedTag)
+    const headers = GitCommit.justHeaders(commit._commit);
+    const signedCommit =
+      headers + '\n' + 'gpgsig' + indent(signature) + '\n' + message;
+    // return a new commit object
+    return GitCommit.from(signedCommit)
   }
 
-  static async verify (tag, pgp, publicKey) {
-    const payload = tag.withoutSignature() + '\n';
-    const signature = tag.signature();
+  static async verify (commit, pgp, publicKey) {
+    const payload = commit.withoutSignature();
+    const signature = commit.isolateSignature();
     return pgp.verify({ payload, publicKey, signature })
+  }
+}
+
+// @ts-check
+
+/**
+ * Read and/or write to the git config files.
+ *
+ * *Caveats:*
+ * - Currently only the local `$GIT_DIR/config` file can be read or written. However support for the global `~/.gitconfig` and system `$(prefix)/etc/gitconfig` will be added in the future.
+ * - The current parser does not support the more exotic features of the git-config file format such as `[include]` and `[includeIf]`.
+ *
+ * @param {Object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} args.path - The key of the git config entry
+ * @param {string} [args.value] - (Optional) A value to store at that path
+ * @param {boolean} [args.all = false] - If the config file contains multiple values, return them all as an array.
+ * @param {boolean} [args.append = false] - If true, will append rather than replace when setting (use with multi-valued config options).
+ *
+ * @returns {Promise<any>} Resolves with the config value
+ *
+ * @example
+ * // Write config value
+ * await git.config({
+ *   dir: '$input((/))',
+ *   path: '$input((user.name))',
+ *   value: '$input((Mr. Test))'
+ * })
+ *
+ * // Read config value
+ * let value = await git.config({
+ *   dir: '$input((/))',
+ *   path: '$input((user.name))'
+ * })
+ * console.log(value)
+ *
+ */
+async function config (args) {
+  // These arguments are not in the function signature but destructured separately
+  // as a result of a bit of a design flaw that requires the un-destructured argument object
+  // in order to call args.hasOwnProperty('value') later on.
+  const {
+    core = 'default',
+    dir,
+    gitdir = join(dir, '.git'),
+    fs = cores.get(core).get('fs'),
+    all = false,
+    append = false,
+    path,
+    value
+  } = args;
+  try {
+    const config = await GitConfigManager.get({ fs, gitdir });
+    // This carefully distinguishes between
+    // 1) there is no 'value' argument (do a "get")
+    // 2) there is a 'value' argument with a value of undefined (do a "set")
+    // Because setting a key to undefined is how we delete entries from the ini.
+    if (
+      value === undefined &&
+      !Object.prototype.hasOwnProperty.call(args, 'value')
+    ) {
+      if (all) {
+        return config.getall(path)
+      } else {
+        return config.get(path)
+      }
+    } else {
+      if (append) {
+        await config.append(path, value);
+      } else {
+        await config.set(path, value);
+      }
+      await GitConfigManager.save({ fs, gitdir, config });
+    }
+  } catch (err) {
+    err.caller = 'git.config';
+    throw err
+  }
+}
+
+async function normalizeAuthorObject ({ fs, gitdir, author = {} }) {
+  let { name, email, date, timestamp, timezoneOffset } = author;
+  name = name || (await config({ fs, gitdir, path: 'user.name' }));
+  email = email || (await config({ fs, gitdir, path: 'user.email' }));
+
+  if (name === undefined || email === undefined) {
+    return undefined
+  }
+
+  date = date || new Date();
+  timestamp = timestamp != null ? timestamp : Math.floor(date.valueOf() / 1000);
+  timezoneOffset =
+    timezoneOffset != null ? timezoneOffset : date.getTimezoneOffset();
+
+  return { name, email, date, timestamp, timezoneOffset }
+}
+
+// @ts-check
+
+/**
+ * Create a new commit
+ *
+ * @param {Object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} args.message - The commit message to use.
+ * @param {Object} [args.author] - The details about the author.
+ * @param {string} [args.author.name] - Default is `user.name` config.
+ * @param {string} [args.author.email] - Default is `user.email` config.
+ * @param {string} [args.author.date] - Set the author timestamp field. Default is the current date.
+ * @param {string} [args.author.timestamp] - Set the author timestamp field. This is an alternative to using `date` using an integer number of seconds since the Unix epoch instead of a JavaScript date object.
+ * @param {string} [args.author.timezoneOffset] - Set the author timezone offset field. This is the difference, in minutes, from the current timezone to UTC. Default is `(new Date()).getTimezoneOffset()`.
+ * @param {Object} [args.committer = author] - The details about the commit committer, in the same format as the author parameter. If not specified, the author details are used.
+ * @param {string} [args.signingKey] - Sign the tag object using this private PGP key.
+ * @param {boolean} [args.dryRun = false] - If true, simulates making a commit so you can test whether it would succeed. Implies `noUpdateBranch`.
+ * @param {boolean} [args.noUpdateBranch = false] - If true, does not update the branch pointer after creating the commit.
+ * @param {string} [args.ref] - The fully expanded name of the branch to commit to. Default is the current branch pointed to by HEAD. (TODO: fix it so it can expand branch names without throwing if the branch doesn't exist yet.)
+ * @param {string[]} [args.parent] - The SHA-1 object ids of the commits to use as parents. If not specified, the commit pointed to by `ref` is used.
+ * @param {string} [args.tree] - The SHA-1 object id of the tree to use. If not specified, a new tree object is created from the current git index.
+ * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
+ * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
+ *
+ * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly created commit.
+ *
+ * @example
+ * let sha = await git.commit({
+ *   dir: '$input((/))',
+ *   author: {
+ *     name: '$input((Mr. Test))',
+ *     email: '$input((mrtest@example.com))'
+ *   },
+ *   message: '$input((Added the a.txt file))'
+ * })
+ * console.log(sha)
+ *
+ */
+async function commit ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs = cores.get(core).get('fs'),
+  message,
+  author,
+  committer,
+  signingKey,
+  dryRun = false,
+  noUpdateBranch = false,
+  emitter = cores.get(core).get('emitter'),
+  emitterPrefix = '',
+  ref,
+  parent,
+  tree
+}) {
+  try {
+    if (emitter) {
+      await emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Creating commit',
+        loaded: 0,
+        lengthComputable: false
+      });
+    }
+    if (!ref) {
+      ref = await GitRefManager.resolve({
+        fs,
+        gitdir,
+        ref: 'HEAD',
+        depth: 2
+      });
+    }
+
+    if (message === undefined) {
+      throw new GitError(E.MissingRequiredParameterError, {
+        function: 'commit',
+        parameter: 'message'
+      })
+    }
+
+    // Fill in missing arguments with default values
+    author = await normalizeAuthorObject({ fs, gitdir, author });
+    if (author === undefined) {
+      throw new GitError(E.MissingAuthorError)
+    }
+
+    committer = Object.assign({}, committer || author);
+    // Match committer's date to author's one, if omitted
+    committer.date = committer.date || author.date;
+    committer = await normalizeAuthorObject({ fs, gitdir, author: committer });
+    if (committer === undefined) {
+      throw new GitError(E.MissingCommitterError)
+    }
+
+    if (emitter) {
+      await emitter.emit(`${emitterPrefix}progress`, {
+        phase: 'Creating commit tree',
+        loaded: 0,
+        lengthComputable: false
+      });
+    }
+
+    return GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+      if (!parent) {
+        try {
+          parent = [
+            await GitRefManager.resolve({
+              fs,
+              gitdir,
+              ref
+            })
+          ];
+        } catch (err) {
+          // Probably an initial commit
+          parent = [];
+        }
+      }
+
+      let mergeHash;
+      try {
+        mergeHash = await GitRefManager.resolve({ fs, gitdir, ref: 'MERGE_HEAD' });
+      } catch (err) {
+        // No merge hash
+      }
+
+      if (mergeHash) {
+        const conflictedPaths = index.conflictedPaths;
+        if (conflictedPaths.length > 0) {
+          throw new GitError(E.CommitUnmergedConflictsFail, { paths: conflictedPaths })
+        }
+        if (parent.length) {
+          if (!parent.includes(mergeHash)) parent.push(mergeHash);
+        } else {
+          throw new GitError(E.NoHeadCommitError, { noun: 'merge commit', ref: mergeHash })
+        }
+      }
+
+      if (!tree) {
+        tree = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index });
+      }
+
+      if (emitter) {
+        await emitter.emit(`${emitterPrefix}progress`, {
+          phase: 'Writing commit',
+          loaded: 0,
+          lengthComputable: false
+        });
+      }
+
+      let comm = GitCommit.from({
+        tree,
+        parent,
+        author,
+        committer,
+        message
+      });
+      if (signingKey) {
+        const pgp = cores.get(core).get('pgp');
+        comm = await GitCommit.sign(comm, pgp, signingKey);
+      }
+      const oid = await writeObject({
+        fs,
+        gitdir,
+        type: 'commit',
+        object: comm.toObject(),
+        dryRun
+      });
+      if (!noUpdateBranch && !dryRun) {
+        // Update branch pointer
+        await GitRefManager.writeRef({
+          fs,
+          gitdir,
+          ref,
+          value: oid
+        });
+        if (mergeHash) {
+          await GitRefManager.deleteRef({ fs, gitdir, ref: 'MERGE_HEAD' });
+          await fs.rm(join(gitdir, 'MERGE_MSG'));
+        }
+      }
+      return oid
+    })
+  } catch (err) {
+    err.caller = 'git.commit';
+    throw err
   }
 }
 
@@ -2737,6 +3319,35 @@ async function parseHeader (reader) {
     reference = buf;
   }
   return { type, length, ofs, reference }
+}
+
+/* eslint-env node, browser */
+
+let supportsDecompressionStream = false;
+
+async function inflate (buffer) {
+  if (supportsDecompressionStream === null) {
+    supportsDecompressionStream = testDecompressionStream();
+  }
+  return supportsDecompressionStream
+    ? browserInflate(buffer)
+    : pako.inflate(buffer)
+}
+
+async function browserInflate (buffer) {
+  const ds = new DecompressionStream('deflate');
+  const d = new Blob([buffer]).stream().pipeThrough(ds);
+  return new Uint8Array(await new Response(d).arrayBuffer())
+}
+
+function testDecompressionStream () {
+  try {
+    const ds = new DecompressionStream('deflate');
+    if (ds) return true
+  } catch (_) {
+    // no bother
+  }
+  return false
 }
 
 function decodeVarInt (reader) {
@@ -3162,7 +3773,7 @@ class GitPackIndex {
     }
     // Handle undeltified objects
     const buffer = raw.slice(reader.tell());
-    object = Buffer.from(pako.inflate(buffer));
+    object = Buffer.from(await inflate(buffer));
     // Assert that the object length is as expected.
     if (object.byteLength !== length) {
       throw new GitError(E.InternalFail, {
@@ -3286,7 +3897,7 @@ async function readObject ({ fs, gitdir, oid, format = 'content' }) {
   /* eslint-disable no-fallthrough */
   switch (result.format) {
     case 'deflated':
-      result.object = Buffer.from(pako.inflate(result.object));
+      result.object = Buffer.from(await inflate(result.object));
       result.format = 'wrapped';
     case 'wrapped':
       if (format === 'wrapped' && result.format === 'wrapped') {
@@ -3313,101 +3924,575 @@ async function readObject ({ fs, gitdir, oid, format = 'content' }) {
   /* eslint-enable no-fallthrough */
 }
 
+class GitAnnotatedTag {
+  constructor (tag) {
+    if (typeof tag === 'string') {
+      this._tag = tag;
+    } else if (Buffer.isBuffer(tag)) {
+      this._tag = tag.toString('utf8');
+    } else if (typeof tag === 'object') {
+      this._tag = GitAnnotatedTag.render(tag);
+    } else {
+      throw new GitError(E.InternalFail, {
+        message: 'invalid type passed to GitAnnotatedTag constructor'
+      })
+    }
+  }
+
+  static from (tag) {
+    return new GitAnnotatedTag(tag)
+  }
+
+  static render (obj) {
+    return `object ${obj.object}
+type ${obj.type}
+tag ${obj.tag}
+tagger ${formatAuthor(obj.tagger)}
+
+${obj.message}
+${obj.signature ? obj.signature : ''}`
+  }
+
+  justHeaders () {
+    return this._tag.slice(0, this._tag.indexOf('\n\n'))
+  }
+
+  message () {
+    const tag = this.withoutSignature();
+    return tag.slice(tag.indexOf('\n\n') + 2)
+  }
+
+  parse () {
+    return Object.assign(this.headers(), {
+      message: this.message(),
+      signature: this.signature()
+    })
+  }
+
+  render () {
+    return this._tag
+  }
+
+  headers () {
+    const headers = this.justHeaders().split('\n');
+    const hs = [];
+    for (const h of headers) {
+      if (h[0] === ' ') {
+        // combine with previous header (without space indent)
+        hs[hs.length - 1] += '\n' + h.slice(1);
+      } else {
+        hs.push(h);
+      }
+    }
+    const obj = {};
+    for (const h of hs) {
+      const key = h.slice(0, h.indexOf(' '));
+      const value = h.slice(h.indexOf(' ') + 1);
+      if (Array.isArray(obj[key])) {
+        obj[key].push(value);
+      } else {
+        obj[key] = value;
+      }
+    }
+    if (obj.tagger) {
+      obj.tagger = parseAuthor(obj.tagger);
+    }
+    if (obj.committer) {
+      obj.committer = parseAuthor(obj.committer);
+    }
+    return obj
+  }
+
+  withoutSignature () {
+    const tag = normalizeNewlines(this._tag);
+    if (tag.indexOf('\n-----BEGIN PGP SIGNATURE-----') === -1) return tag
+    return tag.slice(0, tag.lastIndexOf('\n-----BEGIN PGP SIGNATURE-----'))
+  }
+
+  signature () {
+    if (this._tag.indexOf('\n-----BEGIN PGP SIGNATURE-----') === -1) return
+    const signature = this._tag.slice(
+      this._tag.indexOf('-----BEGIN PGP SIGNATURE-----'),
+      this._tag.indexOf('-----END PGP SIGNATURE-----') +
+        '-----END PGP SIGNATURE-----'.length
+    );
+    return normalizeNewlines(signature)
+  }
+
+  payload () {
+    return this.withoutSignature() + '\n'
+  }
+
+  toObject () {
+    return Buffer.from(this._tag, 'utf8')
+  }
+
+  static async sign (tag, pgp, secretKey) {
+    const payload = tag.payload();
+    let { signature } = await pgp.sign({ payload, secretKey });
+    // renormalize the line endings to the one true line-ending
+    signature = normalizeNewlines(signature);
+    const signedTag = payload + signature;
+    // return a new tag object
+    return GitAnnotatedTag.from(signedTag)
+  }
+
+  static async verify (tag, pgp, publicKey) {
+    const payload = tag.payload();
+    const signature = tag.signature();
+    return pgp.verify({ payload, publicKey, signature })
+  }
+}
+
+async function resolveTree ({ fs, gitdir, oid }) {
+  // Empty tree - bypass `readObject`
+  if (oid === '4b825dc642cb6eb9a060e54bf8d69288fbee4904') {
+    return { tree: GitTree.from([]), oid }
+  }
+  const { type, object } = await readObject({ fs, gitdir, oid });
+  // Resolve annotated tag objects to whatever
+  if (type === 'tag') {
+    oid = GitAnnotatedTag.from(object).parse().object;
+    return resolveTree({ fs, gitdir, oid })
+  }
+  // Resolve commits to trees
+  if (type === 'commit') {
+    oid = GitCommit.from(object).parse().tree;
+    return resolveTree({ fs, gitdir, oid })
+  }
+  if (type !== 'tree') {
+    throw new GitError(E.ResolveTreeError, { oid })
+  }
+  return { tree: GitTree.from(object), oid }
+}
+
+// @ts-check
+
+async function resolveFilepath ({ fs, gitdir, oid, filepath }) {
+  // Ensure there are no leading or trailing directory separators.
+  // I was going to do this automatically, but then found that the Git Terminal for Windows
+  // auto-expands --filepath=/src/utils to --filepath=C:/Users/Will/AppData/Local/Programs/Git/src/utils
+  // so I figured it would be wise to promote the behavior in the application layer not just the library layer.
+  if (filepath.startsWith('/') || filepath.endsWith('/')) {
+    throw new GitError(E.DirectorySeparatorsError)
+  }
+  const _oid = oid;
+  const result = await resolveTree({ fs, gitdir, oid });
+  const tree = result.tree;
+  if (filepath === '') {
+    oid = result.oid;
+  } else {
+    const pathArray = filepath.split('/');
+    oid = await _resolveFilepath({
+      fs,
+      gitdir,
+      tree,
+      pathArray,
+      oid: _oid,
+      filepath
+    });
+  }
+  return oid
+}
+
+async function _resolveFilepath ({
+  fs,
+  gitdir,
+  tree,
+  pathArray,
+  oid,
+  filepath
+}) {
+  const name = pathArray.shift();
+  for (const entry of tree) {
+    if (entry.path === name) {
+      if (pathArray.length === 0) {
+        return entry.oid
+      } else {
+        const { type, object } = await readObject({
+          fs,
+          gitdir,
+          oid: entry.oid
+        });
+        if (type === 'blob') {
+          throw new GitError(E.DirectoryIsAFileError, { oid, filepath })
+        }
+        if (type !== 'tree') {
+          throw new GitError(E.ObjectTypeAssertionInTreeFail, {
+            oid: entry.oid,
+            entrypath: filepath,
+            type
+          })
+        }
+        tree = GitTree.from(object);
+        return _resolveFilepath({ fs, gitdir, tree, pathArray, oid, filepath })
+      }
+    }
+  }
+  throw new GitError(E.TreeOrBlobNotFoundError, { oid, filepath })
+}
+
 // @ts-check
 
 /**
- * Read and/or write to the git config files.
  *
- * *Caveats:*
- * - Currently only the local `$GIT_DIR/config` file can be read or written. However support for the global `~/.gitconfig` and system `$(prefix)/etc/gitconfig` will be added in the future.
- * - The current parser does not support the more exotic features of the git-config file format such as `[include]` and `[includeIf]`.
+ * @typedef {Object} ReadTreeResult - The object returned has the following schema:
+ * @property {string} oid - SHA-1 object id of this tree
+ * @property {TreeObject} tree - the parsed tree object
+ */
+
+/**
  *
- * @param {Object} args
+ * @typedef {TreeEntry[]} TreeObject
+ */
+
+/**
+ *
+ * @typedef {Object} TreeEntry
+ * @property {string} mode - the 6 digit hexadecimal mode
+ * @property {string} path - the name of the file or directory
+ * @property {string} oid - the SHA-1 object id of the blob or tree
+ * @property {'commit'|'blob'|'tree'} type - the type of object
+ */
+
+/**
+ * Read a tree object directly
+ *
+ * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
  * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
- * @param {string} args.path - The key of the git config entry
- * @param {string} [args.value] - (Optional) A value to store at that path
- * @param {boolean} [args.all = false] - If the config file contains multiple values, return them all as an array.
- * @param {boolean} [args.append = false] - If true, will append rather than replace when setting (use with multi-valued config options).
+ * @param {string} args.oid - The SHA-1 object id to get. Annotated tags and commits are peeled.
+ * @param {string} [args.filepath] - Don't return the object with `oid` itself, but resolve `oid` to a tree and then return the tree object at that filepath.
  *
- * @returns {Promise<any>} Resolves with the config value
- *
- * @example
- * // Write config value
- * await git.config({
- *   dir: '$input((/))',
- *   path: '$input((user.name))',
- *   value: '$input((Mr. Test))'
- * })
- *
- * // Read config value
- * let value = await git.config({
- *   dir: '$input((/))',
- *   path: '$input((user.name))'
- * })
- * console.log(value)
+ * @returns {Promise<ReadTreeResult>} Resolves successfully with a git tree object
+ * @see ReadTreeResult
+ * @see TreeObject
+ * @see TreeEntry
  *
  */
-async function config (args) {
-  // These arguments are not in the function signature but destructured separately
-  // as a result of a bit of a design flaw that requires the un-destructured argument object
-  // in order to call args.hasOwnProperty('value') later on.
-  const {
-    core = 'default',
-    dir,
-    gitdir = join(dir, '.git'),
-    fs = cores.get(core).get('fs'),
-    all = false,
-    append = false,
-    path,
-    value
-  } = args;
+async function readTree ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  oid,
+  filepath = undefined
+}) {
   try {
-    const config = await GitConfigManager.get({ fs, gitdir });
-    // This carefully distinguishes between
-    // 1) there is no 'value' argument (do a "get")
-    // 2) there is a 'value' argument with a value of undefined (do a "set")
-    // Because setting a key to undefined is how we delete entries from the ini.
-    if (
-      value === undefined &&
-      !Object.prototype.hasOwnProperty.call(args, 'value')
-    ) {
-      if (all) {
-        return config.getall(path)
-      } else {
-        return config.get(path)
-      }
-    } else {
-      if (append) {
-        await config.append(path, value);
-      } else {
-        await config.set(path, value);
-      }
-      await GitConfigManager.save({ fs, gitdir, config });
+    const fs = new FileSystem(_fs);
+    if (filepath !== undefined) {
+      oid = await resolveFilepath({ fs, gitdir, oid, filepath });
     }
+    const { tree, oid: treeOid } = await resolveTree({ fs, gitdir, oid });
+    const result = {
+      oid: treeOid,
+      tree: tree.entries()
+    };
+    return result
   } catch (err) {
-    err.caller = 'git.config';
+    err.caller = 'git.readTree';
     throw err
   }
 }
 
-async function normalizeAuthorObject ({ fs, gitdir, author = {} }) {
-  let { name, email, date, timestamp, timezoneOffset } = author;
-  name = name || (await config({ fs, gitdir, path: 'user.name' }));
-  email = email || (await config({ fs, gitdir, path: 'user.email' }));
+// @ts-check
 
-  if (name === undefined || email === undefined) {
-    return undefined
+/**
+ * Write a blob object directly
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {Uint8Array} args.blob - The blob object to write
+ *
+ * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly written object
+ *
+ * @example
+ * // Manually create a blob.
+ * let oid = await git.writeBlob({
+ *   dir: '$input((/))',
+ *   blob: $input((new Uint8Array([])))
+ * })
+ *
+ * console.log('oid', oid) // should be 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391'
+ *
+ */
+async function writeBlob ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  blob
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+    const oid = await writeObject({
+      fs,
+      gitdir,
+      type: 'blob',
+      object: blob,
+      format: 'content'
+    });
+    return oid
+  } catch (err) {
+    err.caller = 'git.writeBlob';
+    throw err
   }
+}
 
-  date = date || new Date();
-  timestamp = timestamp != null ? timestamp : Math.floor(date.valueOf() / 1000);
-  timezoneOffset =
-    timezoneOffset != null ? timezoneOffset : date.getTimezoneOffset();
+// @ts-check
 
-  return { name, email, date, timestamp, timezoneOffset }
+/**
+ *
+ * @typedef {TreeEntry[]} TreeObject
+ */
+
+/**
+ *
+ * @typedef {Object} TreeEntry
+ * @property {string} mode - the 6 digit hexadecimal mode
+ * @property {string} path - the name of the file or directory
+ * @property {string} oid - the SHA-1 object id of the blob or tree
+ * @property {'commit'|'blob'|'tree'} type - the type of object
+ */
+
+/**
+ * Write a tree object directly
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {TreeObject} args.tree - The object to write
+ *
+ * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly written object.
+ * @see TreeObject
+ * @see TreeEntry
+ *
+ */
+async function writeTree ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  tree
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+    // Convert object to buffer
+    const object = GitTree.from(tree).toObject();
+    const oid = await writeObject({
+      fs,
+      gitdir,
+      type: 'tree',
+      object,
+      format: 'content'
+    });
+    return oid
+  } catch (err) {
+    err.caller = 'git.writeTree';
+    throw err
+  }
+}
+
+// @ts-check
+
+/**
+ * Add or update an object note
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} [args.ref] - The notes ref to look under
+ * @param {string} [args.oid] - The SHA-1 object id of the object to add the note to.
+ * @param {string|Uint8Array} [args.note] - The note to add
+ * @param {boolean} [args.force] - Over-write note if it already exists.
+ * @param {Object} [args.author] - The details about the author.
+ * @param {string} [args.author.name] - Default is `user.name` config.
+ * @param {string} [args.author.email] - Default is `user.email` config.
+ * @param {string} [args.author.date] - Set the author timestamp field. Default is the current date.
+ * @param {string} [args.author.timestamp] - Set the author timestamp field. This is an alternative to using `date` using an integer number of seconds since the Unix epoch instead of a JavaScript date object.
+ * @param {string} [args.author.timezoneOffset] - Set the author timezone offset field. This is the difference, in minutes, from the current timezone to UTC. Default is `(new Date()).getTimezoneOffset()`.
+ * @param {Object} [args.committer = author] - The details about the note committer, in the same format as the author parameter. If not specified, the author details are used.
+ * @param {string} [args.signingKey] - Sign the note commit using this private PGP key.
+ *
+ * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the commit object for the added note.
+ */
+
+async function addNote ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  ref = 'refs/notes/commits',
+  oid,
+  note,
+  force,
+  author,
+  committer,
+  signingKey
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+
+    // Get the current note commit
+    let parent;
+    try {
+      parent = await GitRefManager.resolve({ gitdir, fs, ref });
+    } catch (err) {
+      if (err.code !== E.ResolveRefError) {
+        throw err
+      }
+    }
+
+    // I'm using the "empty tree" magic number here for brevity
+    const result = await readTree({
+      core,
+      dir,
+      gitdir,
+      fs,
+      oid: parent || '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+    });
+    let tree = result.tree;
+
+    // Handle the case where a note already exists
+    if (force) {
+      tree = tree.filter(entry => entry.path !== oid);
+    } else {
+      for (const entry of tree) {
+        if (entry.path === oid) {
+          throw new GitError(E.NoteAlreadyExistsError, {
+            note: entry.oid,
+            oid
+          })
+        }
+      }
+    }
+
+    // Create the note blob
+    if (typeof note === 'string') {
+      note = Buffer.from(note, 'utf8');
+    }
+    const noteOid = await writeBlob({
+      core,
+      dir,
+      gitdir,
+      fs,
+      blob: note
+    });
+
+    // Create the new note tree
+    tree.push({ mode: '100644', path: oid, oid: noteOid, type: 'blob' });
+    const treeOid = await writeTree({
+      core,
+      dir,
+      gitdir,
+      fs,
+      tree
+    });
+
+    // Create the new note commit
+    const commitOid = await commit({
+      core,
+      dir,
+      gitdir,
+      fs,
+      ref,
+      tree: treeOid,
+      parent: parent && [parent],
+      message: `Note added by 'isomorphic-git addNote'\n`,
+      author,
+      committer,
+      signingKey
+    });
+
+    return commitOid
+  } catch (err) {
+    err.caller = 'git.addNote';
+    throw err
+  }
+}
+
+// @ts-check
+
+/**
+ * Add or update a remote
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} args.remote - The name of the remote
+ * @param {string} args.url - The URL of the remote
+ * @param {boolean} [args.force = false] - Instead of throwing an error if a remote named `remote` already exists, overwrite the existing remote.
+ *
+ * @returns {Promise<void>} Resolves successfully when filesystem operations are complete
+ *
+ * @example
+ * await git.addRemote({ dir: '$input((/))', remote: '$input((upstream))', url: '$input((https://github.com/isomorphic-git/isomorphic-git))' })
+ * console.log('done')
+ *
+ */
+async function addRemote ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs = cores.get(core).get('fs'),
+  remote,
+  url,
+  force = false
+}) {
+  try {
+    if (remote === undefined) {
+      throw new GitError(E.MissingRequiredParameterError, {
+        function: 'addRemote',
+        parameter: 'remote'
+      })
+    }
+    if (url === undefined) {
+      throw new GitError(E.MissingRequiredParameterError, {
+        function: 'addRemote',
+        parameter: 'url'
+      })
+    }
+    if (remote !== cleanGitRef.clean(remote)) {
+      throw new GitError(E.InvalidRefNameError, {
+        verb: 'add',
+        noun: 'remote',
+        ref: remote,
+        suggestion: cleanGitRef.clean(remote)
+      })
+    }
+    const config = await GitConfigManager.get({ fs, gitdir });
+    if (!force) {
+      // Check that setting it wouldn't overwrite.
+      const remoteNames = await config.getSubsections('remote');
+      if (remoteNames.includes(remote)) {
+        // Throw an error if it would overwrite an existing remote,
+        // but not if it's simply setting the same value again.
+        if (url !== (await config.get(`remote.${remote}.url`))) {
+          throw new GitError(E.AddingRemoteWouldOverwrite, { remote })
+        }
+      }
+    }
+    await config.set(`remote.${remote}.url`, url);
+    await config.set(
+      `remote.${remote}.fetch`,
+      `+refs/heads/*:refs/remotes/${remote}/*`
+    );
+    await GitConfigManager.save({ fs, gitdir, config });
+  } catch (err) {
+    err.caller = 'git.addRemote';
+    throw err
+  }
 }
 
 // @ts-check
@@ -3618,206 +4703,6 @@ const worthWalking = (filepath, root) => {
     return filepath.startsWith(root)
   }
 };
-
-function indent (str) {
-  return (
-    str
-      .trim()
-      .split('\n')
-      .map(x => ' ' + x)
-      .join('\n') + '\n'
-  )
-}
-
-function outdent (str) {
-  return str
-    .split('\n')
-    .map(x => x.replace(/^ /, ''))
-    .join('\n')
-}
-
-class GitCommit {
-  constructor (commit) {
-    if (typeof commit === 'string') {
-      this._commit = commit;
-    } else if (Buffer.isBuffer(commit)) {
-      this._commit = commit.toString('utf8');
-    } else if (typeof commit === 'object') {
-      this._commit = GitCommit.render(commit);
-    } else {
-      throw new GitError(E.InternalFail, {
-        message: 'invalid type passed to GitCommit constructor'
-      })
-    }
-  }
-
-  static fromPayloadSignature ({ payload, signature }) {
-    const headers = GitCommit.justHeaders(payload);
-    const message = GitCommit.justMessage(payload);
-    const commit = normalizeNewlines(
-      headers + '\ngpgsig' + indent(signature) + '\n' + message
-    );
-    return new GitCommit(commit)
-  }
-
-  static from (commit) {
-    return new GitCommit(commit)
-  }
-
-  toObject () {
-    return Buffer.from(this._commit, 'utf8')
-  }
-
-  // Todo: allow setting the headers and message
-  headers () {
-    return this.parseHeaders()
-  }
-
-  // Todo: allow setting the headers and message
-  message () {
-    return GitCommit.justMessage(this._commit)
-  }
-
-  parse () {
-    return Object.assign({ message: this.message() }, this.headers())
-  }
-
-  static justMessage (commit) {
-    return normalizeNewlines(commit.slice(commit.indexOf('\n\n') + 2))
-  }
-
-  static justHeaders (commit) {
-    return commit.slice(0, commit.indexOf('\n\n'))
-  }
-
-  parseHeaders () {
-    const headers = GitCommit.justHeaders(this._commit).split('\n');
-    const hs = [];
-    for (const h of headers) {
-      if (h[0] === ' ') {
-        // combine with previous header (without space indent)
-        hs[hs.length - 1] += '\n' + h.slice(1);
-      } else {
-        hs.push(h);
-      }
-    }
-    const obj = {
-      parent: []
-    };
-    for (const h of hs) {
-      const key = h.slice(0, h.indexOf(' '));
-      const value = h.slice(h.indexOf(' ') + 1);
-      if (Array.isArray(obj[key])) {
-        obj[key].push(value);
-      } else {
-        obj[key] = value;
-      }
-    }
-    if (obj.author) {
-      obj.author = parseAuthor(obj.author);
-    }
-    if (obj.committer) {
-      obj.committer = parseAuthor(obj.committer);
-    }
-    return obj
-  }
-
-  static renderHeaders (obj) {
-    let headers = '';
-    if (obj.tree) {
-      headers += `tree ${obj.tree}\n`;
-    } else {
-      headers += `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n`; // the null tree
-    }
-    if (obj.parent) {
-      if (obj.parent.length === undefined) {
-        throw new GitError(E.InternalFail, {
-          message: `commit 'parent' property should be an array`
-        })
-      }
-      for (const p of obj.parent) {
-        headers += `parent ${p}\n`;
-      }
-    }
-    const author = obj.author;
-    headers += `author ${formatAuthor(author)}\n`;
-    const committer = obj.committer || obj.author;
-    headers += `committer ${formatAuthor(committer)}\n`;
-    if (obj.gpgsig) {
-      headers += 'gpgsig' + indent(obj.gpgsig);
-    }
-    return headers
-  }
-
-  static render (obj) {
-    return GitCommit.renderHeaders(obj) + '\n' + normalizeNewlines(obj.message)
-  }
-
-  render () {
-    return this._commit
-  }
-
-  withoutSignature () {
-    const commit = normalizeNewlines(this._commit);
-    if (commit.indexOf('\ngpgsig') === -1) return commit
-    const headers = commit.slice(0, commit.indexOf('\ngpgsig'));
-    const message = commit.slice(
-      commit.indexOf('-----END PGP SIGNATURE-----\n') +
-        '-----END PGP SIGNATURE-----\n'.length
-    );
-    return normalizeNewlines(headers + '\n' + message)
-  }
-
-  isolateSignature () {
-    const signature = this._commit.slice(
-      this._commit.indexOf('-----BEGIN PGP SIGNATURE-----'),
-      this._commit.indexOf('-----END PGP SIGNATURE-----') +
-        '-----END PGP SIGNATURE-----'.length
-    );
-    return outdent(signature)
-  }
-
-  static async sign (commit, pgp, secretKey) {
-    const payload = commit.withoutSignature();
-    const message = GitCommit.justMessage(commit._commit);
-    let { signature } = await pgp.sign({ payload, secretKey });
-    // renormalize the line endings to the one true line-ending
-    signature = normalizeNewlines(signature);
-    const headers = GitCommit.justHeaders(commit._commit);
-    const signedCommit =
-      headers + '\n' + 'gpgsig' + indent(signature) + '\n' + message;
-    // return a new commit object
-    return GitCommit.from(signedCommit)
-  }
-
-  static async verify (commit, pgp, publicKey) {
-    const payload = commit.withoutSignature();
-    const signature = commit.isolateSignature();
-    return pgp.verify({ payload, publicKey, signature })
-  }
-}
-
-async function resolveTree ({ fs, gitdir, oid }) {
-  // Empty tree - bypass `readObject`
-  if (oid === '4b825dc642cb6eb9a060e54bf8d69288fbee4904') {
-    return { tree: GitTree.from([]), oid }
-  }
-  const { type, object } = await readObject({ fs, gitdir, oid });
-  // Resolve annotated tag objects to whatever
-  if (type === 'tag') {
-    oid = GitAnnotatedTag.from(object).parse().object;
-    return resolveTree({ fs, gitdir, oid })
-  }
-  // Resolve commits to trees
-  if (type === 'commit') {
-    oid = GitCommit.from(object).parse().tree;
-    return resolveTree({ fs, gitdir, oid })
-  }
-  if (type !== 'tree') {
-    throw new GitError(E.ResolveTreeError, { oid })
-  }
-  return { tree: GitTree.from(object), oid }
-}
 
 class GitWalkerRepo {
   constructor ({ fs, gitdir, ref }) {
@@ -5081,6 +5966,7 @@ const ALLOW_ALL = ['.'];
  * @param {string} [args.pattern = null] - Only checkout the files that match a glob pattern. (Pattern is relative to `filepaths` if `filepaths` is provided.)
  * @param {string} [args.remote = 'origin'] - Which remote repository to use
  * @param {boolean} [args.noCheckout = false] - If true, will update HEAD but won't update the working directory
+ * @param {boolean} [args.noSubmodules = false] - If true, will not print out an error about missing submodules support. TODO: Skip checkout out submodules when supported instead.
  *
  * @returns {Promise<void>} Resolves successfully when filesystem operations are complete
  *
@@ -5106,7 +5992,8 @@ async function checkout ({
   ref,
   filepaths = ALLOW_ALL,
   pattern = null,
-  noCheckout = false
+  noCheckout = false,
+  noSubmodules = false
 }) {
   try {
     if (ref === undefined) {
@@ -5205,8 +6092,8 @@ async function checkout ({
               if (!match) return
             }
             if (!head) {
-              // if file is not staged, ignore it
-              if (stage && workdir) {
+              // if file is not staged, delete it
+              if (workdir) {
                 await fs.rm(join(dir, fullpath));
                 if (emitter) {
                   await emitter.emit(`${emitterPrefix}progress`, {
@@ -5227,11 +6114,13 @@ async function checkout ({
               }
               case 'commit': {
                 // gitlinks
-                console.log(
-                  new GitError(E.NotImplementedFail, {
-                    thing: 'submodule support'
-                  })
-                );
+                if (!noSubmodules) {
+                  console.log(
+                    new GitError(E.NotImplementedFail, {
+                      thing: 'submodule support'
+                    })
+                  );
+                }
                 break
               }
               case 'blob': {
@@ -5902,6 +6791,14 @@ async function analyze ({
   })
 }
 
+function translateSSHtoHTTP (url) {
+  // handle "shorter scp-like syntax"
+  url = url.replace(/^git@([^:]+):/, 'https://$1/');
+  // handle proper SSH URLs
+  url = url.replace(/^ssh:\/\//, 'https://');
+  return url
+}
+
 function calculateBasicAuthHeader ({ username, password }) {
   return `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`
 }
@@ -6359,6 +7256,13 @@ class GitRemoteHTTP {
 }
 
 function parseRemoteUrl ({ url }) {
+  // the stupid "shorter scp-like syntax"
+  if (url.startsWith('git@')) {
+    return {
+      transport: 'ssh',
+      address: url
+    }
+  }
   const matches = url.match(/(\w+)(:\/\/|::)(.*)/);
   if (matches === null) return
   /*
@@ -6404,7 +7308,8 @@ class GitRemoteManager {
     }
     throw new GitError(E.UnknownTransportError, {
       url,
-      transport: parts.transport
+      transport: parts.transport,
+      suggestion: parts.transport === 'ssh' ? translateSSHtoHTTP(url) : void 0
     })
   }
 }
@@ -6869,6 +7774,7 @@ function writeUploadPackRequest ({
  * @param {object} [args.headers] - Additional headers to include in HTTP requests, similar to git's `extraHeader` config
  * @param {boolean} [args.prune] - Delete local remote-tracking branches that are not present on the remote
  * @param {boolean} [args.pruneTags] - Prune local tags that don’t exist on the remote, and force-update those tags that differ
+ * @param {boolean} [args.autoTranslateSSH] - Attempt to automatically translate SSH remotes into HTTP equivalents
  * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md).
  * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name.
  *
@@ -6919,6 +7825,7 @@ async function fetch ({
   headers = {},
   prune = false,
   pruneTags = false,
+  autoTranslateSSH = false,
   // @ts-ignore
   onprogress // deprecated
 }) {
@@ -6952,7 +7859,8 @@ async function fetch ({
       singleBranch,
       headers,
       prune,
-      pruneTags
+      pruneTags,
+      autoTranslateSSH
     });
     if (response === null) {
       return {
@@ -7041,7 +7949,8 @@ async function fetchPackfile ({
   singleBranch,
   headers,
   prune,
-  pruneTags
+  pruneTags,
+  autoTranslateSSH
 }) {
   // Sanity checks
   if (depth !== null) {
@@ -7059,6 +7968,15 @@ async function fetchPackfile ({
       path: `remote.${remote}.url`
     });
   }
+
+  // Try to convert SSH URLs to HTTPS ones
+  if (
+    autoTranslateSSH ||
+    (await config({ fs, gitdir, path: `isomorphic-git.autoTranslateSSH` }))
+  ) {
+    url = translateSSHtoHTTP(url);
+  }
+
   if (corsProxy === undefined) {
     corsProxy = await config({ fs, gitdir, path: 'http.corsProxy' });
   }
@@ -7369,6 +8287,7 @@ async function init ({
  * @param {string} [args.ref] - Which branch to clone. By default this is the designated "main branch" of the repository.
  * @param {boolean} [args.singleBranch = false] - Instead of the default behavior of fetching all the branches, only fetch a single branch.
  * @param {boolean} [args.noCheckout = false] - If true, clone will only fetch the repo, not check out a branch. Skipping checkout can save a lot of time normally spent writing files to disk.
+ * @param {boolean} [args.noSubmodules = false] - If true, clone will not log an error about missing submodule support. TODO: Make this not check out submodules when ther's submodule support
  * @param {boolean} [args.noGitSuffix = false] - If true, clone will not auto-append a `.git` suffix to the `url`. (**AWS CodeCommit needs this option**.)
  * @param {boolean} [args.noTags = false] - By default clone will fetch all tags. `noTags` disables that behavior.
  * @param {string} [args.remote = 'origin'] - What to name the remote that is created.
@@ -7383,6 +8302,7 @@ async function init ({
  * @param {object} [args.headers = {}] - Additional headers to include in HTTP requests, similar to git's `extraHeader` config
  * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
  * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
+ * @param {boolean} [args.autoTranslateSSH] - Attempt to automatically translate SSH remotes into HTTP equivalents
  *
  * @returns {Promise<void>} Resolves successfully when clone completes
  *
@@ -7423,8 +8343,10 @@ async function clone ({
   relative = false,
   singleBranch = false,
   noCheckout = false,
+  noSubmodules = false,
   noTags = false,
   headers = {},
+  autoTranslateSSH = false,
   // @ts-ignore
   onprogress
 }) {
@@ -7478,7 +8400,8 @@ async function clone ({
       relative,
       singleBranch,
       headers,
-      tags: !noTags
+      tags: !noTags,
+      autoTranslateSSH
     });
     if (fetchHead === null) return
     ref = ref || defaultBranch;
@@ -7492,200 +8415,11 @@ async function clone ({
       emitterPrefix,
       ref,
       remote,
-      noCheckout
+      noCheckout,
+      noSubmodules
     });
   } catch (err) {
     err.caller = 'git.clone';
-    throw err
-  }
-}
-
-// @ts-check
-
-/**
- * Create a new commit
- *
- * @param {Object} args
- * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
- * @param {import('../models/FileSystem').FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
- * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
- * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
- * @param {string} args.message - The commit message to use.
- * @param {Object} [args.author] - The details about the author.
- * @param {string} [args.author.name] - Default is `user.name` config.
- * @param {string} [args.author.email] - Default is `user.email` config.
- * @param {string} [args.author.date] - Set the author timestamp field. Default is the current date.
- * @param {string} [args.author.timestamp] - Set the author timestamp field. This is an alternative to using `date` using an integer number of seconds since the Unix epoch instead of a JavaScript date object.
- * @param {string} [args.author.timezoneOffset] - Set the author timezone offset field. This is the difference, in minutes, from the current timezone to UTC. Default is `(new Date()).getTimezoneOffset()`.
- * @param {Object} [args.committer = author] - The details about the commit committer, in the same format as the author parameter. If not specified, the author details are used.
- * @param {string} [args.signingKey] - Sign the tag object using this private PGP key.
- * @param {boolean} [args.dryRun = false] - If true, simulates making a commit so you can test whether it would succeed. Implies `noUpdateBranch`.
- * @param {boolean} [args.noUpdateBranch = false] - If true, does not update the branch pointer after creating the commit.
- * @param {string} [args.ref] - The fully expanded name of the branch to commit to. Default is the current branch pointed to by HEAD. (TODO: fix it so it can expand branch names without throwing if the branch doesn't exist yet.)
- * @param {string[]} [args.parent] - The SHA-1 object ids of the commits to use as parents. If not specified, the commit pointed to by `ref` is used.
- * @param {string} [args.tree] - The SHA-1 object id of the tree to use. If not specified, a new tree object is created from the current git index.
- * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md)
- * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name
- *
- * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly created commit.
- *
- * @example
- * let sha = await git.commit({
- *   dir: '$input((/))',
- *   author: {
- *     name: '$input((Mr. Test))',
- *     email: '$input((mrtest@example.com))'
- *   },
- *   message: '$input((Added the a.txt file))'
- * })
- * console.log(sha)
- *
- */
-async function commit ({
-  core = 'default',
-  dir,
-  gitdir = join(dir, '.git'),
-  fs = cores.get(core).get('fs'),
-  message,
-  author,
-  committer,
-  signingKey,
-  dryRun = false,
-  noUpdateBranch = false,
-  emitter = cores.get(core).get('emitter'),
-  emitterPrefix = '',
-  ref,
-  parent,
-  tree
-}) {
-  try {
-    if (emitter) {
-      await emitter.emit(`${emitterPrefix}progress`, {
-        phase: 'Creating commit',
-        loaded: 0,
-        lengthComputable: false
-      });
-    }
-    if (!ref) {
-      ref = await GitRefManager.resolve({
-        fs,
-        gitdir,
-        ref: 'HEAD',
-        depth: 2
-      });
-    }
-
-    if (message === undefined) {
-      throw new GitError(E.MissingRequiredParameterError, {
-        function: 'commit',
-        parameter: 'message'
-      })
-    }
-
-    // Fill in missing arguments with default values
-    author = await normalizeAuthorObject({ fs, gitdir, author });
-    if (author === undefined) {
-      throw new GitError(E.MissingAuthorError)
-    }
-
-    committer = Object.assign({}, committer || author);
-    // Match committer's date to author's one, if omitted
-    committer.date = committer.date || author.date;
-    committer = await normalizeAuthorObject({ fs, gitdir, author: committer });
-    if (committer === undefined) {
-      throw new GitError(E.MissingCommitterError)
-    }
-
-    if (emitter) {
-      await emitter.emit(`${emitterPrefix}progress`, {
-        phase: 'Creating commit tree',
-        loaded: 0,
-        lengthComputable: false
-      });
-    }
-
-    return GitIndexManager.acquire({ fs, gitdir }, async function (index) {
-      if (!parent) {
-        try {
-          parent = [
-            await GitRefManager.resolve({
-              fs,
-              gitdir,
-              ref
-            })
-          ];
-        } catch (err) {
-          // Probably an initial commit
-          parent = [];
-        }
-      }
-
-      let mergeHash;
-      try {
-        mergeHash = await GitRefManager.resolve({ fs, gitdir, ref: 'MERGE_HEAD' });
-      } catch (err) {
-        // No merge hash
-      }
-
-      if (mergeHash) {
-        const conflictedPaths = index.conflictedPaths;
-        if (conflictedPaths.length > 0) {
-          throw new GitError(E.CommitUnmergedConflictsFail, { paths: conflictedPaths })
-        }
-        if (parent.length) {
-          if (!parent.includes(mergeHash)) parent.push(mergeHash);
-        } else {
-          throw new GitError(E.NoHeadCommitError, { noun: 'merge commit', ref: mergeHash })
-        }
-      }
-
-      if (!tree) {
-        tree = await GitIndexManager.constructTree({ fs, gitdir, dryRun, index });
-      }
-
-      if (emitter) {
-        await emitter.emit(`${emitterPrefix}progress`, {
-          phase: 'Writing commit',
-          loaded: 0,
-          lengthComputable: false
-        });
-      }
-
-      let comm = GitCommit.from({
-        tree,
-        parent,
-        author,
-        committer,
-        message
-      });
-      if (signingKey) {
-        const pgp = cores.get(core).get('pgp');
-        comm = await GitCommit.sign(comm, pgp, signingKey);
-      }
-      const oid = await writeObject({
-        fs,
-        gitdir,
-        type: 'commit',
-        object: comm.toObject(),
-        dryRun
-      });
-      if (!noUpdateBranch && !dryRun) {
-        // Update branch pointer
-        await GitRefManager.writeRef({
-          fs,
-          gitdir,
-          ref,
-          value: oid
-        });
-        if (mergeHash) {
-          await GitRefManager.deleteRef({ fs, gitdir, ref: 'MERGE_HEAD' });
-          await fs.rm(join(gitdir, 'MERGE_MSG'));
-        }
-      }
-      return oid
-    })
-  } catch (err) {
-    err.caller = 'git.commit';
     throw err
   }
 }
@@ -8749,6 +9483,12 @@ async function listCommitsAndTags ({
  * | 'content'  | Return the object buffer without the git header.                                                                                                                                                          |
  * | 'parsed'   | Returns a parsed representation of the object.                                                                                                                                                            |
  *
+ * @deprecated
+ * > **Deprecated**
+ * > This command is overly complicated.
+ * >
+ * > If you know the type of object you are reading, use [`readBlob`](./readBlob.md), [`readCommit`](./readCommit.md), [`readTag`](./readTag.md), or [`readTree`](./readTree.md).
+ *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
  * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin-fs.md.md).
@@ -8975,6 +9715,60 @@ async function accumulateFilesFromOid ({ gitdir, fs, oid, filenames, prefix }) {
     } else {
       filenames.push(join(prefix, entry.path));
     }
+  }
+}
+
+// @ts-check
+
+/**
+ * List all the object notes
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} [args.ref] - The notes ref to look under
+ *
+ * @returns {Promise<Array<{target: string, note: string}>>} Resolves successfully with an array of entries containing SHA-1 object ids of the note and the object the note targets
+ */
+
+async function listNotes ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  ref = 'refs/notes/commits'
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+
+    // Get the current note commit
+    let parent;
+    try {
+      parent = await GitRefManager.resolve({ gitdir, fs, ref });
+    } catch (err) {
+      if (err.code === E.ResolveRefError) {
+        return []
+      }
+    }
+
+    // Create the current note tree
+    const result = await readTree({
+      gitdir,
+      fs,
+      oid: parent
+    });
+
+    // Format the tree entries
+    const notes = result.tree.map(entry => ({
+      target: entry.path,
+      note: entry.oid
+    }));
+    return notes
+  } catch (err) {
+    err.caller = 'git.listNotes';
+    throw err
   }
 }
 
@@ -9694,7 +10488,7 @@ async function pack ({
     outputStream.push(buff);
     hash.update(buff);
   }
-  function writeObject ({ stype, object }) {
+  async function writeObject ({ stype, object }) {
     // Object type is encoded in bits 654
     const type = types[stype];
     // The length encoding gets complicated.
@@ -9718,7 +10512,7 @@ async function pack ({
       length = length >>> 7;
     }
     // Lastly, we can compress and write the object.
-    write(Buffer.from(pako.deflate(object)));
+    write(Buffer.from(await deflate(object)));
   }
   write('PACK');
   write('00000002', 'hex');
@@ -9726,7 +10520,7 @@ async function pack ({
   write(padHex(8, oids.length), 'hex');
   for (const oid of oids) {
     const { type, object } = await readObject({ fs, gitdir, oid });
-    writeObject({ write, object, stype: type });
+    await writeObject({ write, object, stype: type });
   }
   // Write SHA1 checksum
   const digest = hash.digest();
@@ -9820,7 +10614,9 @@ async function packObjects ({
  * @param {Object} [args.author] - passed to [commit](commit.md) when creating a merge commit
  * @param {Object} [args.committer] - passed to [commit](commit.md) when creating a merge commit
  * @param {string} [args.signingKey] - passed to [commit](commit.md) when creating a merge commit
+ * @param {boolean} [args.autoTranslateSSH] - Attempt to automatically translate SSH remotes into HTTP equivalents
  * @param {boolean} [args.fast = false] - use fastCheckout instead of regular checkout
+ * @param {boolean} [args.noSubmodules = false] - If true, will not print out an error about missing submodules support. TODO: Skip checkout out submodules when supported instead.
  *
  * @returns {Promise<void>} Resolves successfully when pull operation completes
  *
@@ -9857,7 +10653,9 @@ async function pull ({
   author,
   committer,
   signingKey,
-  fast = false
+  autoTranslateSSH = false,
+  fast = false,
+  noSubmodules = false
 }) {
   try {
     if (emitter) {
@@ -9892,7 +10690,8 @@ async function pull ({
       token,
       oauth2format,
       singleBranch,
-      headers
+      headers,
+      autoTranslateSSH
     });
     // Merge the remote tracking branch into the local one.
     await merge({
@@ -10056,6 +10855,7 @@ async function listObjects ({
  * @param {string} [args.token] - See the [Authentication](./authentication.html) documentation
  * @param {string} [args.oauth2format] - See the [Authentication](./authentication.html) documentation
  * @param {object} [args.headers] - Additional headers to include in HTTP requests, similar to git's `extraHeader` config
+ * @param {boolean} [args.autoTranslateSSH] - Attempt to automatically translate SSH remotes into HTTP equivalents
  * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md).
  * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name.
  *
@@ -10094,7 +10894,8 @@ async function push ({
   password = authPassword,
   token,
   oauth2format,
-  headers = {}
+  headers = {},
+  autoTranslateSSH = false
 }) {
   try {
     if (emitter) {
@@ -10108,6 +10909,15 @@ async function push ({
     if (url === undefined) {
       url = await config({ fs, gitdir, path: `remote.${remote}.url` });
     }
+
+    // Try to convert SSH URLs to HTTPS ones
+    if (
+      autoTranslateSSH ||
+      (await config({ fs, gitdir, path: `isomorphic-git.autoTranslateSSH` }))
+    ) {
+      url = translateSSHtoHTTP(url);
+    }
+
     if (corsProxy === undefined) {
       corsProxy = await config({ fs, gitdir, path: 'http.corsProxy' });
     }
@@ -10257,6 +11067,297 @@ async function push ({
   }
 }
 
+async function resolveBlob ({ fs, gitdir, oid }) {
+  const { type, object } = await readObject({ fs, gitdir, oid });
+  // Resolve annotated tag objects to whatever
+  if (type === 'tag') {
+    oid = GitAnnotatedTag.from(object).parse().object;
+    return resolveBlob({ fs, gitdir, oid })
+  }
+  if (type !== 'blob') {
+    throw new GitError(E.ObjectTypeAssertionFail, {
+      oid,
+      type,
+      expected: 'blob'
+    })
+  }
+  return { oid, blob: object }
+}
+
+// @ts-check
+
+/**
+ *
+ * @typedef {Object} ReadBlobResult - The object returned has the following schema:
+ * @property {string} oid
+ * @property {Buffer} blob
+ *
+ */
+
+/**
+ * Read a blob object directly
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} args.oid - The SHA-1 object id to get. Annotated tags, commits, and trees are peeled.
+ * @param {string} [args.filepath] - Don't return the object with `oid` itself, but resolve `oid` to a tree and then return the blob object at that filepath.
+ *
+ * @returns {Promise<ReadBlobResult>} Resolves successfully with a blob object description
+ * @see ReadBlobResult
+ *
+ * @example
+ * // Get the contents of 'README.md' in the master branch.
+ * let commitOid = await git.resolveRef({ dir: '$input((/))', ref: '$input((master))' })
+ * console.log(commitOid)
+ * let { object: blob } = await git.readBlob({
+ *   dir: '$input((/))',
+ *   oid: $input((commitOid)),
+ *   $textarea((filepath: 'README.md'
+ * })
+ * console.log(blob.toString('utf8'))
+ *
+ */
+async function readBlob ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  oid,
+  filepath = undefined
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+    if (filepath !== undefined) {
+      oid = await resolveFilepath({ fs, gitdir, oid, filepath });
+    }
+    const blob = await resolveBlob({
+      fs,
+      gitdir,
+      oid
+    });
+    return blob
+  } catch (err) {
+    err.caller = 'git.readBlob';
+    throw err
+  }
+}
+
+async function resolveCommit ({ fs, gitdir, oid }) {
+  const { type, object } = await readObject({ fs, gitdir, oid });
+  // Resolve annotated tag objects to whatever
+  if (type === 'tag') {
+    oid = GitAnnotatedTag.from(object).parse().object;
+    return resolveCommit({ fs, gitdir, oid })
+  }
+  if (type !== 'commit') {
+    throw new GitError(E.ObjectTypeAssertionFail, {
+      oid,
+      type,
+      expected: 'commit'
+    })
+  }
+  return { commit: GitCommit.from(object), oid }
+}
+
+// @ts-check
+
+/**
+ *
+ * @typedef {Object} ReadCommitResult - The object returned has the following schema:
+ * @property {string} oid - SHA-1 object id of this commit
+ * @property {CommitObject} commit - the parsed commit object
+ * @property {string} payload - PGP signing payload
+ */
+
+/**
+ *
+ * @typedef {Object} CommitObject
+ * @property {string} message - Commit message
+ * @property {string} tree - SHA-1 object id of corresponding file tree
+ * @property {string[]} parent - an array of zero or more SHA-1 object ids
+ * @property {Object} author
+ * @property {string} author.name - The author's name
+ * @property {string} author.email - The author's email
+ * @property {number} author.timestamp - UTC Unix timestamp in seconds
+ * @property {number} author.timezoneOffset - Timezone difference from UTC in minutes
+ * @property {Object} committer
+ * @property {string} committer.name - The committer's name
+ * @property {string} committer.email - The committer's email
+ * @property {number} committer.timestamp - UTC Unix timestamp in seconds
+ * @property {number} committer.timezoneOffset - Timezone difference from UTC in minutes
+ * @property {string} [gpgsig] - PGP signature (if present)
+ */
+
+/**
+ * Read a commit object directly
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} args.oid - The SHA-1 object id to get. Annotated tags are peeled.
+ *
+ * @returns {Promise<ReadCommitResult>} Resolves successfully with a git commit object
+ * @see ReadCommitResult
+ * @see CommitObject
+ *
+ * @example
+ * // Read a commit object
+ * let sha = await git.resolveRef({ dir: '$input((/))', ref: '$input((master))' })
+ * console.log(sha)
+ * let commit = await git.readCommit({ dir: '$input((/))', oid: sha })
+ * console.log(commit)
+ *
+ */
+async function readCommit ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  oid
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+    const { commit, oid: commitOid } = await resolveCommit({
+      fs,
+      gitdir,
+      oid
+    });
+    const result = {
+      oid: commitOid,
+      commit: commit.parse(),
+      payload: commit.withoutSignature()
+    };
+    // @ts-ignore
+    return result
+  } catch (err) {
+    err.caller = 'git.readCommit';
+    throw err
+  }
+}
+
+// @ts-check
+
+/**
+ * Read the contents of a note
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} [args.ref] - The notes ref to look under
+ * @param {string} [args.oid] - The SHA-1 object id of the object to get the note for.
+ *
+ * @returns {Promise<Buffer>} Resolves successfully with note contents as a Buffer.
+ */
+
+async function readNote ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  ref = 'refs/notes/commits',
+  oid
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+
+    const parent = await GitRefManager.resolve({ gitdir, fs, ref });
+    const { blob } = await readBlob({
+      gitdir,
+      fs,
+      oid: parent,
+      filepath: oid
+    });
+
+    return blob
+  } catch (err) {
+    err.caller = 'git.readNote';
+    throw err
+  }
+}
+
+// @ts-check
+
+/**
+ *
+ * @typedef {Object} ReadTagResult - The object returned has the following schema:
+ * @property {string} oid - SHA-1 object id of this tag
+ * @property {TagObject} tag - the parsed tag object
+ * @property {string} payload - PGP signing payload
+ */
+
+/**
+ *
+ * @typedef {Object} TagObject
+ * @property {string} object - SHA-1 object id of object being tagged
+ * @property {'blob' | 'tree' | 'commit' | 'tag'} type - the type of the object being tagged
+ * @property {string} tag - the tag name
+ * @property {Object} tagger
+ * @property {string} tagger.name - the tagger's name
+ * @property {string} tagger.email - the tagger's email
+ * @property {number} tagger.timestamp - UTC Unix timestamp in seconds
+ * @property {number} tagger.timezoneOffset - timezone difference from UTC in minutes
+ * @property {string} message - tag message
+ * @property {string} [signature] - PGP signature (if present)
+ */
+
+/**
+ * Read an annotated tag object directly
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} args.oid - The SHA-1 object id to get
+ *
+ * @returns {Promise<ReadTagResult>} Resolves successfully with a git object description
+ * @see ReadTagResult
+ * @see TagObject
+ *
+ */
+async function readTag ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  oid
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+    const { type, object } = await readObject({
+      fs,
+      gitdir,
+      oid,
+      format: 'content'
+    });
+    if (type !== 'tag') {
+      throw new GitError(E.ObjectTypeAssertionFail, {
+        oid,
+        type,
+        expected: 'tag'
+      })
+    }
+    const tag = GitAnnotatedTag.from(object);
+    const result = {
+      oid,
+      tag: tag.parse(),
+      payload: tag.payload()
+    };
+    // @ts-ignore
+    return result
+  } catch (err) {
+    err.caller = 'git.readTag';
+    throw err
+  }
+}
+
 // @ts-check
 
 /**
@@ -10292,6 +11393,98 @@ async function remove ({
     // TODO: return oid?
   } catch (err) {
     err.caller = 'git.remove';
+    throw err
+  }
+}
+
+// @ts-check
+
+/**
+ * Remove an object note
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {string} [args.ref] - The notes ref to look under
+ * @param {string} [args.oid] - The SHA-1 object id of the object to remove the note from.
+ * @param {Object} [args.author] - The details about the author.
+ * @param {string} [args.author.name] - Default is `user.name` config.
+ * @param {string} [args.author.email] - Default is `user.email` config.
+ * @param {string} [args.author.date] - Set the author timestamp field. Default is the current date.
+ * @param {string} [args.author.timestamp] - Set the author timestamp field. This is an alternative to using `date` using an integer number of seconds since the Unix epoch instead of a JavaScript date object.
+ * @param {string} [args.author.timezoneOffset] - Set the author timezone offset field. This is the difference, in minutes, from the current timezone to UTC. Default is `(new Date()).getTimezoneOffset()`.
+ * @param {Object} [args.committer = author] - The details about the commit committer, in the same format as the author parameter. If not specified, the author details are used.
+ * @param {string} [args.signingKey] - Sign the tag object using this private PGP key.
+ *
+ * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the commit object for the note removal.
+ */
+
+async function removeNote ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  ref = 'refs/notes/commits',
+  oid,
+  author,
+  committer,
+  signingKey
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+
+    // Get the current note commit
+    let parent;
+    try {
+      parent = await GitRefManager.resolve({ gitdir, fs, ref });
+    } catch (err) {
+      if (err.code !== E.ResolveRefError) {
+        throw err
+      }
+    }
+
+    // I'm using the "empty tree" magic number here for brevity
+    const result = await readTree({
+      core,
+      dir,
+      gitdir,
+      fs,
+      oid: parent || '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+    });
+    let tree = result.tree;
+
+    // Remove the note blob entry from the tree
+    tree = tree.filter(entry => entry.path !== oid);
+
+    // Create the new note tree
+    const treeOid = await writeTree({
+      core,
+      dir,
+      gitdir,
+      fs,
+      tree
+    });
+
+    // Create the new note commit
+    const commitOid = await commit({
+      core,
+      dir,
+      gitdir,
+      fs,
+      ref,
+      tree: treeOid,
+      parent: parent && [parent],
+      message: `Note removed by 'isomorphic-git removeNote'\n`,
+      author,
+      committer,
+      signingKey
+    });
+
+    return commitOid
+  } catch (err) {
+    err.caller = 'git.removeNote';
     throw err
   }
 }
@@ -10848,6 +12041,7 @@ const ALLOW_ALL$2 = ['.'];
  * @param {string} [args.pattern = null] - Filter the results to only those whose filepath matches a glob pattern. (Pattern is relative to `filepaths` if `filepaths` is provided.)
  * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md).
  * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name.
+ * @param {boolean} [args.noSubmodules = false] - If true, will skip over submodules completely
  *
  * @returns {Promise<number[][]>} Resolves with a status matrix, described below.
  */
@@ -10860,7 +12054,8 @@ async function statusMatrix ({
   emitterPrefix = '',
   ref = 'HEAD',
   filepaths = ALLOW_ALL$2,
-  pattern = null
+  pattern = null,
+  noSubmodules = false
 }) {
   try {
     let count = 0;
@@ -10909,13 +12104,23 @@ async function statusMatrix ({
           }
           if (!match) return
         }
+
         // For now, just bail on directories
         const headType = head && (await head.type());
         if (headType === 'tree' || headType === 'special') return
+        if (noSubmodules) {
+          if (headType === 'commit') return null
+        }
+
         const workdirType = workdir && (await workdir.type());
         if (workdirType === 'tree' || workdirType === 'special') return
+
         const stageType = stage && (await stage.type());
+        if (noSubmodules) {
+          if (stageType === 'commit') return null
+        }
         if (stageType === 'tree' || stageType === 'special') return
+
         // Figure out the oids, using the staged oid for the working dir oid if the stats match.
         const headOid = head ? await head.oid() : undefined;
         const stageOid = stage ? await stage.oid() : undefined;
@@ -11465,6 +12670,66 @@ async function walkBeta1 ({
 // @ts-check
 
 /**
+ *
+ * @typedef {Object} CommitObject
+ * @property {string} message - Commit message
+ * @property {string} tree - SHA-1 object id of corresponding file tree
+ * @property {string[]} parent - an array of zero or more SHA-1 object ids
+ * @property {Object} author
+ * @property {string} author.name - The author's name
+ * @property {string} author.email - The author's email
+ * @property {number} author.timestamp - UTC Unix timestamp in seconds
+ * @property {number} author.timezoneOffset - Timezone difference from UTC in minutes
+ * @property {Object} committer
+ * @property {string} committer.name - The committer's name
+ * @property {string} committer.email - The committer's email
+ * @property {number} committer.timestamp - UTC Unix timestamp in seconds
+ * @property {number} committer.timezoneOffset - Timezone difference from UTC in minutes
+ * @property {string} [gpgsig] - PGP signature (if present)
+ */
+
+/**
+ * Write a commit object directly
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {CommitObject} args.commit - The object to write
+ *
+ * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly written object
+ * @see CommitObject
+ *
+ */
+async function writeCommit ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  commit
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+    // Convert object to buffer
+    const object = GitCommit.from(commit).toObject();
+    const oid = await writeObject({
+      fs,
+      gitdir,
+      type: 'commit',
+      object,
+      format: 'content'
+    });
+    return oid
+  } catch (err) {
+    err.caller = 'git.writeCommit';
+    throw err
+  }
+}
+
+// @ts-check
+
+/**
  * Write a git object directly
  *
  * `format` can have the following values:
@@ -11478,6 +12743,12 @@ async function walkBeta1 ({
  *
  * If `format` is `'parsed'`, then `object` must match one of the schemas for `CommitDescription`, `TreeDescription`, or `TagDescription` described in...
  * shucks I haven't written that page yet. :( Well, described in the [TypeScript definition](https://github.com/isomorphic-git/isomorphic-git/blob/master/src/index.d.ts) for now.
+ *
+ * @deprecated
+ * > **Deprecated**
+ * > This command is overly complicated.
+ * >
+ * > If you know the type of object you are writing, use [`writeBlob`](./writeBlob.md), [`writeCommit`](./writeCommit.md), [`writeTag`](./writeTag.md), or [`writeTree`](./writeTree.md).
  *
  * @param {object} args
  * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
@@ -11650,279 +12921,85 @@ async function writeRef ({
   }
 }
 
-async function sleep (ms) {
-  return new Promise((resolve, reject) => setTimeout(resolve, ms))
-}
+// @ts-check
 
-const delayedReleases = new Map();
-const fsmap = new WeakMap();
 /**
- * This is just a collection of helper functions really. At least that's how it started.
+ *
+ * @typedef {Object} TagObject
+ * @property {string} object - SHA-1 object id of object being tagged
+ * @property {'blob' | 'tree' | 'commit' | 'tag'} type - the type of the object being tagged
+ * @property {string} tag - the tag name
+ * @property {Object} tagger
+ * @property {string} tagger.name - the tagger's name
+ * @property {string} tagger.email - the tagger's email
+ * @property {number} tagger.timestamp - UTC Unix timestamp in seconds
+ * @property {number} tagger.timezoneOffset - timezone difference from UTC in minutes
+ * @property {string} message - tag message
+ * @property {string} [signature] - PGP signature (if present)
  */
-class FileSystem {
-  constructor (fs) {
-    // This is not actually the most logical place to put this, but in practice
-    // putting the check here should work great.
-    if (fs === undefined) {
-      throw new GitError(E.PluginUndefined, { plugin: 'fs' })
-    }
-    // This is sad... but preserving reference equality is now necessary
-    // to deal with cache invalidation in GitIndexManager.
-    if (fsmap.has(fs)) {
-      return fsmap.get(fs)
-    }
-    if (fsmap.has(fs._original_unwrapped_fs)) {
-      return fsmap.get(fs._original_unwrapped_fs)
-    }
 
-    if (typeof fs._original_unwrapped_fs !== 'undefined') return fs
-
-    if (
-      Object.getOwnPropertyDescriptor(fs, 'promises') &&
-      Object.getOwnPropertyDescriptor(fs, 'promises').enumerable
-    ) {
-      this._readFile = fs.promises.readFile.bind(fs.promises);
-      this._writeFile = fs.promises.writeFile.bind(fs.promises);
-      this._mkdir = fs.promises.mkdir.bind(fs.promises);
-      this._rmdir = fs.promises.rmdir.bind(fs.promises);
-      this._unlink = fs.promises.unlink.bind(fs.promises);
-      this._stat = fs.promises.stat.bind(fs.promises);
-      this._lstat = fs.promises.lstat.bind(fs.promises);
-      this._readdir = fs.promises.readdir.bind(fs.promises);
-      this._readlink = fs.promises.readlink.bind(fs.promises);
-      this._symlink = fs.promises.symlink.bind(fs.promises);
-    } else {
-      this._readFile = pify(fs.readFile.bind(fs));
-      this._writeFile = pify(fs.writeFile.bind(fs));
-      this._mkdir = pify(fs.mkdir.bind(fs));
-      this._rmdir = pify(fs.rmdir.bind(fs));
-      this._unlink = pify(fs.unlink.bind(fs));
-      this._stat = pify(fs.stat.bind(fs));
-      this._lstat = pify(fs.lstat.bind(fs));
-      this._readdir = pify(fs.readdir.bind(fs));
-      this._readlink = pify(fs.readlink.bind(fs));
-      this._symlink = pify(fs.symlink.bind(fs));
-    }
-    this._original_unwrapped_fs = fs;
-    fsmap.set(fs, this);
-  }
-
-  /**
-   * Return true if a file exists, false if it doesn't exist.
-   * Rethrows errors that aren't related to file existance.
-   */
-  async exists (filepath, options = {}) {
-    try {
-      await this._stat(filepath);
-      return true
-    } catch (err) {
-      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
-        return false
-      } else {
-        console.log('Unhandled error in "FileSystem.exists()" function', err);
-        throw err
-      }
-    }
-  }
-
-  /**
-   * Return the contents of a file if it exists, otherwise returns null.
-   *
-   * @param {string} filepath
-   * @param {object} [options]
-   *
-   * @returns {Buffer|null}
-   */
-  async read (filepath, options = {}) {
-    try {
-      let buffer = await this._readFile(filepath, options);
-      // Convert plain ArrayBuffers to Buffers
-      if (typeof buffer !== 'string') {
-        buffer = Buffer.from(buffer);
-      }
-      return buffer
-    } catch (err) {
-      return null
-    }
-  }
-
-  /**
-   * Write a file (creating missing directories if need be) without throwing errors.
-   *
-   * @param {string} filepath
-   * @param {Buffer|Uint8Array|string} contents
-   * @param {object|string} [options]
-   */
-  async write (filepath, contents, options = {}) {
-    try {
-      await this._writeFile(filepath, contents, options);
-      return
-    } catch (err) {
-      // Hmm. Let's try mkdirp and try again.
-      await this.mkdir(dirname(filepath));
-      await this._writeFile(filepath, contents, options);
-    }
-  }
-
-  /**
-   * Make a directory (or series of nested directories) without throwing an error if it already exists.
-   */
-  async mkdir (filepath, _selfCall = false) {
-    try {
-      await this._mkdir(filepath);
-      return
-    } catch (err) {
-      // If err is null then operation succeeded!
-      if (err === null) return
-      // If the directory already exists, that's OK!
-      if (err.code === 'EEXIST') return
-      // Avoid infinite loops of failure
-      if (_selfCall) throw err
-      // If we got a "no such file or directory error" backup and try again.
-      if (err.code === 'ENOENT') {
-        const parent = dirname(filepath);
-        // Check to see if we've gone too far
-        if (parent === '.' || parent === '/' || parent === filepath) throw err
-        // Infinite recursion, what could go wrong?
-        await this.mkdir(parent);
-        await this.mkdir(filepath, true);
-      }
-    }
-  }
-
-  /**
-   * Delete a file without throwing an error if it is already deleted.
-   */
-  async rm (filepath) {
-    try {
-      await this._unlink(filepath);
-    } catch (err) {
-      if (err.code !== 'ENOENT') throw err
-    }
-  }
-
-  /**
-   * Delete a directory without throwing an error if it is already deleted.
-   */
-  async rmdir (filepath) {
-    try {
-      await this._rmdir(filepath);
-    } catch (err) {
-      if (err.code !== 'ENOENT') throw err
-    }
-  }
-
-  /**
-   * Read a directory without throwing an error is the directory doesn't exist
-   */
-  async readdir (filepath) {
-    try {
-      const names = await this._readdir(filepath);
-      // Ordering is not guaranteed, and system specific (Windows vs Unix)
-      // so we must sort them ourselves.
-      names.sort(compareStrings);
-      return names
-    } catch (err) {
-      if (err.code === 'ENOTDIR') return null
-      return []
-    }
-  }
-
-  /**
-   * Return a flast list of all the files nested inside a directory
-   *
-   * Based on an elegant concurrent recursive solution from SO
-   * https://stackoverflow.com/a/45130990/2168416
-   */
-  async readdirDeep (dir) {
-    const subdirs = await this._readdir(dir);
-    const files = await Promise.all(
-      subdirs.map(async subdir => {
-        const res = dir + '/' + subdir;
-        return (await this._stat(res)).isDirectory()
-          ? this.readdirDeep(res)
-          : res
-      })
-    );
-    return files.reduce((a, f) => a.concat(f), [])
-  }
-
-  /**
-   * Return the Stats of a file/symlink if it exists, otherwise returns null.
-   * Rethrows errors that aren't related to file existance.
-   */
-  async lstat (filename) {
-    try {
-      const stats = await this._lstat(filename);
-      return stats
-    } catch (err) {
-      if (err.code === 'ENOENT') {
-        return null
-      }
-      throw err
-    }
-  }
-
-  /**
-   * Reads the contents of a symlink if it exists, otherwise returns null.
-   * Rethrows errors that aren't related to file existance.
-   */
-  async readlink (filename, opts = { encoding: 'buffer' }) {
-    // Note: FileSystem.readlink returns a buffer by default
-    // so we can dump it into GitObject.write just like any other file.
-    try {
-      return this._readlink(filename, opts)
-    } catch (err) {
-      if (err.code === 'ENOENT') {
-        return null
-      }
-      throw err
-    }
-  }
-
-  /**
-   * Write the contents of buffer to a symlink.
-   */
-  async writelink (filename, buffer) {
-    return this._symlink(buffer.toString('utf8'), filename)
-  }
-
-  async lock (filename, triesLeft = 3) {
-    // check to see if we still have it
-    if (delayedReleases.has(filename)) {
-      clearTimeout(delayedReleases.get(filename));
-      delayedReleases.delete(filename);
-      return
-    }
-    if (triesLeft === 0) {
-      throw new GitError(E.AcquireLockFileFail, { filename })
-    }
-    try {
-      await this._mkdir(`${filename}.lock`);
-    } catch (err) {
-      if (err.code === 'EEXIST') {
-        await sleep(100);
-        await this.lock(filename, triesLeft - 1);
-      }
-    }
-  }
-
-  async unlock (filename, delayRelease = 50) {
-    if (delayedReleases.has(filename)) {
-      throw new GitError(E.DoubleReleaseLockFileFail, { filename })
-    }
-    // Basically, we lie and say it was deleted ASAP.
-    // But really we wait a bit to see if you want to acquire it again.
-    delayedReleases.set(
-      filename,
-      setTimeout(async () => {
-        delayedReleases.delete(filename);
-        await this._rmdir(`${filename}.lock`);
-      }, delayRelease)
-    );
+/**
+ * Write an annotated tag object directly
+ *
+ * @param {object} args
+ * @param {string} [args.core = 'default'] - The plugin core identifier to use for plugin injection
+ * @param {FileSystem} [args.fs] - [deprecated] The filesystem containing the git repo. Overrides the fs provided by the [plugin system](./plugin_fs.md).
+ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
+ * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+ * @param {TagObject} args.tag - The object to write
+ *
+ * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly written object
+ * @see TagObject
+ *
+ * @example
+ * // Manually create an annotated tag.
+ * let sha = await git.resolveRef({ dir: '$input((/))', ref: '$input((HEAD))' })
+ * console.log('commit', sha)
+ *
+ * let oid = await git.writeTag({
+ *   dir: '$input((/))',
+ *   tag: {
+ *     object: sha,
+ *     type: 'commit',
+ *     tag: '$input((my-tag))',
+ *     tagger: {
+ *       name: '$input((your name))',
+ *       email: '$input((email@example.com))',
+ *       timestamp: Math.floor(Date.now()/1000),
+ *       timezoneOffset: new Date().getTimezoneOffset()
+ *     },
+ *     message: '$input((Optional message))'
+ *   }
+ * })
+ *
+ * console.log('tag', oid)
+ *
+ */
+async function writeTag ({
+  core = 'default',
+  dir,
+  gitdir = join(dir, '.git'),
+  fs: _fs = cores.get(core).get('fs'),
+  tag
+}) {
+  try {
+    const fs = new FileSystem(_fs);
+    // Convert object to buffer
+    const object = GitAnnotatedTag.from(tag).toObject();
+    const oid = await writeObject({
+      fs,
+      gitdir,
+      type: 'tag',
+      object,
+      format: 'content'
+    });
+    return oid
+  } catch (err) {
+    err.caller = 'git.writeTag';
+    throw err
   }
 }
 
 const utils = { auth, oauth2 };
 
-export { E, FileSystem, STAGE, TREE, WORKDIR, add, addRemote, annotatedTag, branch, checkout, clone, commit, config, cores, currentBranch, deleteBranch, deleteRef, deleteRemote, deleteTag, expandOid$1 as expandOid, expandRef, fastCheckout, fetch, findMergeBase, findRoot, getOidAtPath, getRemoteInfo, hashBlob, indexPack, init, isDescendent, listBranches, listCommitsAndTags, listFiles, listRemotes, listTags, log$1 as log, merge, packObjects, plugins, pull, push, readObject$1 as readObject, remove, resetIndex, resolveRef, sign, status, statusMatrix, tag, utils, verify, version, walkBeta1, walkBeta2, writeObject$1 as writeObject, writeRef };
+export { E, FileSystem, STAGE, TREE, WORKDIR, add, addNote, addRemote, annotatedTag, branch, checkout, clone, commit, config, cores, currentBranch, deleteBranch, deleteRef, deleteRemote, deleteTag, expandOid$1 as expandOid, expandRef, fastCheckout, fetch, findMergeBase, findRoot, getOidAtPath, getRemoteInfo, hashBlob, indexPack, init, isDescendent, listBranches, listCommitsAndTags, listFiles, listNotes, listRemotes, listTags, log$1 as log, merge, packObjects, plugins, pull, push, readBlob, readCommit, readNote, readObject$1 as readObject, readTag, readTree, remove, removeNote, resetIndex, resolveRef, sign, status, statusMatrix, tag, utils, verify, version, walkBeta1, walkBeta2, writeBlob, writeCommit, writeObject$1 as writeObject, writeRef, writeTag, writeTree };

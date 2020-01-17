@@ -1,8 +1,8 @@
 import AsyncLock from 'async-lock';
-import pako from 'pako';
 import crc32 from 'crc-32';
 import applyDelta from 'git-apply-delta';
 import { mark, stop } from 'marky';
+import pako from 'pako';
 import Hash from 'sha.js/sha1';
 import ignore from 'ignore';
 import pify from 'pify';
@@ -85,7 +85,8 @@ const messages = {
   PluginUnrecognized: `Unrecognized plugin type "{ plugin }"`,
   AmbiguousShortOid: `Found multiple oids matching "{ short }" ({ matches }). Use a longer abbreviation length to disambiguate them.`,
   ShortOidNotFound: `Could not find an object matching "{ short }".`,
-  CheckoutConflictError: `Your local changes to the following files would be overwritten by checkout: { filepaths }`
+  CheckoutConflictError: `Your local changes to the following files would be overwritten by checkout: { filepaths }`,
+  NoteAlreadyExistsError: `A note object { note } already exists on object { oid }. Use 'force: true' parameter to overwrite existing notes.`
 };
 
 const E = {
@@ -161,7 +162,8 @@ const E = {
   PluginUnrecognized: `PluginUnrecognized`,
   AmbiguousShortOid: `AmbiguousShortOid`,
   ShortOidNotFound: `ShortOidNotFound`,
-  CheckoutConflictError: `CheckoutConflictError`
+  CheckoutConflictError: `CheckoutConflictError`,
+  NoteAlreadyExistsError: `NoteAlreadyExistsError`
 };
 
 function renderTemplate (template, values) {
@@ -413,27 +415,30 @@ const schema = {
     symlinks: bool,
     ignorecase: bool,
     bigFileThreshold: num
+  },
+  'isomorphic-git': {
+    autoTranslateSSH: bool
   }
 };
 
-// https://git-scm.com/docs/git-config
+// https://git-scm.com/docs/git-config#_syntax
 
 // section starts with [ and ends with ]
-// section is alphanumeric (ASCII) with _ and .
+// section is alphanumeric (ASCII) with - and .
 // section is case insensitive
 // subsection is optionnal
 // subsection is specified after section and one or more spaces
 // subsection is specified between double quotes
-const SECTION_LINE_REGEX = /^\[([A-Za-z0-9_.]+)(?: "(.*)")?\]$/;
-const SECTION_REGEX = /^[A-Za-z0-9_.]+$/;
+const SECTION_LINE_REGEX = /^\[([A-Za-z0-9-.]+)(?: "(.*)")?\]$/;
+const SECTION_REGEX = /^[A-Za-z0-9-.]+$/;
 
 // variable lines contain a name, and equal sign and then a value
 // variable lines can also only contain a name (the implicit value is a boolean true)
-// variable name is alphanumeric (ASCII) with _
+// variable name is alphanumeric (ASCII) with -
 // variable name starts with an alphabetic character
 // variable name is case insensitive
-const VARIABLE_LINE_REGEX = /^([A-Za-z]\w*)(?: *= *(.*))?$/;
-const VARIABLE_NAME_REGEX = /^[A-Za-z]\w*$/;
+const VARIABLE_LINE_REGEX = /^([A-Za-z][A-Za-z-]*)(?: *= *(.*))?$/;
+const VARIABLE_NAME_REGEX = /^[A-Za-z][A-Za-z-]*$/;
 
 const VARIABLE_VALUE_COMMENT_REGEX = /^(.*?)( *[#;].*)$/;
 
@@ -1168,6 +1173,7 @@ ${obj.signature ? obj.signature : ''}`
   }
 
   signature () {
+    if (this._tag.indexOf('\n-----BEGIN PGP SIGNATURE-----') === -1) return
     const signature = this._tag.slice(
       this._tag.indexOf('-----BEGIN PGP SIGNATURE-----'),
       this._tag.indexOf('-----END PGP SIGNATURE-----') +
@@ -1176,12 +1182,16 @@ ${obj.signature ? obj.signature : ''}`
     return normalizeNewlines(signature)
   }
 
+  payload () {
+    return this.withoutSignature() + '\n'
+  }
+
   toObject () {
     return Buffer.from(this._tag, 'utf8')
   }
 
   static async sign (tag, pgp, secretKey) {
-    const payload = tag.withoutSignature() + '\n';
+    const payload = tag.payload();
     let { signature } = await pgp.sign({ payload, secretKey });
     // renormalize the line endings to the one true line-ending
     signature = normalizeNewlines(signature);
@@ -1191,7 +1201,7 @@ ${obj.signature ? obj.signature : ''}`
   }
 
   static async verify (tag, pgp, publicKey) {
-    const payload = tag.withoutSignature() + '\n';
+    const payload = tag.payload();
     const signature = tag.signature();
     return pgp.verify({ payload, publicKey, signature })
   }
@@ -1766,6 +1776,35 @@ async function parseHeader (reader) {
   return { type, length, ofs, reference }
 }
 
+/* eslint-env node, browser */
+
+let supportsDecompressionStream = false;
+
+async function inflate (buffer) {
+  if (supportsDecompressionStream === null) {
+    supportsDecompressionStream = testDecompressionStream();
+  }
+  return supportsDecompressionStream
+    ? browserInflate(buffer)
+    : pako.inflate(buffer)
+}
+
+async function browserInflate (buffer) {
+  const ds = new DecompressionStream('deflate');
+  const d = new Blob([buffer]).stream().pipeThrough(ds);
+  return new Uint8Array(await new Response(d).arrayBuffer())
+}
+
+function testDecompressionStream () {
+  try {
+    const ds = new DecompressionStream('deflate');
+    if (ds) return true
+  } catch (_) {
+    // no bother
+  }
+  return false
+}
+
 let shouldLog = null;
 
 function log (...args) {
@@ -2260,7 +2299,7 @@ class GitPackIndex {
     }
     // Handle undeltified objects
     const buffer = raw.slice(reader.tell());
-    object = Buffer.from(pako.inflate(buffer));
+    object = Buffer.from(await inflate(buffer));
     // Assert that the object length is as expected.
     if (object.byteLength !== length) {
       throw new GitError(E.InternalFail, {
@@ -2384,7 +2423,7 @@ async function readObject ({ fs, gitdir, oid, format = 'content' }) {
   /* eslint-disable no-fallthrough */
   switch (result.format) {
     case 'deflated':
-      result.object = Buffer.from(pako.inflate(result.object));
+      result.object = Buffer.from(await inflate(result.object));
       result.format = 'wrapped';
     case 'wrapped':
       if (format === 'wrapped' && result.format === 'wrapped') {
@@ -2573,14 +2612,14 @@ function appendSlashIfDir (entry) {
   return entry.mode === '040000' ? entry.path + '/' : entry.path
 }
 
-/*::
-type TreeEntry = {
-  mode: string,
-  path: string,
-  oid: string,
-  type?: string
-}
-*/
+/**
+ *
+ * @typedef {Object} TreeEntry
+ * @property {string} mode - the 6 digit hexadecimal mode
+ * @property {string} path - the name of the file or directory
+ * @property {string} oid - the SHA-1 object id of the blob or tree
+ * @property {'commit'|'blob'|'tree'} type - the type of object
+ */
 
 function mode2type (mode) {
   // prettier-ignore
@@ -2644,15 +2683,12 @@ function nudgeIntoShape (entry) {
   }
   entry.mode = limitModeToAllowed(entry.mode); // index
   if (!entry.type) {
-    entry.type = 'blob'; // index
+    entry.type = mode2type(entry.mode); // index
   }
   return entry
 }
 
 class GitTree {
-  /*::
-  _entries: Array<TreeEntry>
-  */
   constructor (entries) {
     if (Buffer.isBuffer(entries)) {
       this._entries = parseBuffer(entries);
@@ -2694,6 +2730,9 @@ class GitTree {
     )
   }
 
+  /**
+   * @returns {TreeEntry[]}
+   */
   entries () {
     return this._entries
   }
@@ -2749,6 +2788,35 @@ async function listObjects ({
   return visited
 }
 
+/* eslint-env node, browser */
+
+let supportsCompressionStream = null;
+
+async function deflate (buffer) {
+  if (supportsCompressionStream === null) {
+    supportsCompressionStream = testCompressionStream();
+  }
+  return supportsCompressionStream
+    ? browserDeflate(buffer)
+    : pako.deflate(buffer)
+}
+
+async function browserDeflate (buffer) {
+  const cs = new CompressionStream('deflate');
+  const c = new Blob([buffer]).stream().pipeThrough(cs);
+  return new Uint8Array(await new Response(c).arrayBuffer())
+}
+
+function testCompressionStream () {
+  try {
+    const cs = new CompressionStream('deflate');
+    if (cs) return true
+  } catch (_) {
+    // no bother
+  }
+  return false
+}
+
 function padHex (b, n) {
   const s = n.toString(16);
   return '0'.repeat(b - s.length) + s
@@ -2785,7 +2853,7 @@ async function pack ({
     outputStream.push(buff);
     hash.update(buff);
   }
-  function writeObject ({ stype, object }) {
+  async function writeObject ({ stype, object }) {
     // Object type is encoded in bits 654
     const type = types[stype];
     // The length encoding gets complicated.
@@ -2809,7 +2877,7 @@ async function pack ({
       length = length >>> 7;
     }
     // Lastly, we can compress and write the object.
-    write(Buffer.from(pako.deflate(object)));
+    write(Buffer.from(await deflate(object)));
   }
   write('PACK');
   write('00000002', 'hex');
@@ -2817,7 +2885,7 @@ async function pack ({
   write(padHex(8, oids.length), 'hex');
   for (const oid of oids) {
     const { type, object } = await readObject({ fs, gitdir, oid });
-    writeObject({ write, object, stype: type });
+    await writeObject({ write, object, stype: type });
   }
   // Write SHA1 checksum
   const digest = hash.digest();
@@ -3550,7 +3618,7 @@ async function writeObject ({
       object = GitObject.wrap({ type, object });
     }
     oid = await shasum(object);
-    object = Buffer.from(pako.deflate(object));
+    object = Buffer.from(await deflate(object));
   }
   if (!dryRun) {
     await writeObjectLoose({ fs, gitdir, object, format: 'deflated', oid });
@@ -4046,7 +4114,22 @@ class GitRemoteHTTP {
   }
 }
 
+function translateSSHtoHTTP (url) {
+  // handle "shorter scp-like syntax"
+  url = url.replace(/^git@([^:]+):/, 'https://$1/');
+  // handle proper SSH URLs
+  url = url.replace(/^ssh:\/\//, 'https://');
+  return url
+}
+
 function parseRemoteUrl ({ url }) {
+  // the stupid "shorter scp-like syntax"
+  if (url.startsWith('git@')) {
+    return {
+      transport: 'ssh',
+      address: url
+    }
+  }
   const matches = url.match(/(\w+)(:\/\/|::)(.*)/);
   if (matches === null) return
   /*
@@ -4092,7 +4175,8 @@ class GitRemoteManager {
     }
     throw new GitError(E.UnknownTransportError, {
       url,
-      transport: parts.transport
+      transport: parts.transport,
+      suggestion: parts.transport === 'ssh' ? translateSSHtoHTTP(url) : void 0
     })
   }
 }
