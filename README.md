@@ -189,6 +189,7 @@ unless there is a major version bump.
 ### commands
 
 - [add](https://isomorphic-git.github.io/docs/add.html)
+- [addNote](https://isomorphic-git.github.io/docs/addNote.html)
 - [addRemote](https://isomorphic-git.github.io/docs/addRemote.html)
 - [annotatedTag](https://isomorphic-git.github.io/docs/annotatedTag.html)
 - [branch](https://isomorphic-git.github.io/docs/branch.html)
@@ -213,6 +214,7 @@ unless there is a major version bump.
 - [isDescendent](https://isomorphic-git.github.io/docs/isDescendent.html)
 - [listBranches](https://isomorphic-git.github.io/docs/listBranches.html)
 - [listFiles](https://isomorphic-git.github.io/docs/listFiles.html)
+- [listNotes](https://isomorphic-git.github.io/docs/listNotes.html)
 - [listRemotes](https://isomorphic-git.github.io/docs/listRemotes.html)
 - [listTags](https://isomorphic-git.github.io/docs/listTags.html)
 - [log](https://isomorphic-git.github.io/docs/log.html)
@@ -220,10 +222,16 @@ unless there is a major version bump.
 - [packObjects](https://isomorphic-git.github.io/docs/packObjects.html)
 - [pull](https://isomorphic-git.github.io/docs/pull.html)
 - [push](https://isomorphic-git.github.io/docs/push.html)
+- [readBlob](https://isomorphic-git.github.io/docs/readBlob.html)
+- [readCommit](https://isomorphic-git.github.io/docs/readCommit.html)
 - [readObject](https://isomorphic-git.github.io/docs/readObject.html)
+- [readTag](https://isomorphic-git.github.io/docs/readTag.html)
+- [readTree](https://isomorphic-git.github.io/docs/readTree.html)
 - [remove](https://isomorphic-git.github.io/docs/remove.html)
+- [removeNote](https://isomorphic-git.github.io/docs/removeNote.html)
 - [resetIndex](https://isomorphic-git.github.io/docs/resetIndex.html)
 - [resolveRef](https://isomorphic-git.github.io/docs/resolveRef.html)
+- [showNote](https://isomorphic-git.github.io/docs/showNote.html)
 - [sign](https://isomorphic-git.github.io/docs/sign.html)
 - [status](https://isomorphic-git.github.io/docs/status.html)
 - [statusMatrix](https://isomorphic-git.github.io/docs/statusMatrix.html)
@@ -231,7 +239,11 @@ unless there is a major version bump.
 - [verify](https://isomorphic-git.github.io/docs/verify.html)
 - [version](https://isomorphic-git.github.io/docs/version.html)
 - [walkBeta2](https://isomorphic-git.github.io/docs/walkBeta2.html)
+- [writeBlob](https://isomorphic-git.github.io/docs/writeBlob.html)
+- [writeCommit](https://isomorphic-git.github.io/docs/writeCommit.html)
 - [writeObject](https://isomorphic-git.github.io/docs/writeObject.html)
+- [writeTag](https://isomorphic-git.github.io/docs/writeTag.html)
+- [writeTree](https://isomorphic-git.github.io/docs/writeTree.html)
 - [writeRef](https://isomorphic-git.github.io/docs/writeRef.html)
 
 ### plugins
@@ -275,6 +287,7 @@ Check out the [`CONTRIBUTING`](./CONTRIBUTING.md) document for more instructions
 - [GIT Web Terminal](https://jcubic.github.io/git/)
 - [Next Editor](https://next-editor.app/)
 - [Clever Cloud](https://www.clever-cloud.com/?utm_source=ref&utm_medium=link&utm_campaign=isomorphic-git)
+- [Stoplight Studio](https://stoplight.io/studio/?utm_source=ref&utm_medium=link&utm_campaign=isomorphic-git) - a modern editor for API design and technical writing
 
 ## Similar projects
 

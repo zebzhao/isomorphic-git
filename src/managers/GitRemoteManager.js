@@ -1,8 +1,16 @@
 import { E, GitError } from '../models/GitError.js'
+import { translateSSHtoHTTP } from '../utils/translateSSHtoHTTP.js'
 
 import { GitRemoteHTTP } from './GitRemoteHTTP'
 
 function parseRemoteUrl ({ url }) {
+  // the stupid "shorter scp-like syntax"
+  if (url.startsWith('git@')) {
+    return {
+      transport: 'ssh',
+      address: url
+    }
+  }
   const matches = url.match(/(\w+)(:\/\/|::)(.*)/)
   if (matches === null) return
   /*
@@ -48,7 +56,8 @@ export class GitRemoteManager {
     }
     throw new GitError(E.UnknownTransportError, {
       url,
-      transport: parts.transport
+      transport: parts.transport,
+      suggestion: parts.transport === 'ssh' ? translateSSHtoHTTP(url) : void 0
     })
   }
 }

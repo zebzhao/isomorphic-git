@@ -145,6 +145,7 @@ const ALLOW_ALL = ['.']
  * @param {string} [args.pattern = null] - Filter the results to only those whose filepath matches a glob pattern. (Pattern is relative to `filepaths` if `filepaths` is provided.)
  * @param {import('events').EventEmitter} [args.emitter] - [deprecated] Overrides the emitter set via the ['emitter' plugin](./plugin_emitter.md).
  * @param {string} [args.emitterPrefix = ''] - Scope emitted events by prepending `emitterPrefix` to the event name.
+ * @param {boolean} [args.noSubmodules = false] - If true, will skip over submodules completely
  *
  * @returns {Promise<number[][]>} Resolves with a status matrix, described below.
  */
@@ -157,7 +158,8 @@ export async function statusMatrix ({
   emitterPrefix = '',
   ref = 'HEAD',
   filepaths = ALLOW_ALL,
-  pattern = null
+  pattern = null,
+  noSubmodules = false
 }) {
   try {
     let count = 0
@@ -206,13 +208,23 @@ export async function statusMatrix ({
           }
           if (!match) return
         }
+
         // For now, just bail on directories
         const headType = head && (await head.type())
         if (headType === 'tree' || headType === 'special') return
+        if (noSubmodules) {
+          if (headType === 'commit') return null
+        }
+
         const workdirType = workdir && (await workdir.type())
         if (workdirType === 'tree' || workdirType === 'special') return
+
         const stageType = stage && (await stage.type())
+        if (noSubmodules) {
+          if (stageType === 'commit') return null
+        }
         if (stageType === 'tree' || stageType === 'special') return
+
         // Figure out the oids, using the staged oid for the working dir oid if the stats match.
         const headOid = head ? await head.oid() : undefined
         const stageOid = stage ? await stage.oid() : undefined

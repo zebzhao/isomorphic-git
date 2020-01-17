@@ -20,6 +20,63 @@ export interface GitObjectDescription {
   source?: string;
 }
 
+export interface ReadBlobResult {
+  oid: string;
+  blob: Buffer;
+}
+
+export interface ReadCommitResult {
+  oid: string;
+  commit: CommitObject;
+  payload: string; // PGP payload
+}
+
+export interface CommitObject {
+  message: string; // Commit message
+  tree: string; // SHA1 object id of corresponding file tree
+  parent: string[]; // an array of zero or more SHA1 object ids
+  author: {
+    name: string; // The author's name
+    email: string; // The author's email
+    timestamp: number; // UTC Unix timestamp in seconds
+    timezoneOffset: number; // Timezone difference from UTC in minutes
+  };
+  committer: {
+    name: string; // The committer's name
+    email: string; // The committer's email
+    timestamp: number; // UTC Unix timestamp in seconds
+    timezoneOffset: number; // Timezone difference from UTC in minutes
+  };
+  gpgsig?: string; // PGP signature (if signed)
+}
+
+export interface ReadTreeResult {
+  oid: string;
+  tree: TreeObject;
+}
+
+export type TreeObject = TreeEntry[];
+
+export interface ReadTagResult {
+  oid: string;
+  commit: TagObject;
+  payload: string; // PGP payload
+}
+
+export interface TagObject {
+  object: string;
+  type: 'blob' | 'tree' | 'commit' | 'tag';
+  tag: string;
+  tagger: {
+    name: string; // The tagger's name
+    email: string; // The tagger's email
+    timestamp: number; // UTC Unix timestamp in seconds
+    timezoneOffset: number; // Timezone difference from UTC in minutes
+  };
+  message: string;
+  signature?: string;
+}
+
 export interface CommitDescription {
   oid?: string; // SHA1 object id of this commit
   message: string; // Commit message
@@ -70,7 +127,7 @@ export interface TreeEntry {
   mode: string;
   path: string;
   oid: string;
-  type?: string;
+  type: string;
 }
 
 export interface PackObjectsResponse {
@@ -254,6 +311,30 @@ export function add(args: WorkDir & GitDir & {
   filepath: string;
 }): Promise<void>;
 
+export function addNote(args: GitDir & {
+  core?: string;
+  fs?: any;
+  ref?: string;
+  oid: string;
+  note: any;
+  author?: {
+    name?: string;
+    email?: string;
+    date?: Date;
+    timestamp?: number;
+    timezoneOffset?: number;
+  };
+  committer?: {
+    name?: string;
+    email?: string;
+    date?: Date;
+    timestamp?: number;
+    timezoneOffset?: number;
+  };
+  signingKey?: string;
+  force?: boolean;
+}): Promise<string>;
+
 export function addRemote(args: GitDir & {
   core?: string;
   fs?: any;
@@ -296,6 +377,7 @@ export function checkout(args: WorkDir & GitDir & {
   ref: string;
   filepaths?: string[];
   pattern?: string;
+  noSubmodules?: boolean;
 }): Promise<void>;
 
 export function clone(args: WorkDir & GitDir & {
@@ -317,8 +399,11 @@ export function clone(args: WorkDir & GitDir & {
   relative?: boolean;
   singleBranch?: boolean;
   noCheckout?: boolean;
+  noSubmodules?: boolean;
+  noGitSuffix?: boolean;
   noTags?: boolean;
   headers?: { [key: string]: string };
+  autoTranslateSSH?: boolean;
 }): Promise<void>;
 
 export function commit(args: GitDir & {
@@ -431,9 +516,11 @@ export function fetch(args: GitDir & {
   relative?: boolean;
   tags?: boolean;
   singleBranch?: boolean;
+  noGitSuffix?: boolean;
   prune?: boolean;
   pruneTags?: boolean;
   headers?: { [key: string]: string };
+  autoTranslateSSH?: boolean;
 }): Promise<FetchResponse>;
 
 export function findMergeBase(args: GitDir & {
@@ -457,6 +544,7 @@ export function getRemoteInfo(args: {
   token?: string;
   oauth2format?: 'github' | 'bitbucket' | 'gitlab';
   forPush?: boolean;
+  noGitSuffix?: boolean;
   headers?: { [key: string]: string };
 }): Promise<RemoteDescription>;
 
@@ -494,6 +582,13 @@ export function listFiles(args: GitDir & {
   fs?: any;
   ref?: string;
 }): Promise<Array<string>>;
+
+export function listNotes(args: GitDir & {
+  core?: string;
+  fs?: any;
+  ref?: string;
+  oid?: string;
+}): Promise<Array<{ oid: string, path: string }>>;
 
 export function listRemotes(args: GitDir & {
   core?: string;
@@ -571,6 +666,7 @@ export function pull(args: WorkDir & GitDir & {
   corsProxy?: string;
   singleBranch?: boolean;
   fastForwardOnly?: boolean;
+  noGitSuffix?: boolean;
   username?: string;
   password?: string;
   token?: string;
@@ -578,6 +674,7 @@ export function pull(args: WorkDir & GitDir & {
   headers?: { [key: string]: string };
   emitter?: EventEmitter;
   emitterPrefix?: string;
+  autoTranslateSSH?: boolean;
   author?: {
     name?: string;
     email?: string;
@@ -593,6 +690,7 @@ export function pull(args: WorkDir & GitDir & {
     timezoneOffset?: number;
   };
   signingKey?: string;
+  noSubmodules?: boolean;
 }): Promise<void>;
 
 export function push(args: GitDir & {
@@ -604,6 +702,7 @@ export function push(args: GitDir & {
   url?: string;
   corsProxy?: string;
   force?: boolean;
+  noGitSuffix?: boolean;
   username?: string;
   password?: string;
   token?: string;
@@ -611,7 +710,28 @@ export function push(args: GitDir & {
   headers?: { [key: string]: string };
   emitter?: EventEmitter;
   emitterPrefix?: string;
+  autoTranslateSSH?: boolean;
 }): Promise<PushResponse>;
+
+export function readBlob(args: GitDir & {
+  core?: string;
+  fs?: any;
+  oid: string;
+  filepath?: string;
+}): Promise<ReadBlobResult>;
+
+export function readCommit(args: GitDir & {
+  core?: string;
+  fs?: any;
+  oid: string;
+}): Promise<ReadCommitResult>;
+
+export function readNote(args: GitDir & {
+  core?: string;
+  fs?: any;
+  ref?: string;
+  oid: string;
+}): Promise<Buffer>;
 
 export function readObject(args: GitDir & {
   core?: string;
@@ -622,11 +742,46 @@ export function readObject(args: GitDir & {
   encoding?: string;
 }): Promise<GitObjectDescription>;
 
+export function readTag(args: GitDir & {
+  core?: string;
+  fs?: any;
+  oid: string;
+}): Promise<ReadTagResult>;
+
+export function readTree(args: GitDir & {
+  core?: string;
+  fs?: any;
+  oid: string;
+  filepath?: string;
+}): Promise<ReadTreeResult>;
+
 export function remove(args: GitDir & {
   core?: string;
   fs?: any;
   filepath: string;
 }): Promise<void>;
+
+export function removeNote(args: GitDir & {
+  core?: string;
+  fs?: any;
+  ref?: string;
+  oid: string;
+  author?: {
+    name?: string;
+    email?: string;
+    date?: Date;
+    timestamp?: number;
+    timezoneOffset?: number;
+  };
+  committer?: {
+    name?: string;
+    email?: string;
+    date?: Date;
+    timestamp?: number;
+    timezoneOffset?: number;
+  };
+  signingKey?: string;
+}): Promise<string>;
 
 export function resetIndex(args: Partial<WorkDir> & GitDir & {
   core?: string;
@@ -660,6 +815,7 @@ export function statusMatrix(args: WorkDir & GitDir & {
   ref?: string;
   filepaths?: string[];
   pattern?: string;
+  noSubmodules?: boolean;
 }): Promise<StatusMatrix>;
 
 export function tag(args: GitDir & {
@@ -698,6 +854,18 @@ export function walkBeta2<T, Q>(args: WorkDir & GitDir & {
   iterate?: (walk: (parent: WalkerEntry2[]) => Promise<Q>, children: Iterable<WalkerEntry2[]>) => Promise<Array<Q|undefined>>;
 }): Promise<Q|undefined>;
 
+export function writeBlob(args: GitDir & {
+  core?: string;
+  fs?: any;
+  blob: Uint8Array;
+}): Promise<string>;
+
+export function writeCommit(args: GitDir & {
+  core?: string;
+  fs?: any;
+  commit: CommitObject;
+}): Promise<string>;
+
 export function writeObject(args: GitDir & {
   core?: string;
   fs?: any;
@@ -706,6 +874,18 @@ export function writeObject(args: GitDir & {
   format?: 'deflated' | 'wrapped' | 'content' | 'parsed';
   oid?: string;
   encoding?: string;
+}): Promise<string>;
+
+export function writeTag(args: GitDir & {
+  core?: string;
+  fs?: any;
+  tag: TagObject;
+}): Promise<string>;
+
+export function writeTree(args: GitDir & {
+  core?: string;
+  fs?: any;
+  tree: TreeObject;
 }): Promise<string>;
 
 type HashBlobResult = {

@@ -1,9 +1,8 @@
-import pako from 'pako'
-
 import { E, GitError } from '../models/GitError.js'
 import { GitObject } from '../models/GitObject.js'
 import { readObjectLoose } from '../storage/readObjectLoose.js'
 import { readObjectPacked } from '../storage/readObjectPacked.js'
+import { inflate } from '../utils/inflate.js'
 import { shasum } from '../utils/shasum.js'
 
 export async function readObject ({ fs, gitdir, oid, format = 'content' }) {
@@ -40,7 +39,7 @@ export async function readObject ({ fs, gitdir, oid, format = 'content' }) {
   /* eslint-disable no-fallthrough */
   switch (result.format) {
     case 'deflated':
-      result.object = Buffer.from(pako.inflate(result.object))
+      result.object = Buffer.from(await inflate(result.object))
       result.format = 'wrapped'
     case 'wrapped':
       if (format === 'wrapped' && result.format === 'wrapped') {

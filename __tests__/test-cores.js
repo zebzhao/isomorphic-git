@@ -39,8 +39,10 @@ describe('cores', () => {
     plugins.set('fs', fs)
     cores.create('third').set('foo', fs)
     expect(cores.get('default').has('fs')).toBeTruthy()
+    // @ts-ignore
     expect(cores.get('default').has('foo')).toBeFalsy()
     expect(cores.get('third').has('fs')).toBeFalsy()
+    // @ts-ignore
     expect(cores.get('third').get('foo')).toBeTruthy()
   })
   it('plugin schema violation', async () => {
@@ -50,6 +52,7 @@ describe('cores', () => {
     }
     let error = null
     try {
+      // @ts-ignore
       plugins.set('fs', fs)
     } catch (err) {
       error = err
