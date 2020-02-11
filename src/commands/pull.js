@@ -20,6 +20,7 @@ import { merge } from './merge'
  * @param {string} args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref] - Which branch to fetch. By default this is the currently checked out branch.
+ * @param {string} [args.remote] - What to name the remote that is created.
  * @param {string} [args.corsProxy] - Optional [CORS proxy](https://www.npmjs.com/%40isomorphic-git/cors-proxy). Overrides value in repo config.
  * @param {boolean} [args.singleBranch = false] - Instead of the default behavior of fetching all the branches, only fetch a single branch.
  * @param {boolean} [args.fastForwardOnly = false] - Only perform simple fast-forward merges. (Don't create merge commits.)
@@ -37,6 +38,7 @@ import { merge } from './merge'
  * @param {boolean} [args.autoTranslateSSH] - Attempt to automatically translate SSH remotes into HTTP equivalents
  * @param {boolean} [args.fast = false] - use fastCheckout instead of regular checkout
  * @param {boolean} [args.noSubmodules = false] - If true, will not print out an error about missing submodules support. TODO: Skip checkout out submodules when supported instead.
+ * @param {boolean} [args.newSubmoduleBehavior = false] - If true, will opt into a newer behavior that improves submodule non-support by at least not accidentally deleting them.
  *
  * @returns {Promise<void>} Resolves successfully when pull operation completes
  *
@@ -55,6 +57,7 @@ export async function pull ({
   gitdir = join(dir, '.git'),
   fs = cores.get(core).get('fs'),
   ref,
+  remote,
   fastForwardOnly = false,
   noGitSuffix = false,
   corsProxy,
@@ -75,7 +78,8 @@ export async function pull ({
   signingKey,
   autoTranslateSSH = false,
   fast = false,
-  noSubmodules = false
+  noSubmodules = false,
+  newSubmoduleBehavior = false
 }) {
   try {
     if (emitter) {
@@ -90,11 +94,7 @@ export async function pull ({
       ref = await currentBranch({ fs, gitdir })
     }
     // Fetch from the correct remote.
-    const remote = await config({
-      gitdir,
-      fs,
-      path: `branch.${ref}.remote`
-    })
+    remote = remote || (await config({ gitdir, fs, path: `branch.${ref}.remote` })) || 'origin'
     const { fetchHead, fetchHeadDescription } = await fetch({
       dir,
       gitdir,
@@ -127,7 +127,9 @@ export async function pull ({
       message: `Merge ${fetchHeadDescription}`,
       author,
       committer,
-      signingKey
+      signingKey,
+      noSubmodules,
+      newSubmoduleBehavior
     })
   } catch (err) {
     err.caller = 'git.pull'

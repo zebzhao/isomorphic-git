@@ -2036,8 +2036,6 @@ class GitPackIndex {
     let totalObjectCount = null;
     let lastPercent = null;
     const times = {
-      hash: 0,
-      readSlice: 0,
       offsets: 0,
       crcs: 0,
       sort: 0
@@ -2152,7 +2150,6 @@ class GitPackIndex {
     let count = 0;
     let callsToReadSlice = 0;
     let callsToGetExternal = 0;
-    const timeByDepth = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     const objectsByDepth = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     for (let offset in offsetToObject) {
       offset = Number(offset);
@@ -2182,17 +2179,11 @@ class GitPackIndex {
       try {
         p.readDepth = 0;
         p.externalReadDepth = 0;
-        marky.mark('readSlice');
         const { type, object } = await p.readSlice({ start: offset });
-        const time = marky.stop('readSlice').duration;
-        times.readSlice += time;
         callsToReadSlice += p.readDepth;
         callsToGetExternal += p.externalReadDepth;
-        timeByDepth[p.readDepth] += time;
         objectsByDepth[p.readDepth] += 1;
-        marky.mark('hash');
         const oid = await shasum(GitObject.wrap({ type, object }));
-        times.hash += marky.stop('hash').duration;
         o.oid = oid;
         hashes.push(oid);
         offsets.set(oid, offset);
@@ -2207,8 +2198,6 @@ class GitPackIndex {
     hashes.sort();
     times['sort'] = Math.floor(marky.stop('sort').duration);
     const totalElapsedTime = marky.stop('total').duration;
-    times.hash = Math.floor(times.hash);
-    times.readSlice = Math.floor(times.readSlice);
     times.misc = Math.floor(
       Object.values(times).reduce((a, b) => a - b, totalElapsedTime)
     );
@@ -2217,12 +2206,6 @@ class GitPackIndex {
     log('by depth:');
     log([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].join('\t'));
     log(objectsByDepth.slice(0, 12).join('\t'));
-    log(
-      timeByDepth
-        .map(Math.floor)
-        .slice(0, 12)
-        .join('\t')
-    );
     return p
   }
 

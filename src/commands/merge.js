@@ -56,6 +56,8 @@ import { mergeFile } from '../utils/mergeFile'
  * @param {Object} [args.committer] - passed to [commit](commit.md) when creating a merge commit
  * @param {string} [args.signingKey] - passed to [commit](commit.md) when creating a merge commit
  * @param {boolean} [args.fast = false] - use fastCheckout instead of regular checkout
+ * @param {boolean} [args.noSubmodules = false] - If true, will not print out an error about missing submodules support. TODO: Skip checkout out submodules when supported instead.
+ * @param {boolean} [args.newSubmoduleBehavior = false] - If true, will opt into a newer behavior that improves submodule non-support by at least not accidentally deleting them.
  *
  * @returns {Promise<MergeReport>} Resolves to a description of the merge operation
  * @see MergeReport
@@ -81,7 +83,9 @@ export async function merge ({
   message,
   author,
   committer,
-  signingKey
+  signingKey,
+  noSubmodules = false,
+  newSubmoduleBehavior = false
 }) {
   try {
     if (emitter) {
@@ -144,7 +148,9 @@ export async function merge ({
           fs,
           ref: ourRef,
           emitter,
-          emitterPrefix
+          emitterPrefix,
+          noSubmodules,
+          newSubmoduleBehavior
         })
       }
       return {

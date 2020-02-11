@@ -3461,8 +3461,6 @@ class GitPackIndex {
     let totalObjectCount = null;
     let lastPercent = null;
     const times = {
-      hash: 0,
-      readSlice: 0,
       offsets: 0,
       crcs: 0,
       sort: 0
@@ -3577,7 +3575,6 @@ class GitPackIndex {
     let count = 0;
     let callsToReadSlice = 0;
     let callsToGetExternal = 0;
-    const timeByDepth = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     const objectsByDepth = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     for (let offset in offsetToObject) {
       offset = Number(offset);
@@ -3607,17 +3604,11 @@ class GitPackIndex {
       try {
         p.readDepth = 0;
         p.externalReadDepth = 0;
-        mark('readSlice');
         const { type, object } = await p.readSlice({ start: offset });
-        const time = stop('readSlice').duration;
-        times.readSlice += time;
         callsToReadSlice += p.readDepth;
         callsToGetExternal += p.externalReadDepth;
-        timeByDepth[p.readDepth] += time;
         objectsByDepth[p.readDepth] += 1;
-        mark('hash');
         const oid = await shasum(GitObject.wrap({ type, object }));
-        times.hash += stop('hash').duration;
         o.oid = oid;
         hashes.push(oid);
         offsets.set(oid, offset);
@@ -3632,8 +3623,6 @@ class GitPackIndex {
     hashes.sort();
     times['sort'] = Math.floor(stop('sort').duration);
     const totalElapsedTime = stop('total').duration;
-    times.hash = Math.floor(times.hash);
-    times.readSlice = Math.floor(times.readSlice);
     times.misc = Math.floor(
       Object.values(times).reduce((a, b) => a - b, totalElapsedTime)
     );
@@ -3642,12 +3631,6 @@ class GitPackIndex {
     log('by depth:');
     log([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].join('\t'));
     log(objectsByDepth.slice(0, 12).join('\t'));
-    log(
-      timeByDepth
-        .map(Math.floor)
-        .slice(0, 12)
-        .join('\t')
-    );
     return p
   }
 
@@ -5783,6 +5766,24 @@ class GitWalkerIndex {
   }
 }
 
+/**
+ *
+ * @param {number} mode
+ */
+function mode2type$1 (mode) {
+  // prettier-ignore
+  switch (mode) {
+    case 0o040000: return 'tree'
+    case 0o100644: return 'blob'
+    case 0o100755: return 'blob'
+    case 0o120000: return 'blob'
+    case 0o160000: return 'commit'
+  }
+  throw new GitError(E.InternalFail, {
+    message: `Unexpected GitTree entry mode: ${mode.toString(8)}`
+  })
+}
+
 class GitWalkerIndex2 {
   constructor ({ fs, gitdir }) {
     this.treePromise = GitIndexManager.acquire({ fs, gitdir }, async function (
@@ -5871,7 +5872,7 @@ class GitWalkerIndex2 {
         )
       }
       const stats = inode.type === 'tree' ? {} : normalizeStats(inode.metadata);
-      entry._type = inode.type;
+      entry._type = inode.type === 'tree' ? 'tree' : mode2type$1(stats.mode);
       entry._mode = stats.mode;
       if (inode.type === 'tree') {
         entry._stat = void 0;
@@ -5967,6 +5968,7 @@ const ALLOW_ALL = ['.'];
  * @param {string} [args.remote = 'origin'] - Which remote repository to use
  * @param {boolean} [args.noCheckout = false] - If true, will update HEAD but won't update the working directory
  * @param {boolean} [args.noSubmodules = false] - If true, will not print out an error about missing submodules support. TODO: Skip checkout out submodules when supported instead.
+ * @param {boolean} [args.newSubmoduleBehavior = false] - If true, will opt into a newer behavior that improves submodule non-support by at least not accidentally deleting them.
  *
  * @returns {Promise<void>} Resolves successfully when filesystem operations are complete
  *
@@ -5993,7 +5995,8 @@ async function checkout ({
   filepaths = ALLOW_ALL,
   pattern = null,
   noCheckout = false,
-  noSubmodules = false
+  noSubmodules = false,
+  newSubmoduleBehavior = false
 }) {
   try {
     if (ref === undefined) {
@@ -6121,6 +6124,16 @@ async function checkout ({
                     })
                   );
                 }
+                if (newSubmoduleBehavior) {
+                  if (!workdir) await fs.mkdir(filepath);
+                  const stats = await fs.lstat(filepath);
+                  stats.mode = 0o160000; // submodules have a unique mode different from trees
+                  indexEntries.push({
+                    filepath: fullpath,
+                    stats,
+                    oid: await head.oid()
+                  });
+                }
                 break
               }
               case 'blob': {
@@ -6231,6 +6244,8 @@ const ALLOW_ALL$1 = ['.'];
  * @param {boolean} [args.noUpdateHead] - If true, will update the working directory but won't update HEAD. Defaults to `false` when `ref` is provided, and `true` if `ref` is not provided.
  * @param {boolean} [args.dryRun = false] - If true, simulates a checkout so you can test whether it would succeed.
  * @param {boolean} [args.force = false] - If true, conflicts will be ignored and files will be overwritten regardless of local changes.
+ * @param {boolean} [args.noSubmodules = false] - If true, will not print out errors about missing submodules support.
+ * @param {boolean} [args.newSubmoduleBehavior = false] - If true, will opt into a newer behavior that improves submodule non-support by at least not accidentally deleting them.
  *
  * @returns {Promise<void>} Resolves successfully when filesystem operations are complete
  *
@@ -6264,7 +6279,9 @@ async function fastCheckout ({
   dryRun = false,
   // @ts-ignore
   debug = false,
-  force = false
+  force = false,
+  noSubmodules = false,
+  newSubmoduleBehavior = false
 }) {
   try {
     const ref = _ref || 'HEAD';
@@ -6314,7 +6331,9 @@ async function fastCheckout ({
           force,
           filepaths,
           emitter,
-          emitterPrefix
+          emitterPrefix,
+          noSubmodules,
+          newSubmoduleBehavior
         });
       } catch (err) {
         // Throw a more helpful error message for this common mistake.
@@ -6380,33 +6399,38 @@ async function fastCheckout ({
       });
 
       // Note: this is cannot be done naively in parallel
-      for (const [method, fullpath] of ops) {
-        if (method === 'rmdir') {
-          const filepath = `${dir}/${fullpath}`;
-          try {
-            await fs.rmdir(filepath);
-            if (emitter) {
-              await emitter.emit(`${emitterPrefix}progress`, {
-                phase: 'Updating workdir',
-                loaded: ++count,
-                total
-              });
-            }
-          } catch (e) {
-            if (e.code === 'ENOTEMPTY') {
-              console.log(
-                `Did not delete ${fullpath} because directory is not empty`
-              );
-            } else {
-              throw e
+      await GitIndexManager.acquire({ fs, gitdir }, async function (index) {
+        for (const [method, fullpath] of ops) {
+          if (method === 'rmdir' || method === 'rmdir-index') {
+            const filepath = `${dir}/${fullpath}`;
+            try {
+              if (method === 'rmdir-index') {
+                index.delete({ filepath: fullpath });
+              }
+              await fs.rmdir(filepath);
+              if (emitter) {
+                emitter.emit(`${emitterPrefix}progress`, {
+                  phase: 'Updating workdir',
+                  loaded: ++count,
+                  total
+                });
+              }
+            } catch (e) {
+              if (e.code === 'ENOTEMPTY') {
+                console.log(
+                  `Did not delete ${fullpath} because directory is not empty`
+                );
+              } else {
+                throw e
+              }
             }
           }
         }
-      }
+      });
 
       await Promise.all(
         ops
-          .filter(([method]) => method === 'mkdir')
+          .filter(([method]) => method === 'mkdir' || method === 'mkdir-index')
           .map(async function ([_, fullpath]) {
             const filepath = `${dir}/${fullpath}`;
             await fs.mkdir(filepath);
@@ -6427,12 +6451,13 @@ async function fastCheckout ({
               ([method]) =>
                 method === 'create' ||
                 method === 'create-index' ||
-                method === 'update'
+                method === 'update' ||
+                method === 'mkdir-index'
             )
             .map(async function ([method, fullpath, oid, mode, chmod]) {
               const filepath = `${dir}/${fullpath}`;
               try {
-                if (method !== 'create-index') {
+                if (method !== 'create-index' && method !== 'mkdir-index') {
                   const { object } = await readObject({ fs, gitdir, oid });
                   if (chmod) {
                     // Note: the mode option of fs.write only works when creating files,
@@ -6464,6 +6489,10 @@ async function fastCheckout ({
                 // TODO: Figure out how git handles this internally.
                 if (mode === 0o100755) {
                   stats.mode = 0o755;
+                }
+                // Submodules are present in the git index but use a unique mode different from trees
+                if (method === 'mkdir-index') {
+                  stats.mode = 0o160000;
                 }
                 index.insert({
                   filepath: fullpath,
@@ -6514,7 +6543,9 @@ async function analyze ({
   force,
   filepaths,
   emitter,
-  emitterPrefix
+  emitterPrefix,
+  noSubmodules,
+  newSubmoduleBehavior
 }) {
   let count = 0;
   return walkBeta2({
@@ -6580,12 +6611,23 @@ async function analyze ({
             }
             case 'commit': {
               // gitlinks
-              console.log(
-                new GitError(E.NotImplementedFail, {
-                  thing: 'submodule support'
-                })
-              );
-              return
+              if (!noSubmodules) {
+                console.log(
+                  new GitError(E.NotImplementedFail, {
+                    thing: 'submodule support'
+                  })
+                );
+              }
+              if (newSubmoduleBehavior) {
+                return [
+                  'mkdir-index',
+                  fullpath,
+                  await commit.oid(),
+                  await commit.mode()
+                ]
+              } else {
+                return
+              }
             }
             default: {
               return [
@@ -6690,15 +6732,21 @@ async function analyze ({
                 return ['delete', fullpath]
               }
             }
+            case 'commit': {
+              return ['rmdir-index', fullpath]
+            }
             default: {
-              return [`delete entry Unhandled type ${await stage.type()}`]
+              return [
+                'error',
+                `delete entry Unhandled type ${await stage.type()}`
+              ]
             }
           }
         }
         /* eslint-disable no-fallthrough */
         // File missing from workdir
         case '110':
-        // Modified entries
+        // Possibly modified entries
         case '111': {
           /* eslint-enable no-fallthrough */
           switch (`${await stage.type()}-${await commit.type()}`) {
@@ -6706,6 +6754,16 @@ async function analyze ({
               return
             }
             case 'blob-blob': {
+              // If the file hasn't changed, there is no need to do anything.
+              // Existing file modifications in the workdir can be be left as is.
+              if (
+                (await stage.oid()) === (await commit.oid()) &&
+                (await stage.mode()) === (await commit.mode()) &&
+                !force
+              ) {
+                return
+              }
+
               // Check for local changes that would be lost
               if (workdir) {
                 // Note: canonical git only compares with the stage. But we're smart enough
@@ -6764,6 +6822,21 @@ async function analyze ({
             }
             case 'blob-tree': {
               return ['update-blob-to-tree', fullpath]
+            }
+            case 'commit-commit': {
+              if (newSubmoduleBehavior) {
+                return [
+                  'mkdir-index',
+                  fullpath,
+                  await commit.oid(),
+                  await commit.mode()
+                ]
+              } else {
+                return [
+                  'error',
+                  `update entry Unhandled type ${await stage.type()}-${await commit.type()}`
+                ]
+              }
             }
             default: {
               return [
@@ -8288,6 +8361,7 @@ async function init ({
  * @param {boolean} [args.singleBranch = false] - Instead of the default behavior of fetching all the branches, only fetch a single branch.
  * @param {boolean} [args.noCheckout = false] - If true, clone will only fetch the repo, not check out a branch. Skipping checkout can save a lot of time normally spent writing files to disk.
  * @param {boolean} [args.noSubmodules = false] - If true, clone will not log an error about missing submodule support. TODO: Make this not check out submodules when ther's submodule support
+ * @param {boolean} [args.newSubmoduleBehavior = false] - If true, will opt into a newer behavior that improves submodule non-support by at least not accidentally deleting them.
  * @param {boolean} [args.noGitSuffix = false] - If true, clone will not auto-append a `.git` suffix to the `url`. (**AWS CodeCommit needs this option**.)
  * @param {boolean} [args.noTags = false] - By default clone will fetch all tags. `noTags` disables that behavior.
  * @param {string} [args.remote = 'origin'] - What to name the remote that is created.
@@ -8344,6 +8418,7 @@ async function clone ({
   singleBranch = false,
   noCheckout = false,
   noSubmodules = false,
+  newSubmoduleBehavior = false,
   noTags = false,
   headers = {},
   autoTranslateSSH = false,
@@ -8416,7 +8491,8 @@ async function clone ({
       ref,
       remote,
       noCheckout,
-      noSubmodules
+      noSubmodules,
+      newSubmoduleBehavior
     });
   } catch (err) {
     err.caller = 'git.clone';
@@ -10162,6 +10238,8 @@ function mergeFile ({
  * @param {Object} [args.committer] - passed to [commit](commit.md) when creating a merge commit
  * @param {string} [args.signingKey] - passed to [commit](commit.md) when creating a merge commit
  * @param {boolean} [args.fast = false] - use fastCheckout instead of regular checkout
+ * @param {boolean} [args.noSubmodules = false] - If true, will not print out an error about missing submodules support. TODO: Skip checkout out submodules when supported instead.
+ * @param {boolean} [args.newSubmoduleBehavior = false] - If true, will opt into a newer behavior that improves submodule non-support by at least not accidentally deleting them.
  *
  * @returns {Promise<MergeReport>} Resolves to a description of the merge operation
  * @see MergeReport
@@ -10187,7 +10265,9 @@ async function merge ({
   message,
   author,
   committer,
-  signingKey
+  signingKey,
+  noSubmodules = false,
+  newSubmoduleBehavior = false
 }) {
   try {
     if (emitter) {
@@ -10250,7 +10330,9 @@ async function merge ({
           fs,
           ref: ourRef,
           emitter,
-          emitterPrefix
+          emitterPrefix,
+          noSubmodules,
+          newSubmoduleBehavior
         });
       }
       return {
@@ -10617,6 +10699,7 @@ async function packObjects ({
  * @param {boolean} [args.autoTranslateSSH] - Attempt to automatically translate SSH remotes into HTTP equivalents
  * @param {boolean} [args.fast = false] - use fastCheckout instead of regular checkout
  * @param {boolean} [args.noSubmodules = false] - If true, will not print out an error about missing submodules support. TODO: Skip checkout out submodules when supported instead.
+ * @param {boolean} [args.newSubmoduleBehavior = false] - If true, will opt into a newer behavior that improves submodule non-support by at least not accidentally deleting them.
  *
  * @returns {Promise<void>} Resolves successfully when pull operation completes
  *
@@ -10655,7 +10738,8 @@ async function pull ({
   signingKey,
   autoTranslateSSH = false,
   fast = false,
-  noSubmodules = false
+  noSubmodules = false,
+  newSubmoduleBehavior = false
 }) {
   try {
     if (emitter) {
@@ -10707,7 +10791,9 @@ async function pull ({
       message: `Merge ${fetchHeadDescription}`,
       author,
       committer,
-      signingKey
+      signingKey,
+      noSubmodules,
+      newSubmoduleBehavior
     });
   } catch (err) {
     err.caller = 'git.pull';
@@ -10847,6 +10933,7 @@ async function listObjects ({
  * @param {string} [args.remoteRef] - The name of the receiving branch on the remote. By default this is the same as `ref`. (See note below)
  * @param {string} [args.remote] - If URL is not specified, determines which remote to use.
  * @param {boolean} [args.force = false] - If true, behaves the same as `git push --force`
+ * @param {boolean} [args.delete = false] - If true, delete the remote ref
  * @param {boolean} [args.noGitSuffix = false] - If true, do not auto-append a `.git` suffix to the `url`. (**AWS CodeCommit needs this option**)
  * @param {string} [args.url] - The URL of the remote git server. The default is the value set in the git config for that remote.
  * @param {string} [args.corsProxy] - Optional [CORS proxy](https://www.npmjs.com/%40isomorphic-git/cors-proxy). Overrides value in repo config.
@@ -10884,6 +10971,7 @@ async function push ({
   remote = 'origin',
   url,
   force = false,
+  delete: _delete = false,
   noGitSuffix = false,
   corsProxy,
   // @ts-ignore
@@ -10932,7 +11020,10 @@ async function push ({
     } else {
       fullRef = await GitRefManager.expand({ fs, gitdir, ref });
     }
-    const oid = await GitRefManager.resolve({ fs, gitdir, ref: fullRef });
+    const emptyOid = '0000000000000000000000000000000000000000';
+    const oid = _delete
+      ? emptyOid
+      : await GitRefManager.resolve({ fs, gitdir, ref: fullRef });
     let auth = { username, password, token, oauth2format };
     const GitRemoteHTTP = GitRemoteManager.getRemoteHelperFor({ url });
     const httpRemote = await GitRemoteHTTP.discover({
@@ -10966,47 +11057,48 @@ async function push ({
         }
       }
     }
-    const emptyOid = '0000000000000000000000000000000000000000';
-    const oldoid =
-      httpRemote.refs.get(fullRemoteRef) || emptyOid;
-    const finish = [...httpRemote.refs.values()];
-    // hack to speed up common force push scenarios
-    // @ts-ignore
-    const mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] });
-    for (const baseOid of mergebase) finish.push(baseOid);
-    // TODO: handle shallow depth cutoff gracefully
-    if (
-      mergebase.length === 0 &&
-      oid !== emptyOid &&
-      oldoid !== emptyOid
-    ) {
-      throw new GitError(E.PushRejectedNoCommonAncestry, {})
-    } else if (!force) {
-      // Is it a tag that already exists?
-      if (
-        fullRef.startsWith('refs/tags') &&
-        oldoid !== emptyOid
-      ) {
-        throw new GitError(E.PushRejectedTagExists, {})
-      }
-      // Is it a non-fast-forward commit?
+    const oldoid = httpRemote.refs.get(fullRemoteRef) || emptyOid;
+    let objects = [];
+    if (!_delete) {
+      const finish = [...httpRemote.refs.values()];
+      // hack to speed up common force push scenarios
+      // @ts-ignore
+      const mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] });
+      for (const oid of mergebase) finish.push(oid);
+      // @ts-ignore
+      const commits = await listCommitsAndTags({
+        fs,
+        gitdir,
+        start: [oid],
+        finish
+      });
+      // @ts-ignore
+      objects = await listObjects({ fs, gitdir, oids: commits });
+
       if (
         oid !== emptyOid &&
         oldoid !== emptyOid &&
-        !(await isDescendent({ fs, gitdir, oid, ancestor: oldoid }))
+        mergebase.length === 0
       ) {
-        throw new GitError(E.PushRejectedNonFastForward, {})
+        throw new GitError(E.PushRejectedNoCommonAncestry, {})
+      } else if (!force) {
+        // Is it a tag that already exists?
+        if (
+          fullRef.startsWith('refs/tags') &&
+          oldoid !== emptyOid
+        ) {
+          throw new GitError(E.PushRejectedTagExists, {})
+        }
+        // Is it a non-fast-forward commit?
+        if (
+          oid !== emptyOid &&
+          oldoid !== emptyOid &&
+          !(await isDescendent({ fs, gitdir, oid, ancestor: oldoid }))
+        ) {
+          throw new GitError(E.PushRejectedNonFastForward, {})
+        }
       }
     }
-    // @ts-ignore
-    const commits = await listCommitsAndTags({
-      fs,
-      gitdir,
-      start: [oid],
-      finish
-    });
-    // @ts-ignore
-    const objects = await listObjects({ fs, gitdir, oids: commits });
     // We can only safely use capabilities that the server also understands.
     // For instance, AWS CodeCommit aborts a push if you include the `agent`!!!
     const capabilities = filterCapabilities(
@@ -11017,11 +11109,13 @@ async function push ({
       capabilities,
       triplets: [{ oldoid, oid, fullRef: fullRemoteRef }]
     });
-    const packstream2 = await pack({
-      fs,
-      gitdir,
-      oids: [...objects]
-    });
+    const packstream2 = _delete
+      ? []
+      : await pack({
+        fs,
+        gitdir,
+        oids: [...objects]
+      });
     const res = await GitRemoteHTTP.connect({
       core,
       emitter,
@@ -11046,19 +11140,18 @@ async function push ({
     if (res.headers) {
       result.headers = res.headers;
     }
-    if (!result.errors || result.errors.length === 0) {
-      // no errors pushing
-      const refs = new Map();
-      refs.set(fullRemoteRef, oid);
-      const symrefs = new Map();
-      // @ts-ignore
-      await GitRefManager.updateRemoteRefs({
-        fs,
-        gitdir,
-        remote,
-        refs,
-        symrefs
-      });
+
+    // Update the local copy of the remote ref
+    if (remote && result.ok && result.ok.includes(fullRemoteRef)) {
+      const ref = `refs/remotes/${remote}/${fullRemoteRef.replace(
+        'refs/heads',
+        ''
+      )}`;
+      if (_delete) {
+        await GitRefManager.deleteRef({ fs, gitdir, ref });
+      } else {
+        await GitRefManager.writeRef({ fs, gitdir, ref, value: oid });
+      }
     }
     return result
   } catch (err) {

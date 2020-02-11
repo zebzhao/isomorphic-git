@@ -250,7 +250,7 @@ async function fetchPackfile ({
     depth = parseInt(depth)
   }
   // Set missing values
-  remote = remote || 'origin'
+  remote = remote || (await config({ gitdir, fs, path: `branch.${ref}.remote` })) || 'origin'
   if (url === undefined) {
     url = await config({
       fs,

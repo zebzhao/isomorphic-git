@@ -54,6 +54,7 @@ import { pack } from './pack.js'
  * @param {string} [args.remoteRef] - The name of the receiving branch on the remote. By default this is the same as `ref`. (See note below)
  * @param {string} [args.remote] - If URL is not specified, determines which remote to use.
  * @param {boolean} [args.force = false] - If true, behaves the same as `git push --force`
+ * @param {boolean} [args.delete = false] - If true, delete the remote ref
  * @param {boolean} [args.noGitSuffix = false] - If true, do not auto-append a `.git` suffix to the `url`. (**AWS CodeCommit needs this option**)
  * @param {string} [args.url] - The URL of the remote git server. The default is the value set in the git config for that remote.
  * @param {string} [args.corsProxy] - Optional [CORS proxy](https://www.npmjs.com/%40isomorphic-git/cors-proxy). Overrides value in repo config.
@@ -91,6 +92,7 @@ export async function push ({
   remote = 'origin',
   url,
   force = false,
+  delete: _delete = false,
   noGitSuffix = false,
   corsProxy,
   // @ts-ignore
@@ -139,7 +141,10 @@ export async function push ({
     } else {
       fullRef = await GitRefManager.expand({ fs, gitdir, ref })
     }
-    const oid = await GitRefManager.resolve({ fs, gitdir, ref: fullRef })
+    const emptyOid = '0000000000000000000000000000000000000000'
+    const oid = _delete
+      ? emptyOid
+      : await GitRefManager.resolve({ fs, gitdir, ref: fullRef })
     let auth = { username, password, token, oauth2format }
     const GitRemoteHTTP = GitRemoteManager.getRemoteHelperFor({ url })
     const httpRemote = await GitRemoteHTTP.discover({
@@ -173,47 +178,48 @@ export async function push ({
         }
       }
     }
-    const emptyOid = '0000000000000000000000000000000000000000'
-    const oldoid =
-      httpRemote.refs.get(fullRemoteRef) || emptyOid
-    const finish = [...httpRemote.refs.values()]
-    // hack to speed up common force push scenarios
-    // @ts-ignore
-    const mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] })
-    for (const baseOid of mergebase) finish.push(baseOid)
-    // TODO: handle shallow depth cutoff gracefully
-    if (
-      mergebase.length === 0 &&
-      oid !== emptyOid &&
-      oldoid !== emptyOid
-    ) {
-      throw new GitError(E.PushRejectedNoCommonAncestry, {})
-    } else if (!force) {
-      // Is it a tag that already exists?
-      if (
-        fullRef.startsWith('refs/tags') &&
-        oldoid !== emptyOid
-      ) {
-        throw new GitError(E.PushRejectedTagExists, {})
-      }
-      // Is it a non-fast-forward commit?
+    const oldoid = httpRemote.refs.get(fullRemoteRef) || emptyOid
+    let objects = []
+    if (!_delete) {
+      const finish = [...httpRemote.refs.values()]
+      // hack to speed up common force push scenarios
+      // @ts-ignore
+      const mergebase = await findMergeBase({ fs, gitdir, oids: [oid, oldoid] })
+      for (const oid of mergebase) finish.push(oid)
+      // @ts-ignore
+      const commits = await listCommitsAndTags({
+        fs,
+        gitdir,
+        start: [oid],
+        finish
+      })
+      // @ts-ignore
+      objects = await listObjects({ fs, gitdir, oids: commits })
+
       if (
         oid !== emptyOid &&
         oldoid !== emptyOid &&
-        !(await isDescendent({ fs, gitdir, oid, ancestor: oldoid }))
+        mergebase.length === 0
       ) {
-        throw new GitError(E.PushRejectedNonFastForward, {})
+        throw new GitError(E.PushRejectedNoCommonAncestry, {})
+      } else if (!force) {
+        // Is it a tag that already exists?
+        if (
+          fullRef.startsWith('refs/tags') &&
+          oldoid !== emptyOid
+        ) {
+          throw new GitError(E.PushRejectedTagExists, {})
+        }
+        // Is it a non-fast-forward commit?
+        if (
+          oid !== emptyOid &&
+          oldoid !== emptyOid &&
+          !(await isDescendent({ fs, gitdir, oid, ancestor: oldoid }))
+        ) {
+          throw new GitError(E.PushRejectedNonFastForward, {})
+        }
       }
     }
-    // @ts-ignore
-    const commits = await listCommitsAndTags({
-      fs,
-      gitdir,
-      start: [oid],
-      finish
-    })
-    // @ts-ignore
-    const objects = await listObjects({ fs, gitdir, oids: commits })
     // We can only safely use capabilities that the server also understands.
     // For instance, AWS CodeCommit aborts a push if you include the `agent`!!!
     const capabilities = filterCapabilities(
@@ -224,11 +230,13 @@ export async function push ({
       capabilities,
       triplets: [{ oldoid, oid, fullRef: fullRemoteRef }]
     })
-    const packstream2 = await pack({
-      fs,
-      gitdir,
-      oids: [...objects]
-    })
+    const packstream2 = _delete
+      ? []
+      : await pack({
+        fs,
+        gitdir,
+        oids: [...objects]
+      })
     const res = await GitRemoteHTTP.connect({
       core,
       emitter,
@@ -253,19 +261,18 @@ export async function push ({
     if (res.headers) {
       result.headers = res.headers
     }
-    if (!result.errors || result.errors.length === 0) {
-      // no errors pushing
-      const refs = new Map()
-      refs.set(fullRemoteRef, oid)
-      const symrefs = new Map()
-      // @ts-ignore
-      await GitRefManager.updateRemoteRefs({
-        fs,
-        gitdir,
-        remote,
-        refs,
-        symrefs
-      })
+
+    // Update the local copy of the remote ref
+    if (remote && result.ok && result.ok.includes(fullRemoteRef)) {
+      const ref = `refs/remotes/${remote}/${fullRemoteRef.replace(
+        'refs/heads',
+        ''
+      )}`
+      if (_delete) {
+        await GitRefManager.deleteRef({ fs, gitdir, ref })
+      } else {
+        await GitRefManager.writeRef({ fs, gitdir, ref, value: oid })
+      }
     }
     return result
   } catch (err) {

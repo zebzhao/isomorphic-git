@@ -5,7 +5,7 @@ const snapshots = require('./__snapshots__/test-push.js.snap')
 const registerSnapshots = require('./__helpers__/jasmine-snapshots')
 const EventEmitter = require('events')
 
-const { plugins, config, push } = require('isomorphic-git')
+const { plugins, config, push, listBranches } = require('isomorphic-git')
 
 // this is so it works with either Node local tests or Browser WAN tests
 const localhost =
@@ -78,6 +78,7 @@ describe('push', () => {
     expect(res.ok).toBeTruthy()
     expect(res.ok[0]).toBe('unpack')
     expect(res.ok[1]).toBe('refs/heads/foobar')
+    expect(await listBranches({ gitdir, remote: 'karma' })).toContain('foobar')
   })
   it('push with lightweight tag', async () => {
     // Setup
@@ -116,6 +117,36 @@ describe('push', () => {
     expect(res.ok).toBeTruthy()
     expect(res.ok[0]).toBe('unpack')
     expect(res.ok[1]).toBe('refs/tags/annotated-tag')
+  })
+  it('push delete', async () => {
+    // Setup
+    const { gitdir } = await makeFixture('test-push')
+    await config({
+      gitdir,
+      path: 'remote.karma.url',
+      value: `http://${localhost}:8888/test-push-server.git`
+    })
+    await push({
+      gitdir,
+      remote: 'karma',
+      ref: 'master',
+      remoteRef: 'foobar'
+    })
+    expect(await listBranches({ gitdir, remote: 'karma' })).toContain('foobar')
+    // Test
+    const res = await push({
+      gitdir,
+      remote: 'karma',
+      remoteRef: 'foobar',
+      delete: true
+    })
+    expect(res).toBeTruthy()
+    expect(res.ok).toBeTruthy()
+    expect(res.ok[0]).toBe('unpack')
+    expect(res.ok[1]).toBe('refs/heads/foobar')
+    expect(await listBranches({ gitdir, remote: 'karma' })).not.toContain(
+      'foobar'
+    )
   })
 
   it('push with Basic Auth', async () => {
