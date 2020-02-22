@@ -3372,31 +3372,8 @@ async function parseHeader (reader) {
 
 /* eslint-env node, browser */
 
-let supportsDecompressionStream = false;
-
 async function inflate (buffer) {
-  if (supportsDecompressionStream === null) {
-    supportsDecompressionStream = testDecompressionStream();
-  }
-  return supportsDecompressionStream
-    ? browserInflate(buffer)
-    : pako.inflate(buffer)
-}
-
-async function browserInflate (buffer) {
-  const ds = new DecompressionStream('deflate');
-  const d = new Blob([buffer]).stream().pipeThrough(ds);
-  return new Uint8Array(await new Response(d).arrayBuffer())
-}
-
-function testDecompressionStream () {
-  try {
-    const ds = new DecompressionStream('deflate');
-    if (ds) return true
-  } catch (_) {
-    // no bother
-  }
-  return false
+  return  pako.inflate(buffer)
 }
 
 function decodeVarInt (reader) {
@@ -8099,7 +8076,7 @@ async function fetchPackfile ({
     depth = parseInt(depth);
   }
   // Set missing values
-  remote = remote || 'origin';
+  remote = remote || (await config({ gitdir, fs, path: `branch.${ref}.remote` })) || 'origin';
   if (url === undefined) {
     url = await config({
       fs,
@@ -10748,6 +10725,7 @@ async function packObjects ({
  * @param {string} args.dir] - The [working tree](dir-vs-gitdir.md) directory path
  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
  * @param {string} [args.ref] - Which branch to fetch. By default this is the currently checked out branch.
+ * @param {string} [args.remote] - What to name the remote that is created.
  * @param {string} [args.corsProxy] - Optional [CORS proxy](https://www.npmjs.com/%40isomorphic-git/cors-proxy). Overrides value in repo config.
  * @param {boolean} [args.singleBranch = false] - Instead of the default behavior of fetching all the branches, only fetch a single branch.
  * @param {boolean} [args.fastForwardOnly = false] - Only perform simple fast-forward merges. (Don't create merge commits.)
@@ -10784,6 +10762,7 @@ async function pull ({
   gitdir = join(dir, '.git'),
   fs = cores.get(core).get('fs'),
   ref,
+  remote,
   fastForwardOnly = false,
   noGitSuffix = false,
   corsProxy,
@@ -10820,11 +10799,7 @@ async function pull ({
       ref = await currentBranch({ fs, gitdir });
     }
     // Fetch from the correct remote.
-    const remote = await config({
-      gitdir,
-      fs,
-      path: `branch.${ref}.remote`
-    });
+    remote = remote || (await config({ gitdir, fs, path: `branch.${ref}.remote` })) || 'origin';
     const { fetchHead, fetchHeadDescription } = await fetch({
       dir,
       gitdir,
